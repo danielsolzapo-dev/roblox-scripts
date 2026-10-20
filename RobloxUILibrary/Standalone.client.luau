@@ -250,6 +250,8 @@ refreshNamed = function(t)
 end
 
 local Home = addTab("Home")
+local Farm = addTab("Farm")
+local ESPtab = addTab("ESP")
 local PlayerT = addTab("Player")
 local Visual = addTab("Visual")
 local Settings = addTab("Settings")
@@ -448,6 +450,40 @@ end
 
 -- Home kept simple; demos moved to Settings
 -- Examples
+-- Farm tab
+addSection(Farm, "Farm")
+local fastToggle = addToggle(Farm, "Fast Attack (Matsune, server hits)", false, function(v)
+    if v then
+        if not _G.MatsuneFastAttack then
+            pcall(function()
+                loadstring(game:HttpGet("https://raw.githubusercontent.com/danielsolzapo-dev/roblox-scripts/main/FastAttack.luau"))()
+            end)
+        end
+        if _G.MatsuneFastAttack and _G.MatsuneFastAttack.Start then
+            _G.MatsuneFastAttack:Start()
+        end
+    else
+        if _G.MatsuneFastAttack and _G.MatsuneFastAttack.Stop then
+            _G.MatsuneFastAttack:Stop()
+        end
+    end
+end)
+
+-- ESP tab
+addSection(ESPtab, "ESP")
+local espApi = nil
+pcall(function()
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/danielsolzapo-dev/roblox-scripts/main/ESP.luau"))()
+    espApi = _G.MatsuneESP
+end)
+local names = {"Island","Player","Chest","DevilFruit","Flower","RealFruit"}
+for _, nm in ipairs(names) do
+    addToggle(ESPtab, nm.." ESP", false, function(v)
+        if espApi and espApi.Set then espApi.Set(espApi, nm, v) end
+        if espApi then espApi[nm.."ESP"] = v end
+    end)
+end
+
 addBtn(Settings, "Theme: Midnight", function() activeTheme="Midnight"; applyTheme({}); Float.BackgroundColor3=T().Accent end)
 addBtn(Settings, "Theme: Dark", function() activeTheme="Dark"; applyTheme({}); Float.BackgroundColor3=T().Accent end)
 addBtn(Settings, "Theme: Light", function() activeTheme="Light"; applyTheme({}); Float.BackgroundColor3=T().Accent end)
@@ -461,26 +497,6 @@ addSection(Settings, "Exemplos")
 addLabel(Settings, "Numericos e componentes de exemplo abaixo.")
 addBtn(Settings, "Mostrar notificação", function()
     notify({Title="Carregado!", Text="Interface carregada com sucesso.", Duration=3, Type="info"})
-end)
-
--- Combat tab via Settings: Matsune FastAttack
-addSection(Settings, "Combat")
-local fastToggle = addToggle(Settings, "Fast Attack (Matsune, server hits)", false, function(v)
-    if v then
-        if not _G.MatsuneFastAttack then
-            -- load standalone FastAttack module if available
-            pcall(function()
-                loadstring(game:HttpGet("https://raw.githubusercontent.com/danielsolzapo-dev/roblox-scripts/main/FastAttack.luau"))()
-            end)
-        end
-        if _G.MatsuneFastAttack and _G.MatsuneFastAttack.Start then
-            _G.MatsuneFastAttack:Start()
-        end
-    else
-        if _G.MatsuneFastAttack and _G.MatsuneFastAttack.Stop then
-            _G.MatsuneFastAttack:Stop()
-        end
-    end
 end)
 
 
