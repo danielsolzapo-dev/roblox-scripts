@@ -250,11 +250,11 @@ refreshNamed = function(t)
 end
 
 local Home = addTab("Home")
-local Farm = addTab("Farm")
-local ESPtab = addTab("ESP")
 local PlayerT = addTab("Player")
 local Visual = addTab("Visual")
 local Settings = addTab("Settings")
+local Farm = addTab("Farm")
+local ESPtab = addTab("ESP")
 
 for i,t in ipairs(tabs) do
     t.Page.Visible = (i==1); t.Selected = (i==1)
@@ -323,7 +323,156 @@ end)
 bind(Float.MouseEnter, function() Float.BackgroundColor3 = Color3.new(math.min(1,T().Accent.R*1.2), math.min(1,T().Accent.G*1.2), math.min(1,T().Accent.B*1.2)) end)
 bind(Float.MouseLeave, function() Float.BackgroundColor3 = T().Accent end)
 
-do -- inline FastAttack module
+-- Components
+local function addBtn(parent, text, cb)
+    local b = new("TextButton", {Size=UDim2.new(1,-24,0,36), Text=text, Font=Enum.Font.Gotham, TextSize=14, AutoButtonColor=false, Active=true, Theme={TextColor3="Text", BackgroundColor3="ComponentBg"}}, parent)
+    new("UICorner", {CornerRadius=UDim.new(0,6)}, b)
+    bind(b.MouseEnter, function() b.BackgroundColor3 = T().Hover end)
+    bind(b.MouseLeave, function() b.BackgroundColor3 = T().ComponentBg end)
+    bind(b.MouseButton1Click, function() if cb then cb() end end)
+    return b
+end
+
+local function addToggle(parent, label, default, cb)
+    local f = new("Frame", {Size=UDim2.new(1,-24,0,36), Theme={BackgroundColor3="ComponentBg"}}, parent)
+    new("UICorner", {CornerRadius=UDim.new(0,6)}, f)
+    local lbl = new("TextLabel", {Text=label, Size=UDim2.new(1,-60,1,0), Position=UDim2.new(0,12,0,0), Font=Enum.Font.Gotham, TextSize=14, BackgroundTransparency=1, TextXAlignment=Enum.TextXAlignment.Left, Theme={TextColor3="Text"}}, f)
+    local track = new("Frame", {Size=UDim2.fromOffset(40,20), Position=UDim2.new(1,-52,0.5,-10), Theme={BackgroundColor3="Surface"}}, f)
+    new("UICorner", {CornerRadius=UDim.new(1,0)}, track)
+    local knob = new("Frame", {Size=UDim2.fromOffset(16,16), Position=UDim2.new(0,2,0.5,-8), BackgroundColor3=Color3.new(1,1,1)}, track)
+    new("UICorner", {CornerRadius=UDim.new(1,0)}, knob)
+    local val = (default==true)
+    local render = function(instant)
+        local info = instant and TweenInfo.new(0) or TweenInfo.new(0.15)
+        TweenService:Create(knob, info, {Position = val and UDim2.new(1,-18,0.5,-8) or UDim2.new(0,2,0.5,-8)}):Play()
+        TweenService:Create(track, info, {BackgroundColor3 = val and T().Accent or T().Surface}):Play()
+    end
+    local refreshTheme = function() render(true) end
+    render(true)
+    local function toggle() val = not val; render(false); if cb then cb(val) end end
+    local btnArea = new("TextButton", {Size=UDim2.fromOffset(44,24), Position=UDim2.new(1,-54,0.5,-12), BackgroundTransparency=1, Text=""}, f)
+    bind(btnArea.MouseButton1Click, toggle)
+    local api = {Frame=f, Value=val, Get=function() return val end, Set=function(v) val=(v==true); render(false); if cb then cb(val) end end, SetText=function(t) lbl.Text=t end, RefreshTheme=refreshTheme, Destroy=function() f:Destroy() end}
+    return api
+end
+
+local function addSlider(parent, opts)
+    opts = opts or {}
+    local min = opts.Min or 0
+    local max = opts.Max or 1
+    if not (max > min) then max = min + 1 end
+    local step = opts.Step or 0.01
+    if step <= 0 then step = 0.01 end
+    local default = opts.Default or min
+    if default < min then default = min end
+    if default > max then default = max end
+    local suffix = opts.Suffix or ""
+    local cb = opts.Callback
+    local name = opts.Name or "Slider"
+    local f = new("Frame", {Size=UDim2.new(1,-24,0,56), Theme={BackgroundColor3="ComponentBg"}}, parent)
+    new("UICorner", {CornerRadius=UDim.new(0,6)}, f)
+    local titleLbl = new("TextLabel", {Text=name, Size=UDim2.new(1,-70,0,20), Position=UDim2.new(0,12,0,4), Font=Enum.Font.Gotham, TextSize=13, BackgroundTransparency=1, TextXAlignment=Enum.TextXAlignment.Left, TextTruncate=Enum.TextTruncate.AtEnd, Theme={TextColor3="Text"}}, f)
+    local valLabel = new("TextLabel", {Size=UDim2.new(0,60,0,20), Position=UDim2.new(1,-72,0,4), Font=Enum.Font.Gotham, TextSize=13, BackgroundTransparency=1, TextXAlignment=Enum.TextXAlignment.Right, Theme={TextColor3="TextMuted"}}, f)
+    local hit = new("Frame", {Size=UDim2.new(1,-24,0,28), Position=UDim2.new(0,12,0,24), BackgroundTransparency=1, Active=true}, f)
+    local bar = new("Frame", {Size=UDim2.new(1,0,0,8), Position=UDim2.new(0,0,0.5,-4), Theme={BackgroundColor3="Surface"}}, hit)
+    new("UICorner", {CornerRadius=UDim.new(1,0)}, bar)
+    local fill = new("Frame", {Size=UDim2.new(0,0,1,0), Theme={BackgroundColor3="Accent"}}, bar)
+    new("UICorner", {CornerRadius=UDim.new(1,0)}, fill)
+    local knob = new("Frame", {Size=UDim2.fromOffset(16,16), AnchorPoint=Vector2.new(0.5,0.5), Position=UDim2.new(0,0,0.5,0), BackgroundColor3=Color3.new(1,1,1)}, bar)
+    new("UICorner", {CornerRadius=UDim.new(1,0)}, knob)
+
+    local value = default
+    local function snap(v)
+        local steps = (v - min) / step
+        local snapped = math.floor(steps + 0.5) * step + min
+        return math.clamp(snapped, min, max)
+    end
+    local function render()
+        local p = (value - min)/(max - min)
+        fill.Size = UDim2.new(p,0,1,0)
+        knob.Position = UDim2.new(p,0,0.5,0)
+        valLabel.Text = tostring(value) .. suffix
+    end
+    local function setValue(v)
+        value = snap(v)
+        render()
+        if cb then cb(value) end
+    end
+    local function setFromX(x)
+        local sizeX = bar.AbsoluteSize.X
+        local absX = bar.AbsolutePosition.X
+        if sizeX <= 0 then return end
+        local frac = (x - absX)/sizeX
+        frac = math.clamp(frac,0,1)
+        setValue(min + (max-min)*frac)
+    end
+    local dragging = false
+    bind(hit.InputBegan, function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+            dragging = true
+            setFromX(i.Position.X)
+        end
+    end)
+    bind(UserInputService.InputChanged, function(i)
+        if dragging and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then
+            setFromX(i.Position.X)
+        end
+    end)
+    bind(UserInputService.InputEnded, function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+    task.defer(function() setValue(default) end)
+    local api = {Frame=f, Get=function() return value end, Set=setValue, SetValue=setValue, SetText=function(t) titleLbl.Text=t end, Destroy=function() f:Destroy() end}
+    return api
+end
+
+-- Simple
+local function addLabel(parent, text)
+    return new("TextLabel", {Size=UDim2.new(1,-24,0,0), AutomaticSize=Enum.AutomaticSize.Y, Text=text, Font=Enum.Font.Gotham, TextSize=13, BackgroundTransparency=1, TextWrapped=true, TextXAlignment=Enum.TextXAlignment.Left, Theme={TextColor3="Text"}}, parent)
+end
+local function addSection(parent, title, collapsible)
+    local f = new("Frame", {Size=UDim2.new(1,-24,0,28), BackgroundTransparency=1}, parent)
+    new("TextLabel", {Text=title:upper(), Size=UDim2.new(1,0,0,16), Font=Enum.Font.GothamBold, TextSize=11, BackgroundTransparency=1, TextXAlignment=Enum.TextXAlignment.Left, Theme={TextColor3="TextMuted"}}, f)
+    new("Frame", {Size=UDim2.new(1,0,0,1), Position=UDim2.new(0,0,0,20), Theme={BackgroundColor3="Border"}}, f)
+    return f
+end
+local function addTextbox(parent, opts)
+    opts = opts or {}
+    local f = new("Frame", {Size=UDim2.new(1,-24,0,36), Theme={BackgroundColor3="ComponentBg"}}, parent)
+    new("UICorner", {CornerRadius=UDim.new(0,6)}, f)
+    local box = new("TextBox", {Size=UDim2.new(1,-16,1,0), Position=UDim2.new(0,8,0,0), BackgroundTransparency=1, PlaceholderText=opts.Placeholder or "Type...", Text="", Font=Enum.Font.Gotham, TextSize=13, TextXAlignment=Enum.TextXAlignment.Left, Theme={TextColor3="Text", PlaceholderColor3="TextMuted"}}, f)
+    local cb = opts.Callback
+    bind(box.FocusLost, function(enter) if enter and cb then cb(box.Text) end end)
+    return {Frame=f, Get=function() return box.Text end, Set=function(t) box.Text=t end, Destroy=function() f:Destroy() end}
+end
+
+-- Home kept simple; demos moved to Settings
+-- Examples
+addBtn(Settings, "Theme: Midnight", function() activeTheme="Midnight"; applyTheme({}); Float.BackgroundColor3=T().Accent end)
+addBtn(Settings, "Theme: Dark", function() activeTheme="Dark"; applyTheme({}); Float.BackgroundColor3=T().Accent end)
+addBtn(Settings, "Theme: Light", function() activeTheme="Light"; applyTheme({}); Float.BackgroundColor3=T().Accent end)
+
+local demoToggle = addToggle(Settings, "Ativar toggle", false, function(v) print("Toggle:", v) end)
+addSlider(Settings, {Name="Velocidade", Min=0, Max=100, Default=50, Step=1, Callback=function(v) print("Slider:", v) end})
+-- DEMO ONLY: does not change Humanoid
+addSlider(PlayerT, {Name="Velocidade Jogador (DEMO, não altera Humanoid)", Min=16, Max=100, Default=16, Step=1, Callback=function(v) print("Velocidade (demo):", v) end})
+addTextbox(Settings, {Placeholder="Nome...", Callback=function(t) print("Textbox:", t) end})
+addSection(Settings, "Exemplos")
+addLabel(Settings, "Numericos e componentes de exemplo abaixo.")
+addBtn(Settings, "Mostrar notificação", function()
+    notify({Title="Carregado!", Text="Interface carregada com sucesso.", Duration=3, Type="info"})
+end)
+
+
+-- Visual/Settings informational tabs
+addLabel(Visual, "Aba Visual: demonstração/informativa. Componentes de visual ainda não implementados.")
+addLabel(Settings, "Aba Settings: demonstração/informativa. Configurações persistentes não implementadas.")
+
+
+-- === Inlined FastAttack module (Matsune) ===
+local function initFastAttack()
 -- FastAttack (extracted from Matsune Blox Fruits script)
 -- Server-side real fast attack: uses RE/RegisterAttack and RE/RegisterHit
 -- Usage:
@@ -482,11 +631,14 @@ end
 
 _G.MatsuneFastAttack = FastAttack
 
+-- (inlined)
+
 return FastAttack
-
 end
+_G.MatsuneFastAttack = initFastAttack()
 
-do -- inline ESP module
+-- === Inlined ESP module (Matsune) ===
+local function initESP()
 -- ESP module extracted from Matsune logic (Roblox)
 -- Toggles: Island, Player, Chest, DevilFruit, Flower, Apple/RealFruit
 local Players = game:GetService("Players")
@@ -693,136 +845,10 @@ _G.MatsuneESP = ESP
 ESP:StartLoop()
 
 return ESP
-
 end
+_G.MatsuneESP = initESP()
 
--- Components
-local function addBtn(parent, text, cb)
-    local b = new("TextButton", {Size=UDim2.new(1,-24,0,36), Text=text, Font=Enum.Font.Gotham, TextSize=14, AutoButtonColor=false, Active=true, Theme={TextColor3="Text", BackgroundColor3="ComponentBg"}}, parent)
-    new("UICorner", {CornerRadius=UDim.new(0,6)}, b)
-    bind(b.MouseEnter, function() b.BackgroundColor3 = T().Hover end)
-    bind(b.MouseLeave, function() b.BackgroundColor3 = T().ComponentBg end)
-    bind(b.MouseButton1Click, function() if cb then cb() end end)
-    return b
-end
 
-local function addToggle(parent, label, default, cb)
-    local f = new("Frame", {Size=UDim2.new(1,-24,0,36), Theme={BackgroundColor3="ComponentBg"}}, parent)
-    new("UICorner", {CornerRadius=UDim.new(0,6)}, f)
-    local lbl = new("TextLabel", {Text=label, Size=UDim2.new(1,-60,1,0), Position=UDim2.new(0,12,0,0), Font=Enum.Font.Gotham, TextSize=14, BackgroundTransparency=1, TextXAlignment=Enum.TextXAlignment.Left, Theme={TextColor3="Text"}}, f)
-    local track = new("Frame", {Size=UDim2.fromOffset(40,20), Position=UDim2.new(1,-52,0.5,-10), Theme={BackgroundColor3="Surface"}}, f)
-    new("UICorner", {CornerRadius=UDim.new(1,0)}, track)
-    local knob = new("Frame", {Size=UDim2.fromOffset(16,16), Position=UDim2.new(0,2,0.5,-8), BackgroundColor3=Color3.new(1,1,1)}, track)
-    new("UICorner", {CornerRadius=UDim.new(1,0)}, knob)
-    local val = (default==true)
-    local render = function(instant)
-        local info = instant and TweenInfo.new(0) or TweenInfo.new(0.15)
-        TweenService:Create(knob, info, {Position = val and UDim2.new(1,-18,0.5,-8) or UDim2.new(0,2,0.5,-8)}):Play()
-        TweenService:Create(track, info, {BackgroundColor3 = val and T().Accent or T().Surface}):Play()
-    end
-    local refreshTheme = function() render(true) end
-    render(true)
-    local function toggle() val = not val; render(false); if cb then cb(val) end end
-    local btnArea = new("TextButton", {Size=UDim2.fromOffset(44,24), Position=UDim2.new(1,-54,0.5,-12), BackgroundTransparency=1, Text=""}, f)
-    bind(btnArea.MouseButton1Click, toggle)
-    local api = {Frame=f, Value=val, Get=function() return val end, Set=function(v) val=(v==true); render(false); if cb then cb(val) end end, SetText=function(t) lbl.Text=t end, RefreshTheme=refreshTheme, Destroy=function() f:Destroy() end}
-    return api
-end
-
-local function addSlider(parent, opts)
-    opts = opts or {}
-    local min = opts.Min or 0
-    local max = opts.Max or 1
-    if not (max > min) then max = min + 1 end
-    local step = opts.Step or 0.01
-    if step <= 0 then step = 0.01 end
-    local default = opts.Default or min
-    if default < min then default = min end
-    if default > max then default = max end
-    local suffix = opts.Suffix or ""
-    local cb = opts.Callback
-    local name = opts.Name or "Slider"
-    local f = new("Frame", {Size=UDim2.new(1,-24,0,56), Theme={BackgroundColor3="ComponentBg"}}, parent)
-    new("UICorner", {CornerRadius=UDim.new(0,6)}, f)
-    local titleLbl = new("TextLabel", {Text=name, Size=UDim2.new(1,-70,0,20), Position=UDim2.new(0,12,0,4), Font=Enum.Font.Gotham, TextSize=13, BackgroundTransparency=1, TextXAlignment=Enum.TextXAlignment.Left, TextTruncate=Enum.TextTruncate.AtEnd, Theme={TextColor3="Text"}}, f)
-    local valLabel = new("TextLabel", {Size=UDim2.new(0,60,0,20), Position=UDim2.new(1,-72,0,4), Font=Enum.Font.Gotham, TextSize=13, BackgroundTransparency=1, TextXAlignment=Enum.TextXAlignment.Right, Theme={TextColor3="TextMuted"}}, f)
-    local hit = new("Frame", {Size=UDim2.new(1,-24,0,28), Position=UDim2.new(0,12,0,24), BackgroundTransparency=1, Active=true}, f)
-    local bar = new("Frame", {Size=UDim2.new(1,0,0,8), Position=UDim2.new(0,0,0.5,-4), Theme={BackgroundColor3="Surface"}}, hit)
-    new("UICorner", {CornerRadius=UDim.new(1,0)}, bar)
-    local fill = new("Frame", {Size=UDim2.new(0,0,1,0), Theme={BackgroundColor3="Accent"}}, bar)
-    new("UICorner", {CornerRadius=UDim.new(1,0)}, fill)
-    local knob = new("Frame", {Size=UDim2.fromOffset(16,16), AnchorPoint=Vector2.new(0.5,0.5), Position=UDim2.new(0,0,0.5,0), BackgroundColor3=Color3.new(1,1,1)}, bar)
-    new("UICorner", {CornerRadius=UDim.new(1,0)}, knob)
-
-    local value = default
-    local function snap(v)
-        local steps = (v - min) / step
-        local snapped = math.floor(steps + 0.5) * step + min
-        return math.clamp(snapped, min, max)
-    end
-    local function render()
-        local p = (value - min)/(max - min)
-        fill.Size = UDim2.new(p,0,1,0)
-        knob.Position = UDim2.new(p,0,0.5,0)
-        valLabel.Text = tostring(value) .. suffix
-    end
-    local function setValue(v)
-        value = snap(v)
-        render()
-        if cb then cb(value) end
-    end
-    local function setFromX(x)
-        local sizeX = bar.AbsoluteSize.X
-        local absX = bar.AbsolutePosition.X
-        if sizeX <= 0 then return end
-        local frac = (x - absX)/sizeX
-        frac = math.clamp(frac,0,1)
-        setValue(min + (max-min)*frac)
-    end
-    local dragging = false
-    bind(hit.InputBegan, function(i)
-        if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
-            dragging = true
-            setFromX(i.Position.X)
-        end
-    end)
-    bind(UserInputService.InputChanged, function(i)
-        if dragging and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then
-            setFromX(i.Position.X)
-        end
-    end)
-    bind(UserInputService.InputEnded, function(i)
-        if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
-            dragging = false
-        end
-    end)
-    task.defer(function() setValue(default) end)
-    local api = {Frame=f, Get=function() return value end, Set=setValue, SetValue=setValue, SetText=function(t) titleLbl.Text=t end, Destroy=function() f:Destroy() end}
-    return api
-end
-
--- Simple
-local function addLabel(parent, text)
-    return new("TextLabel", {Size=UDim2.new(1,-24,0,0), AutomaticSize=Enum.AutomaticSize.Y, Text=text, Font=Enum.Font.Gotham, TextSize=13, BackgroundTransparency=1, TextWrapped=true, TextXAlignment=Enum.TextXAlignment.Left, Theme={TextColor3="Text"}}, parent)
-end
-local function addSection(parent, title, collapsible)
-    local f = new("Frame", {Size=UDim2.new(1,-24,0,28), BackgroundTransparency=1}, parent)
-    new("TextLabel", {Text=title:upper(), Size=UDim2.new(1,0,0,16), Font=Enum.Font.GothamBold, TextSize=11, BackgroundTransparency=1, TextXAlignment=Enum.TextXAlignment.Left, Theme={TextColor3="TextMuted"}}, f)
-    new("Frame", {Size=UDim2.new(1,0,0,1), Position=UDim2.new(0,0,0,20), Theme={BackgroundColor3="Border"}}, f)
-    return f
-end
-local function addTextbox(parent, opts)
-    opts = opts or {}
-    local f = new("Frame", {Size=UDim2.new(1,-24,0,36), Theme={BackgroundColor3="ComponentBg"}}, parent)
-    new("UICorner", {CornerRadius=UDim.new(0,6)}, f)
-    local box = new("TextBox", {Size=UDim2.new(1,-16,1,0), Position=UDim2.new(0,8,0,0), BackgroundTransparency=1, PlaceholderText=opts.Placeholder or "Type...", Text="", Font=Enum.Font.Gotham, TextSize=13, TextXAlignment=Enum.TextXAlignment.Left, Theme={TextColor3="Text", PlaceholderColor3="TextMuted"}}, f)
-    local cb = opts.Callback
-    bind(box.FocusLost, function(enter) if enter and cb then cb(box.Text) end end)
-    return {Frame=f, Get=function() return box.Text end, Set=function(t) box.Text=t end, Destroy=function() f:Destroy() end}
-end
-
--- Home kept simple; demos moved to Settings
--- Examples
 -- Farm tab
 addSection(Farm, "Farm")
 local fastToggle = addToggle(Farm, "Fast Attack (Matsune, server hits)", false, function(v)
@@ -840,34 +866,17 @@ end)
 -- ESP tab
 addSection(ESPtab, "ESP")
 local espApi = _G.MatsuneESP
-local names = {"Island","Player","Chest","DevilFruit","Flower","RealFruit"}
-for _, nm in ipairs(names) do
-    addToggle(ESPtab, nm.." ESP", false, function(v)
-        if espApi and espApi.Set then espApi.Set(espApi, nm, v) end
-        if espApi then espApi[nm.."ESP"] = v end
+local function mkEspToggle(label, key)
+    return addToggle(ESPtab, label, false, function(v)
+        if espApi and espApi.Set then espApi:Set(key, v) end
     end)
 end
-
-addBtn(Settings, "Theme: Midnight", function() activeTheme="Midnight"; applyTheme({}); Float.BackgroundColor3=T().Accent end)
-addBtn(Settings, "Theme: Dark", function() activeTheme="Dark"; applyTheme({}); Float.BackgroundColor3=T().Accent end)
-addBtn(Settings, "Theme: Light", function() activeTheme="Light"; applyTheme({}); Float.BackgroundColor3=T().Accent end)
-
-local demoToggle = addToggle(Settings, "Ativar toggle", false, function(v) print("Toggle:", v) end)
-addSlider(Settings, {Name="Velocidade", Min=0, Max=100, Default=50, Step=1, Callback=function(v) print("Slider:", v) end})
--- DEMO ONLY: does not change Humanoid
-addSlider(PlayerT, {Name="Velocidade Jogador (DEMO, não altera Humanoid)", Min=16, Max=100, Default=16, Step=1, Callback=function(v) print("Velocidade (demo):", v) end})
-addTextbox(Settings, {Placeholder="Nome...", Callback=function(t) print("Textbox:", t) end})
-addSection(Settings, "Exemplos")
-addLabel(Settings, "Numericos e componentes de exemplo abaixo.")
-addBtn(Settings, "Mostrar notificação", function()
-    notify({Title="Carregado!", Text="Interface carregada com sucesso.", Duration=3, Type="info"})
-end)
-
-
-
--- Visual/Settings informational tabs
-addLabel(Visual, "Aba Visual: demonstração/informativa. Componentes de visual ainda não implementados.")
-addLabel(Settings, "Aba Settings: demonstração/informativa. Configurações persistentes não implementadas.")
+mkEspToggle("Island ESP", "Island")
+mkEspToggle("Player ESP", "Player")
+mkEspToggle("Chest ESP", "Chest")
+mkEspToggle("Devil Fruit ESP", "DevilFruit")
+mkEspToggle("Flower ESP", "Flower")
+mkEspToggle("Real Fruit (Apple) ESP", "RealFruit")
 
 -- hotkey
 bind(UserInputService.InputBegan, function(i, gameProcessed)
