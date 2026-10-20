@@ -323,6 +323,379 @@ end)
 bind(Float.MouseEnter, function() Float.BackgroundColor3 = Color3.new(math.min(1,T().Accent.R*1.2), math.min(1,T().Accent.G*1.2), math.min(1,T().Accent.B*1.2)) end)
 bind(Float.MouseLeave, function() Float.BackgroundColor3 = T().Accent end)
 
+do -- inline FastAttack module
+-- FastAttack (extracted from Matsune Blox Fruits script)
+-- Server-side real fast attack: uses RE/RegisterAttack and RE/RegisterHit
+-- Usage:
+--   local FastAttack = require(script:FindFirstChild("FastAttack"))
+--   FastAttack:Start() / FastAttack:Stop()
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Player = Players.LocalPlayer
+
+local Net
+local function resolveNet()
+	local pkg = ReplicatedStorage:FindFirstChild("Packages")
+	if pkg then
+		local n = pkg:FindFirstChild("Net")
+		if n then return n end
+	end
+	local n = ReplicatedStorage:FindFirstChild("Net")
+	if n then return n end
+	local mods = ReplicatedStorage:FindFirstChild("Modules")
+	if mods then
+		local n2 = mods:FindFirstChild("Net")
+		if n2 then return n2 end
+	end
+	return nil
+end
+
+local function SafeWaitForChild(parent, name)
+	if not parent then return nil end
+	for i = 1, 40 do
+		local c = parent:FindFirstChild(name)
+		if c then return c end
+		task.wait(0.25)
+	end
+	return parent:FindFirstChild(name)
+end
+
+Net = resolveNet()
+
+local Enemies = Workspace:FindFirstChild("Enemies") or Workspace:FindFirstChild("Hostiles")
+local Characters = Workspace:FindFirstChild("Characters")
+
+local Settings = {
+	AutoClick = false,
+	ClickDelay = 0
+}
+
+local FastAttack = {
+	Distance = 100,
+	attackMobs = true,
+	attackPlayers = true,
+	Equipped = nil,
+	Running = false,
+	_thread = nil
+}
+
+local RegisterAttack, RegisterHit
+
+if Net then
+	RegisterAttack = SafeWaitForChild(Net, "RE/RegisterAttack")
+	RegisterHit = SafeWaitForChild(Net, "RE/RegisterHit")
+end
+
+local function IsAlive(character)
+	return character and character:FindFirstChild("Humanoid") and character.Humanoid.Health > 0
+end
+
+local function ProcessEnemies(OthersEnemies, Folder)
+	local BasePart = nil
+	if not Folder then return BasePart end
+	for _, Enemy in Folder:GetChildren() do
+		local Head = Enemy:FindFirstChild("Head")
+		if Head and IsAlive(Enemy) and Player:DistanceFromCharacter(Head.Position) < FastAttack.Distance then
+			if Enemy ~= Player.Character then
+				table.insert(OthersEnemies, { Enemy, Head })
+				BasePart = Head
+			end
+		end
+	end
+	return BasePart
+end
+
+function FastAttack:Attack(BasePart, OthersEnemies)
+	if not BasePart or #OthersEnemies == 0 then return end
+	if RegisterAttack then
+		RegisterAttack:FireServer(Settings.ClickDelay or 0)
+	end
+	if RegisterHit then
+		RegisterHit:FireServer(BasePart, OthersEnemies)
+	end
+end
+
+function FastAttack:AttackNearest()
+	local OthersEnemies = {}
+	local Part1 = ProcessEnemies(OthersEnemies, Enemies)
+	local Part2 = ProcessEnemies(OthersEnemies, Characters)
+
+	local character = Player.Character
+	if not character then return end
+	local equippedWeapon = character:FindFirstChildOfClass("Tool")
+
+	if equippedWeapon and equippedWeapon:FindFirstChild("LeftClickRemote") then
+		for _, enemyData in ipairs(OthersEnemies) do
+			local enemy = enemyData[1]
+			local direction = (enemy.HumanoidRootPart.Position - character:GetPivot().Position).Unit
+			pcall(function()
+				equippedWeapon.LeftClickRemote:FireServer(direction, 1)
+			end)
+		end
+	elseif #OthersEnemies > 0 then
+		self:Attack(Part1 or Part2, OthersEnemies)
+	else
+		task.wait(0)
+	end
+end
+
+function FastAttack:BladeHits()
+	local Equipped = IsAlive(Player.Character) and Player.Character:FindFirstChildOfClass("Tool")
+	if Equipped and Equipped.ToolTip ~= "Gun" then
+		self:AttackNearest()
+	else
+		task.wait(0)
+	end
+end
+
+function FastAttack:Start()
+	if self.Running then return end
+	self.Running = true
+	Settings.AutoClick = true
+	self._thread = task.spawn(function()
+		while self.Running and Settings.AutoClick do
+			self:BladeHits()
+			task.wait(Settings.ClickDelay)
+		end
+	end)
+end
+
+function FastAttack:Stop()
+	self.Running = false
+	Settings.AutoClick = false
+	if self._thread then
+		task.cancel(self._thread)
+		self._thread = nil
+	end
+end
+
+function FastAttack:SetDelay(v)
+	Settings.ClickDelay = v or 0
+end
+
+function FastAttack:SetDistance(v)
+	self.Distance = v or 100
+end
+
+_G.MatsuneFastAttack = FastAttack
+
+return FastAttack
+
+end
+
+do -- inline ESP module
+-- ESP module extracted from Matsune logic (Roblox)
+-- Toggles: Island, Player, Chest, DevilFruit, Flower, Apple/RealFruit
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local LocalPlayer = Players.LocalPlayer
+
+local ESP = {
+	IslandESP=false,
+	PlayerESP=false,
+	ChestESP=false,
+	DevilFruitESP=false,
+	FlowerESP=false,
+	RealFruitESP=false
+}
+ESP.__index = ESP
+
+local Number = tostring(math.random(1,999))
+
+local function round(n) return math.floor(n+0.5) end
+
+local function makeBillboard(parent, name, text, color, size)
+	local bb = Instance.new("BillboardGui")
+	bb.Name = name
+	bb.Size = UDim2.new(0,220,0,50)
+	bb.AlwaysOnTop = true
+	bb.ExtentsOffset = Vector3.new(0,3,0)
+	local tl = Instance.new("TextLabel")
+	tl.Size = UDim2.new(1,0,1,0)
+	tl.BackgroundTransparency = 1
+	tl.TextStrokeTransparency = 0.5
+	tl.Font = Enum.Font.GothamBold
+	tl.TextSize = 14
+	tl.TextColor3 = color or Color3.fromRGB(255,255,255)
+	tl.Text = text or ""
+	tl.Parent = bb
+	bb.Parent = parent
+	return bb
+end
+
+local function cleanup(parent, name)
+	if parent and parent:FindFirstChild(name) then pcall(function() parent[name]:Destroy() end) end
+end
+
+function ESP:UpdateIsland()
+	for _, v in pairs(Workspace:GetChildren()) do
+		if v.Name and v.Name:match("Island") or (v:FindFirstChild("Head")==nil and v.ClassName=="Part") then
+			if self.IslandESP then
+				if not v:FindFirstChild("NameEsp") then
+					makeBillboard(v, "NameEsp", v.Name, Color3.fromRGB(255,255,255))
+				end
+				if v:FindFirstChild("NameEsp") then
+					local d = (LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Head") and LocalPlayer.Character.Head.Position - v.Position).Magnitude or 0
+					v.NameEsp.TextLabel.Text = (v.Name .. "\n" .. round(d/3) .. " Distance")
+				end
+			else
+				cleanup(v, "NameEsp")
+			end
+		end
+	end
+end
+
+function ESP:UpdatePlayers()
+	for _, v in pairs(Players:GetPlayers()) do
+		if v ~= LocalPlayer and v.Character and v.Character:FindFirstChild("Head") then
+			if self.PlayerESP then
+				if not v.Character.Head:FindFirstChild("NameEsp"..Number) then
+					makeBillboard(v.Character.Head, "NameEsp"..Number, v.Name, Color3.fromRGB(0,255,100))
+				end
+				local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Head")
+				local other = v.Character.Head
+				if root and other then
+					local d = (root.Position - other.Position).Magnitude
+					local hp = v.Character:FindFirstChild("Humanoid")
+					local pct = hp and (hp.Health*100/math.max(1,hp.MaxHealth)) or 0
+					v.Character.Head["NameEsp"..Number].TextLabel.Text = (v.Name .. " | " .. round(d/3) .. " Distance\nHealth: " .. round(pct) .. "%")
+				end
+			else
+				cleanup(v.Character.Head, "NameEsp"..Number)
+			end
+		end
+	end
+end
+
+function ESP:UpdateChest()
+	for _, chest in pairs(Workspace:GetDescendants()) do
+		if chest.Name and chest.Name:lower():match("chest") then
+			if self.ChestESP then
+				if not chest:FindFirstChild("ChestEsp") then
+					makeBillboard(chest, "ChestEsp", "Chest", Color3.fromRGB(255,215,0))
+				end
+				if chest:FindFirstChild("ChestEsp") then
+					local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Head")
+					if root then
+						local d = (root.Position - chest.Position).Magnitude
+						chest.ChestEsp.TextLabel.Text = ("Chest\n" .. round(d/3) .. " M")
+					end
+				end
+			else
+				cleanup(chest, "ChestEsp")
+			end
+		end
+	end
+end
+
+function ESP:UpdateDevilFruit()
+	for _, v in pairs(Workspace:GetChildren()) do
+		if v.Name and v.Name:match("Fruit") then
+			if self.DevilFruitESP then
+				if not (v:FindFirstChild("Handle") or v.PrimaryPart) then continue end
+				local attach = v:FindFirstChild("Handle") or v.PrimaryPart
+				if not attach then continue end
+				if not attach:FindFirstChild("NameEsp"..Number) then
+					makeBillboard(attach, "NameEsp"..Number, v.Name, Color3.fromRGB(255,0,255))
+				end
+				if attach:FindFirstChild("NameEsp"..Number) then
+					local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Head")
+					if root then
+						local d = (root.Position - attach.Position).Magnitude
+						attach["NameEsp"..Number].TextLabel.Text = (v.Name .. "\n" .. round(d/3) .. " Distance")
+					end
+				end
+			else
+				local attach = v:FindFirstChild("Handle") or v.PrimaryPart
+				if attach then cleanup(attach, "NameEsp"..Number) end
+			end
+		end
+	end
+end
+
+function ESP:UpdateFlower()
+	for _, v in pairs(Workspace:GetChildren()) do
+		if v.Name == "Flower1" or v.Name == "Flower2" then
+			if self.FlowerESP then
+				if not v:FindFirstChild("EspFlower"..Number) then
+					makeBillboard(v, "EspFlower"..Number, (v.Name=="Flower1" and "Blue Flower" or "Red Flower"), Color3.fromRGB(100,100,255))
+				end
+				if v:FindFirstChild("EspFlower"..Number) then
+					local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Head")
+					if root then
+						local d = (root.Position - v.Position).Magnitude
+						v["EspFlower"..Number].TextLabel.Text = ((v.Name=="Flower1" and "Blue Flower" or "Red Flower") .. "\n" .. round(d/3) .. " Distance")
+						v["EspFlower"..Number].TextLabel.TextColor3 = (v.Name=="Flower1" and Color3.fromRGB(40,40,255) or Color3.fromRGB(255,100,100))
+					end
+				end
+			else
+				cleanup(v, "EspFlower"..Number)
+			end
+		end
+	end
+end
+
+function ESP:UpdateRealFruit()
+	local spawner = Workspace:FindFirstChild("AppleSpawner")
+	if not spawner then return end
+	for _, v in pairs(spawner:GetChildren()) do
+		if self.RealFruitESP then
+			if v.Name == "Fruit" then
+				if not v:FindFirstChild("NameEsp"..Number) then
+					makeBillboard(v, "NameEsp"..Number, "Apple (Real)", Color3.fromRGB(255,50,50))
+				end
+				if v:FindFirstChild("NameEsp"..Number) then
+					local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Head")
+					if root then
+						local d = (root.Position - v.Position).Magnitude
+						v["NameEsp"..Number].TextLabel.Text = ("Apple (Real)" .. "\n" .. round(d/3) .. " Distance")
+					end
+				end
+			end
+		else
+			cleanup(v, "NameEsp"..Number)
+		end
+	end
+end
+
+function ESP:StartLoop()
+	if self._loop then return end
+	self._loop = task.spawn(function()
+		while true do
+			pcall(function() self:UpdateIsland() end)
+			pcall(function() self:UpdatePlayers() end)
+			pcall(function() self:UpdateChest() end)
+			pcall(function() self:UpdateDevilFruit() end)
+			pcall(function() self:UpdateFlower() end)
+			pcall(function() self:UpdateRealFruit() end)
+			task.wait(1)
+		end
+	end)
+end
+
+function ESP:StopLoop()
+	if self._loop then pcall(task.cancel, self._loop); self._loop = nil end
+end
+
+function ESP:Set(name, v)
+	if self[name.."ESP"] == nil then
+		-- support keys like IslandESP already present
+	end
+	self[name] = v
+	-- map simple names
+	self[name.."ESP"] = v
+end
+
+_G.MatsuneESP = ESP
+ESP:StartLoop()
+
+return ESP
+
+end
+
 -- Components
 local function addBtn(parent, text, cb)
     local b = new("TextButton", {Size=UDim2.new(1,-24,0,36), Text=text, Font=Enum.Font.Gotham, TextSize=14, AutoButtonColor=false, Active=true, Theme={TextColor3="Text", BackgroundColor3="ComponentBg"}}, parent)
@@ -454,11 +827,6 @@ end
 addSection(Farm, "Farm")
 local fastToggle = addToggle(Farm, "Fast Attack (Matsune, server hits)", false, function(v)
     if v then
-        if not _G.MatsuneFastAttack then
-            pcall(function()
-                loadstring(game:HttpGet("https://raw.githubusercontent.com/danielsolzapo-dev/roblox-scripts/main/FastAttack.luau"))()
-            end)
-        end
         if _G.MatsuneFastAttack and _G.MatsuneFastAttack.Start then
             _G.MatsuneFastAttack:Start()
         end
@@ -471,11 +839,7 @@ end)
 
 -- ESP tab
 addSection(ESPtab, "ESP")
-local espApi = nil
-pcall(function()
-    loadstring(game:HttpGet("https://raw.githubusercontent.com/danielsolzapo-dev/roblox-scripts/main/ESP.luau"))()
-    espApi = _G.MatsuneESP
-end)
+local espApi = _G.MatsuneESP
 local names = {"Island","Player","Chest","DevilFruit","Flower","RealFruit"}
 for _, nm in ipairs(names) do
     addToggle(ESPtab, nm.." ESP", false, function(v)
