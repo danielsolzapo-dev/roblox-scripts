@@ -12,10 +12,18 @@ local conns = {}
 local tasksPending = {}
 local function bind(sig, fn) local c = sig:Connect(fn); conns[#conns+1]=c; return c end
 local function trackTask(t) tasksPending[#tasksPending+1]=t end
+local destroyed = false
+local cleanupFns = {}
+local ownedGui
 local function unload()
+    if destroyed then return end
+    destroyed = true
+    for i = #cleanupFns, 1, -1 do pcall(cleanupFns[i]) end
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     for _, t in ipairs(tasksPending) do pcall(function() if typeof(t)=="thread" then task.cancel(t) end end) end
-    if shared._uilibGui then pcall(function() shared._uilibGui:Destroy() end) end
+    if ownedGui then pcall(function() ownedGui:Destroy() end) end
+    if shared._uilibGui == ownedGui then shared._uilibGui = nil end
+    if shared._UILibUnload == unload then shared._UILibUnload = nil end
 end
 if shared._UILibUnload then pcall(shared._UILibUnload) end
 local old = PlayerGui:FindFirstChild("_UILib"); if old then old:Destroy() end
@@ -44,6 +52,7 @@ local activeTheme = "Dark"
 local function T() return THEMES[activeTheme] end
 
 local themeRegistry = {}
+local themeRefreshers = {}
 local function reg(obj, prop, key)
     obj[prop] = T()[key]
     table.insert(themeRegistry, {Obj=obj, Prop=prop, Key=key})
@@ -56,6 +65,7 @@ local function applyTheme(updateFns)
         if not o or not o.Parent then table.remove(themeRegistry, i)
         else pcall(function() o[prop] = T()[key] end) end
     end
+    for _, refresh in ipairs(themeRefreshers) do refresh() end
     if typeof(updateFns) == "table" then for _, fn in ipairs(updateFns) do pcall(fn) end end
 end
 
@@ -70,18 +80,23 @@ end
 
 local uiGui = new("ScreenGui", {Name="_UILib", ResetOnSpawn=false, IgnoreGuiInset=true, ZIndexBehavior=Enum.ZIndexBehavior.Sibling}, PlayerGui)
 shared._uilibGui = uiGui
+ownedGui = uiGui
+bind(uiGui.Destroying, unload)
+shared._UILibUnload = unload
 
 -- state
 local isUIOpen = false
 local state = "normal" -- normal/min/max
 local previousState = "normal"
-local curTweens = {}
-local function cancelTweens()
-    for _,tw in ipairs(curTweens) do pcall(function() tw:Cancel() end) end
-    curTweens = {}
-end
+-- Visibility and geometry own separate tweens; neither can interrupt the other.
+local openTween, sizeTween
+local openVersion = 0
+table.insert(cleanupFns, function()
+    openVersion = openVersion + 1
+    if openTween then openTween:Cancel() end
+    if sizeTween then sizeTween:Cancel() end
+end)
 local function sizeFor(s)
-    local bw,bh,mw,mh = baseW, baseH, maxW, maxH
     baseW,baseH,maxW,maxH = computeSizes()
     if s == "min" then return UDim2.fromOffset(baseW, HDR) end
     if s == "max" then return UDim2.fromOffset(maxW, maxH) end
@@ -101,22 +116,23 @@ reg(new("UIStroke", {Thickness=1, Theme={Color="Border"}}, Main), "Color", "Bord
 UIScale = new("UIScale", {Scale=0.92}, Main)
 
 local function setOpen(v)
+    if destroyed then return end
     isUIOpen = v
-    if v then
-        Main.Visible = true
-        cancelTweens()
-        UIScale.Scale = 0.92
-        local tw = TweenService:Create(UIScale, TweenInfo.new(0.2), {Scale=1}); curTweens[#curTweens+1]=tw; tw:Play()
-    else
-        cancelTweens()
-        local myToken = math.random(1, 1e9)
-        _G._closeToken = myToken
-        local tw = TweenService:Create(UIScale, TweenInfo.new(0.15), {Scale=0.92}); curTweens[#curTweens+1]=tw; tw:Play()
-        local t = task.delay(0.15, function()
-            if _G._closeToken == myToken then Main.Visible = false end
+    openVersion = openVersion + 1
+    local version = openVersion
+    if openTween then openTween:Cancel() end
+    if v then Main.Visible = true end
+    openTween = TweenService:Create(UIScale, TweenInfo.new(v and 0.2 or 0.15),
+        {Scale = v and 1 or 0.92})
+    if not v then
+        openTween.Completed:Once(function(playback)
+            if playback == Enum.PlaybackState.Completed and not destroyed
+                and openVersion == version and not isUIOpen then
+                Main.Visible = false
+            end
         end)
-        trackTask(t)
     end
+    openTween:Play()
 end
 local function toggleUI()
     if isUIOpen then setOpen(false) else setOpen(true) end
@@ -148,10 +164,12 @@ new("Frame", {Size=UDim2.new(1,0,0,1), Position=UDim2.new(0,0,1,-1), BorderSizeP
 
 -- setState with prev save
 local function setState(s)
-    previousState = state
+    if destroyed then return end
+    if s == "min" and state ~= "min" then previousState = state end
     state = s
-    cancelTweens()
-    local tw = TweenService:Create(Main, TweenInfo.new(0.2), {Size = sizeFor(state)}); curTweens[#curTweens+1]=tw; tw:Play()
+    if sizeTween then sizeTween:Cancel() end
+    sizeTween = TweenService:Create(Main, TweenInfo.new(0.2), {Size = sizeFor(state)})
+    sizeTween:Play()
 end
 bind(MinBtn.MouseButton1Click, function() if state=="min" then setState(previousState or "normal") else setState("min") end end)
 bind(MaxBtn.MouseButton1Click, function() setState(state=="max" and "normal" or "max") end)
@@ -159,10 +177,12 @@ bind(CloseBtn.MouseButton1Click, function() setOpen(false) end)
 
 -- drag
 local draggingHeader=false
+local headerTouch
 local hdStart, hmStart
 bind(Header.InputBegan, function(i)
     if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
         draggingHeader=true; hdStart=i.Position
+        headerTouch = i.UserInputType==Enum.UserInputType.Touch and i or nil
         -- absolute position in pixels from current UDim2
         local pos = Main.Position
         local vp = viewport()
@@ -174,22 +194,18 @@ bind(Header.InputBegan, function(i)
 end)
 bind(UserInputService.InputChanged, function(i)
     if draggingHeader and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then
+        if headerTouch and i ~= headerTouch then return end
         local d = i.Position - hdStart
         local sz = Main.AbsoluteSize
         local vp = viewport()
-        -- account anchorpoint
         local ap = Main.AnchorPoint
-        local left = hmStart.X + d.X - sz.X*ap.X
-        local top = hmStart.Y + d.Y - sz.Y*ap.Y
-        local maxX = vp.X - sz.X*(1-ap.X)
-        local maxY = vp.Y - sz.Y*(1-ap.Y)
-        left = math.clamp(left, -sz.X*ap.X, maxX)
-        top = math.clamp(top, -sz.Y*ap.Y, maxY)
-        Main.Position = UDim2.new(0, left + sz.X*ap.X, 0, top + sz.Y*ap.Y)
+        local x = math.clamp(hmStart.X + d.X, sz.X*ap.X, math.max(sz.X*ap.X, vp.X-sz.X*(1-ap.X)))
+        local y = math.clamp(hmStart.Y + d.Y, sz.Y*ap.Y, math.max(sz.Y*ap.Y, vp.Y-sz.Y*(1-ap.Y)))
+        Main.Position = UDim2.fromOffset(x, y)
     end
 end)
 bind(UserInputService.InputEnded, function(i)
-    if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then draggingHeader=false end
+    if (headerTouch and i == headerTouch) or (not headerTouch and i.UserInputType==Enum.UserInputType.MouseButton1) then draggingHeader=false; headerTouch=nil end
 end)
 
 -- Sidebar
@@ -223,9 +239,9 @@ local function addTab(name)
     tab.RefreshTheme = function()
         if tab.Indicator then tab.Indicator.BackgroundTransparency = tab.Selected and 0 or 1 end
         if tab.Btn then tab.Btn.TextColor3 = tab.Selected and T().Text or T().TextMuted end
-        if tab.Btn and not tab.Selected then tab.Btn.BackgroundColor3 = T().ComponentBg end
+        if tab.Btn then tab.Btn.BackgroundColor3 = tab.Selected and T().Hover or T().ComponentBg end
     end
-    table.insert(updateFns, tab.RefreshTheme)
+    table.insert(themeRefreshers, function() if btn.Parent then tab.RefreshTheme() end end)
     bind(btn.MouseButton1Click, function()
         for _, t in ipairs(tabs) do
             t.Page.Visible = false
@@ -255,6 +271,7 @@ local Visual = addTab("Visual")
 local Settings = addTab("Settings")
 local Farm = addTab("Farm")
 local ESPtab = addTab("ESP")
+local Fruit = addTab("Fruit")
 
 for i,t in ipairs(tabs) do
     t.Page.Visible = (i==1); t.Selected = (i==1)
@@ -342,12 +359,22 @@ local function addToggle(parent, label, default, cb)
     local knob = new("Frame", {Size=UDim2.fromOffset(16,16), Position=UDim2.new(0,2,0.5,-8), BackgroundColor3=Color3.new(1,1,1)}, track)
     new("UICorner", {CornerRadius=UDim.new(1,0)}, knob)
     local val = (default==true)
+    local knobTween, trackTween
     local render = function(instant)
+        if knobTween then knobTween:Cancel() end
+        if trackTween then trackTween:Cancel() end
         local info = instant and TweenInfo.new(0) or TweenInfo.new(0.15)
-        TweenService:Create(knob, info, {Position = val and UDim2.new(1,-18,0.5,-8) or UDim2.new(0,2,0.5,-8)}):Play()
-        TweenService:Create(track, info, {BackgroundColor3 = val and T().Accent or T().Surface}):Play()
+        knobTween = TweenService:Create(knob, info, {Position = val and UDim2.new(1,-18,0.5,-8) or UDim2.new(0,2,0.5,-8)})
+        trackTween = TweenService:Create(track, info, {BackgroundColor3 = val and T().Accent or T().Surface})
+        knobTween:Play()
+        trackTween:Play()
     end
-    local refreshTheme = function() render(true) end
+    local refreshTheme = function() if f.Parent then render(true) end end
+    table.insert(themeRefreshers, refreshTheme)
+    table.insert(cleanupFns, function()
+        if knobTween then knobTween:Cancel() end
+        if trackTween then trackTween:Cancel() end
+    end)
     render(true)
     local function toggle() val = not val; render(false); if cb then cb(val) end end
     local btnArea = new("TextButton", {Size=UDim2.fromOffset(44,24), Position=UDim2.new(1,-54,0.5,-12), BackgroundTransparency=1, Text=""}, f)
@@ -423,7 +450,7 @@ local function addSlider(parent, opts)
             dragging = false
         end
     end)
-    task.defer(function() setValue(default) end)
+    trackTask(task.defer(function() if not destroyed and f.Parent then setValue(default) end end))
     local api = {Frame=f, Get=function() return value end, Set=setValue, SetValue=setValue, SetText=function(t) titleLbl.Text=t end, Destroy=function() f:Destroy() end}
     return api
 end
@@ -635,7 +662,9 @@ _G.MatsuneFastAttack = FastAttack
 
 return FastAttack
 end
-_G.MatsuneFastAttack = initFastAttack()
+local fastAttackApi = initFastAttack()
+_G.MatsuneFastAttack = fastAttackApi
+table.insert(cleanupFns, function() fastAttackApi:Stop() end)
 
 -- === Inlined ESP module (Matsune) ===
 local function initESP()
@@ -846,7 +875,17 @@ ESP:StartLoop()
 
 return ESP
 end
-_G.MatsuneESP = initESP()
+local ownedESP = initESP()
+_G.MatsuneESP = ownedESP
+table.insert(cleanupFns, function()
+    ownedESP:StopLoop()
+    for _, key in ipairs({"Island", "Player", "Chest", "DevilFruit", "Flower", "RealFruit"}) do
+        ownedESP:Set(key, false)
+    end
+    for _, method in ipairs({"UpdateIsland", "UpdatePlayers", "UpdateChest", "UpdateDevilFruit", "UpdateFlower", "UpdateRealFruit"}) do
+        pcall(function() ownedESP[method](ownedESP) end)
+    end
+end)
 
 
 -- Farm tab
@@ -878,15 +917,108 @@ mkEspToggle("Devil Fruit ESP", "DevilFruit")
 mkEspToggle("Flower ESP", "Flower")
 mkEspToggle("Real Fruit (Apple) ESP", "RealFruit")
 
+-- Fruit requests have one shared gate, including across UI reloads.
+-- 120 seconds is a conservative client spacing, NOT a server cooldown.
+-- No server response schema is available: all responses remain diagnostics.
+local FRUIT_SPACING = 120
+local fruitGate = shared._UILibFruitGate
+if type(fruitGate) ~= "table" then
+    fruitGate = {busy = nil, nextAllowed = 0}
+    shared._UILibFruitGate = fruitGate
+end
+local fruitEnabled = false
+local fruitSession = 0
+local fruitTimer
+local fruitWake
+local armFruit
+
+local function cancelFruitTimer()
+    if fruitTimer then pcall(task.cancel, fruitTimer); fruitTimer = nil end
+end
+
+local function requestFruit(manual)
+    if destroyed then return end
+    if fruitGate.busy or os.clock() < fruitGate.nextAllowed then
+        if manual then
+            notify({Title="Fruit", Text="Solicitação pendente ou intervalo local de segurança ativo."})
+        end
+        return
+    end
+    local remotes = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+    local remote = remotes and remotes:FindFirstChild("CommF_")
+    if not remote or not remote:IsA("RemoteFunction") then
+        if manual then notify({Title="Fruit", Text="RemoteFunction Remotes.CommF_ indisponível."}) end
+        warn("[Fruit] RemoteFunction ReplicatedStorage.Remotes.CommF_ indisponível.")
+        fruitGate.nextAllowed = os.clock() + FRUIT_SPACING
+        return
+    end
+    local owner = {}
+    fruitGate.busy = owner
+    fruitGate.nextAllowed = os.clock() + FRUIT_SPACING
+    -- Intentionally not in tasksPending: canceling a yielding InvokeServer cannot
+    -- cancel the server operation. Keep the gate until the call actually returns.
+    task.defer(function()
+        local ok, response = pcall(function()
+            return remote:InvokeServer("Cousin", "Buy")
+        end)
+        if fruitGate.busy == owner then fruitGate.busy = nil end
+        warn("[Fruit] Diagnóstico (pcall=" .. tostring(ok) .. ", tipo="
+            .. typeof(response) .. "): " .. tostring(response))
+        -- Resume scheduling before optional UI diagnostics.
+        local wake = fruitGate.wake
+        if wake then wake() end
+        if not destroyed then
+            notify({Title="Fruit", Text=ok
+                and "Resposta recebida; compra não confirmada. Veja o diagnóstico no Output."
+                or "Falha na solicitação. Veja o diagnóstico no Output."})
+        end
+    end)
+end
+
+armFruit = function(session)
+    if destroyed or not fruitEnabled or fruitSession ~= session or fruitTimer then return end
+    -- No polling while waiting for a request; completion wakes the active session.
+    if fruitGate.busy then return end
+    fruitTimer = task.delay(math.max(0, fruitGate.nextAllowed - os.clock()), function()
+        if destroyed or not fruitEnabled or fruitSession ~= session then return end
+        fruitTimer = nil
+        requestFruit(false)
+        armFruit(session)
+    end)
+end
+
+local function setFruitEnabled(enabled)
+    fruitSession = fruitSession + 1
+    fruitEnabled = enabled == true
+    cancelFruitTimer()
+    if fruitGate.wake == fruitWake then fruitGate.wake = nil end
+    local session = fruitSession
+    fruitWake = function()
+        if not destroyed and fruitEnabled and fruitSession == session then armFruit(session) end
+    end
+    if fruitEnabled then
+        fruitGate.wake = fruitWake
+        armFruit(session)
+    end
+end
+table.insert(cleanupFns, function()
+    setFruitEnabled(false)
+end)
+
+addSection(Fruit, "Fruit")
+addLabel(Fruit, "Auto: intervalo local de 120 s, sem cooldown do servidor confirmado. Respostas são diagnósticos; o servidor decide a compra.")
+addBtn(Fruit, "Random Fruit", function() requestFruit(true) end)
+addToggle(Fruit, "Auto Random Fruit", false, setFruitEnabled)
+
 -- hotkey
 bind(UserInputService.InputBegan, function(i, gameProcessed)
-    if gameProcessed then return end
+    if gameProcessed or UserInputService:GetFocusedTextBox() then return end
     if i.KeyCode == Enum.KeyCode.RightShift then toggleUI() end
 end)
 
 -- viewport resize recalc
 bind(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"), function()
-    baseW,baseH,maxW,maxH = computeSizes()
+    setState(state)
 end)
 
 local UILib = {
