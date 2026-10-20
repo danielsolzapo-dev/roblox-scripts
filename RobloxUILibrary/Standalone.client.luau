@@ -463,6 +463,27 @@ addBtn(Settings, "Mostrar notificação", function()
     notify({Title="Carregado!", Text="Interface carregada com sucesso.", Duration=3, Type="info"})
 end)
 
+-- Combat tab via Settings: Matsune FastAttack
+addSection(Settings, "Combat")
+local fastToggle = addToggle(Settings, "Fast Attack (Matsune, server hits)", false, function(v)
+    if v then
+        if not _G.MatsuneFastAttack then
+            -- load standalone FastAttack module if available
+            pcall(function()
+                loadstring(game:HttpGet("https://raw.githubusercontent.com/danielsolzapo-dev/roblox-scripts/main/FastAttack.luau"))()
+            end)
+        end
+        if _G.MatsuneFastAttack and _G.MatsuneFastAttack.Start then
+            _G.MatsuneFastAttack:Start()
+        end
+    else
+        if _G.MatsuneFastAttack and _G.MatsuneFastAttack.Stop then
+            _G.MatsuneFastAttack:Stop()
+        end
+    end
+end)
+
+
 
 -- Visual/Settings informational tabs
 addLabel(Visual, "Aba Visual: demonstração/informativa. Componentes de visual ainda não implementados.")
