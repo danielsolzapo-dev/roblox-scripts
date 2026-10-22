@@ -270,6 +270,51 @@ local PlayerT = addTab("Player")
 local Visual = addTab("Visual")
 local Settings = addTab("Settings")
 local Farm = addTab("Farm")
+
+-- Farm / Auto Haki (Buso)
+local autoHakiEnabled = false
+local autoHakiThread = nil
+
+local function runAutoHakiLoop()
+    while autoHakiEnabled and not destroyed do
+        local ok, err = pcall(function()
+            local player = game:GetService("Players").LocalPlayer
+            local character = player and player.Character
+            if character and character.Parent and not character:FindFirstChild("HasBuso") then
+                local remotes = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+                local remote = remotes and remotes:FindFirstChild("CommF_")
+                if remote then
+                    remote:InvokeServer("Buso")
+                end
+            end
+        end)
+        if not ok and not destroyed then
+            warn("[AutoHaki] falha:", err)
+        end
+        task.wait(1)
+    end
+end
+
+addToggle(Farm, "Auto Haki (Buso)", false, function(enabled)
+    autoHakiEnabled = enabled
+    if enabled then
+        if autoHakiThread then pcall(task.cancel, autoHakiThread) end
+        autoHakiThread = task.spawn(runAutoHakiLoop)
+        trackTask(autoHakiThread)
+    else
+        autoHakiEnabled = false
+        autoHakiThread = nil
+    end
+    notify({Title="Auto Haki", Text = enabled and "Haki ativado." or "Haki desativado.", Duration=2, Type="info"})
+end)
+
+table.insert(cleanupFns, function()
+    autoHakiEnabled = false
+    if autoHakiThread and typeof(autoHakiThread) == "thread" then
+        pcall(task.cancel, autoHakiThread)
+    end
+    autoHakiThread = nil
+end)
 local ESPtab = addTab("ESP")
 local Fruit = addTab("Fruit")
 
