@@ -13,6 +13,12 @@ local tasksPending = {}
 local function bind(sig, fn) local c = sig:Connect(fn); conns[#conns+1]=c; return c end
 local function trackTask(t) tasksPending[#tasksPending+1]=t end
 local function unload()
+    -- Fruit cleanup must run together with the original unload so tasks and
+    -- shared request state are cleared before the UI is destroyed.
+    fruitAutoEnabled = false
+    fruitCloseBusyIfStale()
+    if fruitTask and typeof(fruitTask) == "thread" then pcall(task.cancel, fruitTask) end
+    fruitTask = nil
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     for _, t in ipairs(tasksPending) do pcall(function() if typeof(t)=="thread" then task.cancel(t) end end) end
     if shared._uilibGui then pcall(function() shared._uilibGui:Destroy() end) end
