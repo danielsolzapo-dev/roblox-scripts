@@ -1266,38 +1266,78 @@ local function initImportedFeatures()
         for _,key in ipairs({"Z","X","C","V","F"}) do if options["Skill"..key] then press(key) end end
     end
     local lastInputClick=-math.huge
+    local attackState={Phase="idle",Method="Auto",Attempts=0}
+    local inputLease
+    local function releaseInput()
+        local lease=inputLease
+        if not lease then return true end
+        local ok,err=pcall(lease.Release)
+        attackState.InputRelease=ok and "released" or tostring(err)
+        if ok then inputLease=nil else debugLog("WARN","combat.release",err) end
+        return ok
+    end
+    local function heldInput(release,down)
+        inputLease={Release=release}
+        local lease=inputLease
+        local ok,err=pcall(down)
+        if not ok then releaseInput();return false,tostring(err) end
+        attackState.InputRelease="holding_60ms"
+        trackTask(task.delay(0.06,function() if inputLease==lease then releaseInput() end end))
+        return true
+    end
+    local function clearClickPoint()
+        local camera=workspace.CurrentCamera
+        if not camera then return nil end
+        local v=camera.ViewportSize
+        -- Do not send a mouse click into the Library or another interactive GUI.
+        for _,fraction in ipairs({Vector2.new(0.95,0.88),Vector2.new(0.05,0.88),Vector2.new(0.95,0.15),Vector2.new(0.5,0.9)}) do
+            local point=Vector2.new(v.X*fraction.X,v.Y*fraction.Y)
+            local ok,objects=pcall(function() return PlayerGui:GetGuiObjectsAtPosition(point.X,point.Y) end)
+            if ok and type(objects)=="table" then
+                local blocked=false
+                for _,object in ipairs(objects) do
+                    if object.Visible and (object.Active or object:IsA("TextButton") or object:IsA("ImageButton") or object:IsA("TextBox")) then blocked=true;break end
+                end
+                if not blocked then return point end
+            end
+        end
+        return nil
+    end
     local function inputClick(method)
         if destroyed or not active then return false,"unloaded" end
         if UserInputService:GetFocusedTextBox() then return false,"typing" end
+        if inputLease and not releaseInput() then return false,"release_failed" end
         if os.clock()-lastInputClick<0.15 then return false,"cooldown" end
         lastInputClick=os.clock()
         local camera=workspace.CurrentCamera
         local function r2()
-            -- Reference: Hoho's ScriptLoad.lua contains this in a commented AutoM1 example.
             local vim=game:GetService("VirtualInputManager")
-            local ok,err=pcall(function() vim:SendKeyEvent(true,Enum.KeyCode.ButtonR2,false,game) end)
-            local released,releaseErr=pcall(function() vim:SendKeyEvent(false,Enum.KeyCode.ButtonR2,false,game) end)
-            if not ok or not released then return false,tostring(err or releaseErr) end
-            return true,"button_r2_sent"
+            local ok,err=heldInput(function() vim:SendKeyEvent(false,Enum.KeyCode.ButtonR2,false,game) end,
+                function() vim:SendKeyEvent(true,Enum.KeyCode.ButtonR2,false,game) end)
+            return ok,ok and "button_r2_sent" or err
         end
         if method=="Hoho R2" then return r2() end
-        -- Matsune's farm uses VirtualUser:CaptureController()/Button1Down().
-        -- Pair it with Button1Up even if the down event errors; never leave a held click.
+        local point=clearClickPoint()
+        attackState.ClickPosition=point
+        if not point then
+            attackState.InputFallback="no_clear_click_position"
+            return r2()
+        end
         local vu
-        local point=camera and Vector2.new(camera.ViewportSize.X/2,camera.ViewportSize.Y/2) or Vector2.new(1,1)
-        local ok,err=pcall(function()
-            vu=game:GetService("VirtualUser")
-            vu:CaptureController()
-            if not camera then error("camera unavailable") end
-            vu:Button1Down(point,camera.CFrame)
-        end)
-        local released,releaseErr=pcall(function() if vu then vu:Button1Up(point,camera and camera.CFrame or CFrame.new()) end end)
-        if ok and released then return true,"virtual_user_sent" end
+        local available,serviceErr=pcall(function() vu=game:GetService("VirtualUser") end)
+        local ok,err=false,serviceErr
+        if available then
+            ok,err=heldInput(function() vu:Button1Up(point,camera.CFrame) end,function()
+                vu:CaptureController();vu:Button1Down(point,camera.CFrame)
+            end)
+        end
+        if ok then attackState.InputFallback=nil;return true,"virtual_user_sent" end
+        attackState.InputFallback=tostring(err)
+        if inputLease then return false,"release_failed" end
         local fallback,reason=r2()
         if fallback then return true,reason end
-        return false,"input_unavailable: "..tostring(err or releaseErr).." / "..tostring(reason)
+        return false,"input_unavailable: "..tostring(err).." / "..tostring(reason)
     end
-    local attackState={Phase="idle",Method="Auto",Attempts=0}
     local lastAttackTarget,lastAttackHealth,lastDamageAt
     local function fight(target,owner)
         local root=part(target)
@@ -1316,6 +1356,7 @@ local function initImportedFeatures()
         local mastery=options.Mastery~="Off" and hp/math.max(1,maxHP)*100 <= options.MasteryHealth
         local tool=equip(mastery and options.Mastery or options.Weapon)
         attackState.Target=target.Name
+        attackState.Health=hp;attackState.MaxHealth=maxHP
         attackState.Tool=tool and tool.Name or nil
         attackState.Distance=distance(target)
         if lastAttackTarget~=target then lastAttackTarget=target;lastAttackHealth=hp;lastDamageAt=nil end
@@ -2284,7 +2325,7 @@ local function initImportedFeatures()
             lastFarmLog=os.clock();lastFarmMessage=important
         end
     end
-    onJobStop.Farm=function() fixedCombatTarget=nil;fixedCombatPoint=nil;fixedCombatOffset=nil;farmProgress("idle") end
+    onJobStop.Farm=function() releaseInput();attackState.Phase="idle";fixedCombatTarget=nil;fixedCombatPoint=nil;fixedCombatOffset=nil;farmProgress("idle") end
     local function spawnCFrame(object)
         if object:IsA("BasePart") then return object.CFrame end
         if object:IsA("Model") then
@@ -2836,6 +2877,7 @@ local function initImportedFeatures()
         stopMove();fixedCombatTarget=nil;fixedCombatPoint=nil;fixedCombatOffset=nil;restoreCamera()
     end,"features.respawn")
     bind(LocalPlayer.CharacterRemoving,function()
+        releaseInput()
         stopMove();fixedCombatTarget=nil;fixedCombatPoint=nil;fixedCombatOffset=nil
     end,"features.character_removing")
     local function restoreVisuals()
@@ -2847,6 +2889,7 @@ local function initImportedFeatures()
         end
     end
     local function stopAll()
+        releaseInput()
         requestSession=requestSession+1
         jumpOn=false;flags.SkillSpam=false
         for _,control in pairs(controls) do control.Set(false) end
@@ -2954,7 +2997,8 @@ local function debugReportText()
         "Farm: "..tostring(farm.Phase).." | alvo: "..tostring(farm.Target or farm.ExpectedMob),
         "Ataque: "..tostring(attack.Phase).." | método: "..tostring(attack.Method).." | transporte: "..tostring(attack.Transport).." | clique: "..tostring(attack.Input),
         "Arma: "..tostring(attack.Tool).." | distância: "..tostring(attack.Distance).." | tentativas: "..tostring(attack.Attempts),
-        "Última perda de vida observada (relógio local): "..tostring(attack.LastDamageAt),
+        "Vida do alvo: "..tostring(attack.Health).." / "..tostring(attack.MaxHealth).." | última queda de vida: "..(attack.LastDamageAt and string.format("há %.1fs",os.clock()-attack.LastDamageAt) or "não observada"),
+        "Soltar clique: "..tostring(attack.InputRelease).." | alternativa: "..tostring(attack.InputFallback),
         "Movimento: "..tostring(movement.Owner).." | suspenso: "..tostring(movement.Suspended),
         "Missão: "..tostring(farm.QuestSource).." | spawn: "..tostring(farm.SpawnSource),
         "Interface: "..tostring(state).." | aberta: "..tostring(isUIOpen).." | descarregada: "..tostring(destroyed)}
