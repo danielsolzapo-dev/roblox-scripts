@@ -33,10 +33,10 @@ local function viewport() return (workspace.CurrentCamera and workspace.CurrentC
 local vp0 = viewport()
 local function computeSizes()
     local vp = viewport()
-    local baseW = math.min(600, vp.X - 24)
-    local baseH = math.min(450, vp.Y - 24)
-    local maxW = math.min(900, vp.X - 24)
-    local maxH = math.min(600, vp.Y - 24)
+    local baseW = math.max(1, math.min(600, vp.X - 24))
+    local baseH = math.max(52, math.min(450, vp.Y - 24))
+    local maxW = math.max(1, math.min(900, vp.X - 24))
+    local maxH = math.max(52, math.min(600, vp.Y - 24))
     return baseW, baseH, maxW, maxH
 end
 local baseW, baseH, maxW, maxH = computeSizes()
@@ -115,8 +115,10 @@ new("UICorner", {CornerRadius=UDim.new(0,CORNER)}, Main)
 reg(new("UIStroke", {Thickness=1, Theme={Color="Border"}}, Main), "Color", "Border")
 UIScale = new("UIScale", {Scale=0.92}, Main)
 
+local cancelDrag
 local function setOpen(v)
     if destroyed then return end
+    if cancelDrag then cancelDrag() end
     isUIOpen = v
     openVersion = openVersion + 1
     local version = openVersion
@@ -139,7 +141,7 @@ local function toggleUI()
 end
 
 -- Header
-local Header = new("Frame", {Size=UDim2.new(1,0,0,HDR), Theme={BackgroundColor3="Sidebar"}}, Main)
+local Header = new("Frame", {Active=true, Size=UDim2.new(1,0,0,HDR), Theme={BackgroundColor3="Sidebar"}}, Main)
 new("UICorner", {CornerRadius=UDim.new(0,CORNER)}, Header)
 new("Frame", {Size=UDim2.new(1,0,0,CORNER), Position=UDim2.new(0,0,1,-CORNER), BorderSizePixel=0, Theme={BackgroundColor3="Sidebar"}}, Header)
 
@@ -162,13 +164,28 @@ local MinBtn = topBtn("–", -(44+36+8+36+8))
 
 new("Frame", {Size=UDim2.new(1,0,0,1), Position=UDim2.new(0,0,1,-1), BorderSizePixel=0, Theme={BackgroundColor3="Border"}}, Header)
 
+-- Clamp against the target geometry, not the size of an interrupted tween.
+local function clampMain(size)
+    local vp = viewport()
+    local pos = Main.Position
+    local w, h = size.X.Offset, size.Y.Offset
+    local x = pos.X.Scale * vp.X + pos.X.Offset
+    local y = pos.Y.Scale * vp.Y + pos.Y.Offset
+    Main.Position = UDim2.fromOffset(
+        math.clamp(x, w / 2, math.max(w / 2, vp.X - w / 2)),
+        math.clamp(y, h / 2, math.max(h / 2, vp.Y - h / 2)))
+end
+
 -- setState with prev save
 local function setState(s)
     if destroyed then return end
+    if cancelDrag then cancelDrag() end
     if s == "min" and state ~= "min" then previousState = state end
     state = s
     if sizeTween then sizeTween:Cancel() end
-    sizeTween = TweenService:Create(Main, TweenInfo.new(0.2), {Size = sizeFor(state)})
+    local target = sizeFor(state)
+    clampMain(target)
+    sizeTween = TweenService:Create(Main, TweenInfo.new(0.2), {Size = target})
     sizeTween:Play()
 end
 bind(MinBtn.MouseButton1Click, function() if state=="min" then setState(previousState or "normal") else setState("min") end end)
@@ -181,6 +198,13 @@ local headerTouch
 local hdStart, hmStart
 bind(Header.InputBegan, function(i)
     if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+        if draggingHeader or not isUIOpen then return end
+        -- Header buttons must never start a window drag.
+        for _, button in ipairs({CloseBtn, MaxBtn, MinBtn}) do
+            local pos, size = button.AbsolutePosition, button.AbsoluteSize
+            if i.Position.X >= pos.X and i.Position.X <= pos.X + size.X
+                and i.Position.Y >= pos.Y and i.Position.Y <= pos.Y + size.Y then return end
+        end
         draggingHeader=true; hdStart=i.Position
         headerTouch = i.UserInputType==Enum.UserInputType.Touch and i or nil
         -- absolute position in pixels from current UDim2
@@ -193,7 +217,7 @@ bind(Header.InputBegan, function(i)
     end
 end)
 bind(UserInputService.InputChanged, function(i)
-    if draggingHeader and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then
+    if draggingHeader and isUIOpen and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then
         if headerTouch and i ~= headerTouch then return end
         local d = i.Position - hdStart
         local sz = Main.AbsoluteSize
@@ -310,7 +334,9 @@ local fs, fstart = nil, nil
 local touchId = nil
 bind(Float.InputBegan, function(i)
     if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+        if fd then return end
         fd=true; fmoved=false; fs=i.Position; fstart=Float.Position
+        touchId=nil
         if i.UserInputType==Enum.UserInputType.Touch then touchId=i end
     end
 end)
@@ -322,13 +348,13 @@ bind(UserInputService.InputChanged, function(i)
         local vp = viewport()
         local nx = fstart.X.Offset + d.X
         local ny = fstart.Y.Offset + d.Y
-        nx = math.clamp(nx, 0, vp.X - 64)
-        ny = math.clamp(ny, 0, vp.Y - 64)
+        nx = math.clamp(nx, 0, math.max(0, vp.X - 64))
+        ny = math.clamp(ny, 0, math.max(0, vp.Y - 64))
         Float.Position = UDim2.new(0, nx, 0, ny)
     end
 end)
 bind(UserInputService.InputEnded, function(i)
-    if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+    if (touchId and i == touchId) or (not touchId and i.UserInputType==Enum.UserInputType.MouseButton1) then
         fd=false
         if touchId==i then touchId=nil end
     end
@@ -529,15 +555,6 @@ local function resolveNet()
 	return nil
 end
 
-local function SafeWaitForChild(parent, name)
-	if not parent then return nil end
-	for i = 1, 40 do
-		local c = parent:FindFirstChild(name)
-		if c then return c end
-		task.wait(0.25)
-	end
-	return parent:FindFirstChild(name)
-end
 
 Net = resolveNet()
 
@@ -561,8 +578,8 @@ local FastAttack = {
 local RegisterAttack, RegisterHit
 
 if Net then
-	RegisterAttack = SafeWaitForChild(Net, "RE/RegisterAttack")
-	RegisterHit = SafeWaitForChild(Net, "RE/RegisterHit")
+	RegisterAttack = Net:FindFirstChild("RE/RegisterAttack")
+	RegisterHit = Net:FindFirstChild("RE/RegisterHit")
 end
 
 local function IsAlive(character)
@@ -628,7 +645,12 @@ function FastAttack:BladeHits()
 end
 
 function FastAttack:Start()
-	if self.Running then return end
+	if destroyed or self.Running then return end
+	Net = resolveNet()
+	RegisterAttack = Net and Net:FindFirstChild("RE/RegisterAttack")
+	RegisterHit = Net and Net:FindFirstChild("RE/RegisterHit")
+	Enemies = Workspace:FindFirstChild("Enemies") or Workspace:FindFirstChild("Hostiles")
+	Characters = Workspace:FindFirstChild("Characters")
 	self.Running = true
 	Settings.AutoClick = true
 	self._thread = task.spawn(function()
@@ -1016,10 +1038,34 @@ bind(UserInputService.InputBegan, function(i, gameProcessed)
     if i.KeyCode == Enum.KeyCode.RightShift then toggleUI() end
 end)
 
--- viewport resize recalc
-bind(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"), function()
+-- Camera can be absent at startup or replaced later.
+local cameraConnection
+local function refreshViewport()
+    if destroyed then return end
     setState(state)
+    local vp = viewport()
+    Float.Position = UDim2.fromOffset(
+        math.clamp(Float.Position.X.Offset, 0, math.max(0, vp.X - 64)),
+        math.clamp(Float.Position.Y.Offset, 0, math.max(0, vp.Y - 64)))
+end
+local function watchCamera()
+    if cameraConnection then cameraConnection:Disconnect(); cameraConnection = nil end
+    local camera = workspace.CurrentCamera
+    if camera then cameraConnection = camera:GetPropertyChangedSignal("ViewportSize"):Connect(refreshViewport) end
+    refreshViewport()
+end
+bind(workspace:GetPropertyChangedSignal("CurrentCamera"), watchCamera)
+table.insert(cleanupFns, function()
+    if cameraConnection then cameraConnection:Disconnect(); cameraConnection = nil end
 end)
+watchCamera()
+cancelDrag = function()
+    draggingHeader = false
+    headerTouch = nil
+    fd = false
+    touchId = nil
+end
+bind(UserInputService.WindowFocusReleased, cancelDrag)
 
 local UILib = {
     Destroy = function() unload() end,
@@ -1030,4 +1076,6 @@ local UILib = {
 _G.XerecaUILib = UILib
 shared._UILibUnload = unload
 
+setOpen(true)
 print("[UILib] XERECA HUB loaded successfully.")
+
