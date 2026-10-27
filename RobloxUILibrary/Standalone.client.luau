@@ -10,7 +10,7 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 -- Optional diagnostics. No polling, external requests or global error hooks.
 local DEBUG_DEFAULT = false
 local debugEnabled = DEBUG_DEFAULT
-local debugControl
+local debugControl, debugPanelControl
 local debugHistory = {}
 local DEBUG_LIMIT = 100
 local function debugLog(level, event, detail)
@@ -28,6 +28,7 @@ local function setDebug(enabled)
     debugEnabled=nextValue
     if not previous and nextValue then debugLog("INFO","debug","enabled") end
     if debugControl and debugControl.Get()~=nextValue then debugControl.Set(nextValue) end
+    if debugPanelControl and debugPanelControl.Get()~=nextValue then debugPanelControl.Set(nextValue) end
     return nextValue
 end
 
@@ -603,6 +604,27 @@ local function initFastAttack()
             if value and value:IsA("RemoteEvent") then return value end
         end
     end
+    local lastDispatch=-math.huge
+    function api:AttackTarget(enemy)
+        if destroyed then return false,"unloaded" end
+        local c=LocalPlayer.Character
+        local h=c and c:FindFirstChildOfClass("Humanoid")
+        local root=c and c:FindFirstChild("HumanoidRootPart")
+        local tool=c and c:FindFirstChildOfClass("Tool")
+        local targetHumanoid=enemy and enemy:FindFirstChildOfClass("Humanoid")
+        local head=enemy and (enemy:FindFirstChild("Head") or enemy:FindFirstChild("HumanoidRootPart"))
+        if not root or not h or h.Health<=0 or not tool then return false,"missing_character_or_tool" end
+        if tool.ToolTip=="Gun" or tool.ToolTip=="Blox Fruit" then return false,"skill_weapon" end
+        if not targetHumanoid or targetHumanoid.Health<=0 or not head or not head:IsA("BasePart") then return false,"invalid_target" end
+        if (head.Position-root.Position).Magnitude>self.Distance then return false,"out_of_range" end
+        local attack,hit=remote("RE/RegisterAttack"),remote("RE/RegisterHit")
+        if not attack or not hit then return false,"remotes_unavailable" end
+        if os.clock()-lastDispatch<self.Delay then return true,"cooldown" end
+        lastDispatch=os.clock()
+        attack:FireServer(self.Delay)
+        hit:FireServer(head,{{enemy,head}})
+        return true,"remote_sent"
+    end
     function api:AttackNearest()
         local c=LocalPlayer.Character
         local h=c and c:FindFirstChildOfClass("Humanoid")
@@ -625,6 +647,8 @@ local function initFastAttack()
         if not first then return end
         local attack,hit=remote("RE/RegisterAttack"),remote("RE/RegisterHit")
         if not attack or not hit then error("FastAttack: remotes não disponíveis; contrato precisa ser confirmado no jogo.",0) end
+        if os.clock()-lastDispatch<self.Delay then return end
+        lastDispatch=os.clock()
         attack:FireServer(self.Delay);hit:FireServer(first,hits)
     end
     function api:Start()
@@ -1234,6 +1258,8 @@ local function initImportedFeatures()
     local function skillAttack()
         for _,key in ipairs({"Z","X","C","V","F"}) do if options["Skill"..key] then press(key) end end
     end
+    local attackState={Phase="idle",Method="Auto",Attempts=0}
+    local lastAttackTarget,lastAttackHealth,lastDamageAt
     local function fight(target,owner)
         local root=part(target)
         local hp,maxHP=health(target)
@@ -1250,9 +1276,30 @@ local function initImportedFeatures()
         move(destination,owner)
         local mastery=options.Mastery~="Off" and hp/math.max(1,maxHP)*100 <= options.MasteryHealth
         local tool=equip(mastery and options.Mastery or options.Weapon)
-        if distance(target)<=100 and tool then
-            if mastery or flags.SkillSpam or owner=="SeaCombat" then skillAttack() else tool:Activate() end
+        attackState.Target=target.Name
+        attackState.Tool=tool and tool.Name or nil
+        attackState.Distance=distance(target)
+        if lastAttackTarget~=target then lastAttackTarget=target;lastAttackHealth=hp;lastDamageAt=nil end
+        if hp<lastAttackHealth then lastDamageAt=os.clock() end
+        lastAttackHealth=hp
+        attackState.LastDamageAt=lastDamageAt
+        if not tool then
+            attackState.Phase="missing_weapon"
+        elseif attackState.Distance>100 then
+            attackState.Phase="approaching"
+        elseif mastery or flags.SkillSpam or owner=="SeaCombat" then
+            skillAttack();attackState.Phase="skills_sent"
+        else
+            -- Tool activation alone does not reach the game's newer combat remotes.
+            -- Always preserve the normal tool path, then target only this farm enemy.
+            tool:Activate()
+            local sent,reason=false,"tool_only"
+            if attackState.Method=="Auto" then sent,reason=fastAttackApi:AttackTarget(target) end
+            attackState.Attempts=attackState.Attempts+1
+            attackState.Phase=sent and "attack_sent" or "tool_activated"
+            attackState.Transport=reason
         end
+        debugLog("INFO","combat",attackState.Phase.." target="..tostring(target.Name).." tool="..tostring(attackState.Tool).." transport="..tostring(attackState.Transport).." hp="..tostring(hp))
     end
     -- Adapted static quest/boss/island/shop data from the two supplied sources.
     local function questForLevel()
@@ -2410,6 +2457,8 @@ local function initImportedFeatures()
         stopMove("Farm")
     end)
     addLabel(Farm,"Velocidade do Tween: menor = mais lento. O ajuste também vale durante o deslocamento.")
+    dropdown(Farm,"Ataque do farm",{"Auto","Tool"},"Auto",function(v) attackState.Method=v end)
+    addLabel(Farm,"Auto: ativa a arma e envia ataque ao inimigo selecionado quando os remotes existem. Tool: somente ativação normal. DEBUG mostra envio e perda de vida observada separadamente.")
     dropdown(Farm,"Arma",{"Melee","Sword","Gun","Blox Fruit"},options.Weapon,function(v) options.Weapon=v end)
     dropdown(Farm,"Modo",modes,"Off",function(v)
         options.Mode=v;farmQuest=nil;farmQuestKey=nil;fixedCombatTarget=nil;fixedCombatPoint=nil;stopMove("Farm")
@@ -2774,7 +2823,7 @@ local function initImportedFeatures()
     report("startup",supported and "target game detected" or "UI available; target game unavailable")
     return {StopAll=stopAll,GetState=function()
         local running={};for name in pairs(jobs) do running[#running+1]=name end;table.sort(running)
-        return {Active=active,SupportedGame=supported,Mode=options.Mode,TweenSpeed=options.Speed,Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),QuestRuntime=questRuntime.GetState(),Movement={Owner=moveOwner,Suspended=motionState~=nil,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
+        return {Active=active,SupportedGame=supported,Mode=options.Mode,Attack=table.clone(attackState),TweenSpeed=options.Speed,Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),QuestRuntime=questRuntime.GetState(),Movement={Owner=moveOwner,Suspended=motionState~=nil,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
     end}
 end
 
@@ -2812,6 +2861,58 @@ local function getDebugLog()
     return copy
 end
 
+-- Diagnostics stay local; no external logging or global error interception.
+local debugPage=addTab("DEBUG")
+addSection(debugPage,"Diagnóstico do XERECA HUB")
+addLabel(debugPage,"Envio de ataque não confirma dano. Confira a vida observada abaixo. Logs locais, limitados a 100 entradas; nenhum envio externo.")
+local panelPaused,onlyProblems=false,false
+local debugSearch=""
+local debugStatus=addLabel(debugPage,"DEBUG desativado")
+local debugOutput=addLabel(debugPage,"")
+debugOutput.RichText=false
+local function debugReportText()
+    local snapshot=importedFeatures.GetState()
+    local farm=snapshot.Farm or {}
+    local attack=snapshot.Attack or {}
+    local movement=snapshot.Movement or {}
+    local rows={"XERECA HUB | diagnóstico local",
+        "Farm: "..tostring(farm.Phase).." | alvo: "..tostring(farm.Target or farm.ExpectedMob),
+        "Ataque: "..tostring(attack.Phase).." | método: "..tostring(attack.Method).." | transporte: "..tostring(attack.Transport),
+        "Arma: "..tostring(attack.Tool).." | distância: "..tostring(attack.Distance).." | tentativas: "..tostring(attack.Attempts),
+        "Última perda de vida observada (relógio local): "..tostring(attack.LastDamageAt),
+        "Movimento: "..tostring(movement.Owner).." | suspenso: "..tostring(movement.Suspended),
+        "Missão: "..tostring(farm.QuestSource).." | spawn: "..tostring(farm.SpawnSource),
+        "Interface: "..tostring(state).." | aberta: "..tostring(isUIOpen).." | descarregada: "..tostring(destroyed)}
+    return table.concat(rows,"\n")
+end
+local function refreshDebugPanel()
+    if destroyed then return end
+    if not debugEnabled then debugStatus.Text="DEBUG desativado";return end
+    debugStatus.Text=debugReportText()
+    local rows={}
+    for i=#debugHistory,1,-1 do
+        local e=debugHistory[i]
+        local line=string.format("[%.1f] [%s] %s: %s",e.Time,e.Level,e.Event,e.Detail)
+        if (not onlyProblems or e.Level=="ERROR" or e.Level=="WARN") and (debugSearch=="" or line:lower():find(debugSearch,1,true)) then
+            table.insert(rows,1,line:sub(1,600))
+            if #rows>=25 then break end
+        end
+    end
+    debugOutput.Text=#rows>0 and table.concat(rows,"\n") or "Sem registros para este filtro."
+end
+debugPanelControl=addToggle(debugPage,"Ativar painel DEBUG",false,function(on) setDebug(on);refreshDebugPanel() end)
+addToggle(debugPage,"Pausar atualização do painel",false,function(on) panelPaused=on end)
+addToggle(debugPage,"Somente avisos e erros",false,function(on) onlyProblems=on;refreshDebugPanel() end)
+addTextbox(debugPage,{Placeholder="Filtrar logs (ex.: combat)",Callback=function(text) debugSearch=tostring(text):lower();refreshDebugPanel() end})
+addBtn(debugPage,"Atualizar diagnóstico",function() runDebug();refreshDebugPanel() end)
+addBtn(debugPage,"Limpar registros",function() table.clear(debugHistory);refreshDebugPanel() end)
+local lastDebugPaint=0
+bind(game:GetService("RunService").Heartbeat,function()
+    if debugEnabled and not panelPaused and isUIOpen and state~="min" and os.clock()-lastDebugPaint>=1 then
+        lastDebugPaint=os.clock();refreshDebugPanel()
+    end
+end,"debug.panel")
+
 addSection(Settings, "DEBUG")
 debugControl=addToggle(Settings, "Ativar DEBUG (Output)", DEBUG_DEFAULT, setDebug)
 addBtn(Settings, "Executar diagnóstico", function()
@@ -2833,6 +2934,7 @@ local UILib = {
     end,
     IsDebugEnabled = function() return debugEnabled end,
     RunDebug = runDebug,
+    GetDebugReport = debugReportText,
     GetDebugLog = getDebugLog,
     ClearDebugLog = function() table.clear(debugHistory) end,
     Destroy = function() unload() end,
