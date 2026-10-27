@@ -879,9 +879,11 @@ local function initImportedFeatures()
         for object,value in pairs(collisionState) do if object.Parent then object.CanCollide=value end end
         table.clear(collisionState)
     end
-    local options = {Weapon="Melee", Mastery="Off", MasteryHealth=30, Speed=250, Offset=20,
+    local options = {Weapon="Melee", Mastery="Off", MasteryHealth=30, Speed=100, Offset=20,
         Boss="The Gorilla King", Mode="Off", Chip="Flame", Player="", SkillZ=true, SkillX=true, SkillC=true, SkillV=false, SkillF=false}
     local supported = game.PlaceId == 2753915549 or game.PlaceId == 4442272183 or game.PlaceId == 7449423635
+    local speedSliders = {}
+    local syncingSpeed = false
     local function report(event, detail)
         debugLog("INFO", "features." .. event, detail)
     end
@@ -984,6 +986,33 @@ local function initImportedFeatures()
             if moveVersion==version then restoreCollisions() end
         end)
         moveTween:Play()
+    end
+    local function setTweenSpeed(value)
+        if syncingSpeed or not active or destroyed then return end
+        if type(value)~="number" or value~=value or value==math.huge or value==-math.huge then return end
+        local speed=math.clamp(math.floor(value/5+0.5)*5,10,500)
+        local changed=options.Speed~=speed
+        options.Speed=speed
+        syncingSpeed=true
+        for _,slider in ipairs(speedSliders) do
+            if slider.Get()~=speed then slider.Set(speed) end
+        end
+        syncingSpeed=false
+        if changed then
+            debugLog("INFO","tween.speed",tostring(speed).." studs/s")
+            if moveTween and moveTween.PlaybackState==Enum.PlaybackState.Playing then
+                local destination,owner,previousRoot=moveTarget,moveOwner,moveRoot
+                stopMove()
+                local _,_,root=character()
+                if root==previousRoot and destination then move(destination,owner) end
+            end
+        end
+    end
+    local function speedSlider(page)
+        local slider=addSlider(page,{Name="Velocidade do Tween",Min=10,Max=500,Step=5,Default=options.Speed,
+            Suffix=" studs/s",Callback=setTweenSpeed})
+        speedSliders[#speedSliders+1]=slider
+        return slider
     end
     bind(RunService.Stepped,function()
         if active and not destroyed and moveTween and moveTween.PlaybackState==Enum.PlaybackState.Playing then
@@ -2097,6 +2126,8 @@ local function initImportedFeatures()
     addSection(Farm,"Farm integrado")
     addLabel(Farm,"Um modo de farm por vez. Coordenadas/missões vêm das fontes; progresso e dano dependem do servidor. Dados de nível limitados a 2600.")
     local farmControl
+    speedSlider(Farm)
+    addLabel(Farm,"Velocidade do Tween: menor = mais lento. O ajuste também vale durante o deslocamento.")
     dropdown(Farm,"Arma",{"Melee","Sword","Gun","Blox Fruit"},options.Weapon,function(v) options.Weapon=v end)
     dropdown(Farm,"Modo",modes,"Off",function(v)
         options.Mode=v;farmQuest=nil;farmQuestKey=nil;stopMove("Farm")
@@ -2258,7 +2289,7 @@ local function initImportedFeatures()
         if data.Entrance then comm("entrance",3,"requestEntrance",data.Target.Position) else move(data.Target,"Manual") end
     end)
     for _,sea in ipairs({{"Primeiro mar","TravelMain"},{"Segundo mar","TravelDressrosa"},{"Terceiro mar","TravelZou"}}) do button(pageTP,sea[1],function() comm("travel",5,sea[2]) end) end
-    addSlider(pageTP,{Name="Velocidade de deslocamento",Min=50,Max=350,Step=10,Default=250,Callback=function(v) options.Speed=v end})
+    speedSlider(pageTP)
     local npcSelection=""
     local function npcNames()
         local names={};local folder=workspace:FindFirstChild("NPCs")
@@ -2456,7 +2487,7 @@ local function initImportedFeatures()
     report("startup",supported and "target game detected" or "UI available; target game unavailable")
     return {StopAll=stopAll,GetState=function()
         local running={};for name in pairs(jobs) do running[#running+1]=name end;table.sort(running)
-        return {Active=active,SupportedGame=supported,Mode=options.Mode,Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus)}
+        return {Active=active,SupportedGame=supported,Mode=options.Mode,TweenSpeed=options.Speed,Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus)}
     end}
 end
 
