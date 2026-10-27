@@ -7,16 +7,56 @@ local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
+-- Optional diagnostics. No polling, external requests or global error hooks.
+local DEBUG_DEFAULT = false
+local debugEnabled = DEBUG_DEFAULT
+local debugHistory = {}
+local DEBUG_LIMIT = 100
+local debugSnapshot
+local function debugLog(level, event, detail)
+    if not debugEnabled then return end
+    local entry = {Time=os.clock(), Level=level, Event=event, Detail=tostring(detail or "")}
+    if #debugHistory >= DEBUG_LIMIT then table.remove(debugHistory, 1) end
+    debugHistory[#debugHistory + 1] = entry
+    local message = "[UILib DEBUG][" .. level .. "][" .. event .. "] " .. entry.Detail
+    if level == "ERROR" or level == "WARN" then warn(message) else print(message) end
+end
+local function setDebug(enabled)
+    if enabled ~= true then
+        debugLog("INFO", "debug", "disabled")
+        debugEnabled = false
+        return false
+    end
+    debugEnabled = true
+    debugLog("INFO", "debug", "enabled")
+    return true
+end
+
 -- Maid / connections
 local conns = {}
 local tasksPending = {}
-local function bind(sig, fn) local c = sig:Connect(fn); conns[#conns+1]=c; return c end
+local function bind(sig, fn, label)
+    local c = sig:Connect(function(...)
+        local args = table.pack(...)
+        local ok, failure = xpcall(function()
+            fn(table.unpack(args, 1, args.n))
+        end, function(err) return debug.traceback(tostring(err), 2) end)
+        if not ok then
+            debugLog("ERROR", label or "callback", failure)
+            -- Preserve the original error in Output even when diagnostics are off.
+            error(failure, 0)
+        end
+    end)
+    conns[#conns + 1] = c
+    return c
+end
 local function trackTask(t) tasksPending[#tasksPending+1]=t end
 local destroyed = false
 local cleanupFns = {}
 local ownedGui
 local function unload()
     if destroyed then return end
+    debugLog("INFO", "unload", "cleaning up owned resources")
     destroyed = true
     for i = #cleanupFns, 1, -1 do pcall(cleanupFns[i]) end
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
@@ -119,6 +159,7 @@ local cancelDrag
 local function setOpen(v)
     if destroyed then return end
     if cancelDrag then cancelDrag() end
+    debugLog("INFO", "visibility", tostring(isUIOpen) .. " -> " .. tostring(v))
     isUIOpen = v
     openVersion = openVersion + 1
     local version = openVersion
@@ -131,6 +172,7 @@ local function setOpen(v)
             if playback == Enum.PlaybackState.Completed and not destroyed
                 and openVersion == version and not isUIOpen then
                 Main.Visible = false
+                debugLog("INFO", "visibility.completed", "hidden")
             end
         end)
     end
@@ -181,11 +223,18 @@ local function setState(s)
     if destroyed then return end
     if cancelDrag then cancelDrag() end
     if s == "min" and state ~= "min" then previousState = state end
+    debugLog("INFO", "window.state", state .. " -> " .. tostring(s))
     state = s
     if sizeTween then sizeTween:Cancel() end
     local target = sizeFor(state)
     clampMain(target)
     sizeTween = TweenService:Create(Main, TweenInfo.new(0.2), {Size = target})
+    local expectedState = state
+    sizeTween.Completed:Once(function(playback)
+        if destroyed or playback ~= Enum.PlaybackState.Completed or state ~= expectedState then return end
+        debugLog("INFO", "window.geometry", "state=" .. state .. " size=" .. tostring(Main.Size)
+            .. " absolute=" .. tostring(Main.AbsoluteSize) .. " position=" .. tostring(Main.Position))
+    end)
     sizeTween:Play()
 end
 bind(MinBtn.MouseButton1Click, function() if state=="min" then setState(previousState or "normal") else setState("min") end end)
@@ -308,6 +357,7 @@ end
 local NotifContainer = new("Frame", {Size=UDim2.new(0,320,1,0), Position=UDim2.new(1,-332,0,12), BackgroundTransparency=1}, uiGui)
 new("UIListLayout", {Padding=UDim.new(0,8), SortOrder=Enum.SortOrder.LayoutOrder, HorizontalAlignment=Enum.HorizontalAlignment.Right}, NotifContainer)
 local function notify(opts)
+    if destroyed then return end
     opts = opts or {}
     local wrapper = new("Frame", {Size=UDim2.new(1,0,0,64), BackgroundTransparency=1}, NotifContainer)
     local card = new("Frame", {Size=UDim2.new(1,0,1,0), Position=UDim2.new(1,12,0,0), Theme={BackgroundColor3="ComponentBg"}}, wrapper)
@@ -684,7 +734,9 @@ _G.MatsuneFastAttack = FastAttack
 
 return FastAttack
 end
+debugLog("INFO", "initFastAttack", "starting")
 local fastAttackApi = initFastAttack()
+debugLog("INFO", "initFastAttack", "ready")
 _G.MatsuneFastAttack = fastAttackApi
 table.insert(cleanupFns, function() fastAttackApi:Stop() end)
 
@@ -868,12 +920,30 @@ function ESP:StartLoop()
 	if self._loop then return end
 	self._loop = task.spawn(function()
 		while true do
-			pcall(function() self:UpdateIsland() end)
-			pcall(function() self:UpdatePlayers() end)
-			pcall(function() self:UpdateChest() end)
-			pcall(function() self:UpdateDevilFruit() end)
-			pcall(function() self:UpdateFlower() end)
-			pcall(function() self:UpdateRealFruit() end)
+			do
+                local ok, err = pcall(function() self:UpdateIsland() end)
+                if not ok then debugLog("ERROR", "ESP.UpdateIsland", err) end
+            end
+			do
+                local ok, err = pcall(function() self:UpdatePlayers() end)
+                if not ok then debugLog("ERROR", "ESP.UpdatePlayers", err) end
+            end
+			do
+                local ok, err = pcall(function() self:UpdateChest() end)
+                if not ok then debugLog("ERROR", "ESP.UpdateChest", err) end
+            end
+			do
+                local ok, err = pcall(function() self:UpdateDevilFruit() end)
+                if not ok then debugLog("ERROR", "ESP.UpdateDevilFruit", err) end
+            end
+			do
+                local ok, err = pcall(function() self:UpdateFlower() end)
+                if not ok then debugLog("ERROR", "ESP.UpdateFlower", err) end
+            end
+			do
+                local ok, err = pcall(function() self:UpdateRealFruit() end)
+                if not ok then debugLog("ERROR", "ESP.UpdateRealFruit", err) end
+            end
 			task.wait(1)
 		end
 	end)
@@ -897,7 +967,9 @@ ESP:StartLoop()
 
 return ESP
 end
+debugLog("INFO", "initESP", "starting")
 local ownedESP = initESP()
+debugLog("INFO", "initESP", "ready")
 _G.MatsuneESP = ownedESP
 table.insert(cleanupFns, function()
     ownedESP:StopLoop()
@@ -1051,6 +1123,7 @@ end
 local function watchCamera()
     if cameraConnection then cameraConnection:Disconnect(); cameraConnection = nil end
     local camera = workspace.CurrentCamera
+    debugLog(camera and "INFO" or "WARN", "camera", camera and "watching viewport" or "not available; using fallback")
     if camera then cameraConnection = camera:GetPropertyChangedSignal("ViewportSize"):Connect(refreshViewport) end
     refreshViewport()
 end
@@ -1067,7 +1140,56 @@ cancelDrag = function()
 end
 bind(UserInputService.WindowFocusReleased, cancelDrag)
 
+-- A read-only check: does not fire remotes or change window/toggle state.
+local function runDebug()
+    local checks = {}
+    local function check(name, passed, detail)
+        checks[#checks + 1] = {Name=name, Passed=passed == true, Detail=tostring(detail or "")}
+        debugLog(passed and "INFO" or "WARN", "check." .. name, detail)
+    end
+    check("lifecycle", not destroyed, destroyed and "unloaded" or "active")
+    check("gui", not destroyed and uiGui.Parent == PlayerGui, "owned ScreenGui")
+    check("FastAttack", type(fastAttackApi) == "table" and type(fastAttackApi.Start) == "function", "API initialized")
+    check("ESP", type(ownedESP) == "table" and type(ownedESP.Set) == "function", "API initialized")
+    check("camera", workspace.CurrentCamera ~= nil, "camera may be temporarily absent")
+    if not destroyed then
+        local target = sizeFor(state)
+        local settled = not sizeTween or sizeTween.PlaybackState ~= Enum.PlaybackState.Playing
+        if settled then
+            check("geometry", Main.Size == target, "state=" .. state .. " actual=" .. tostring(Main.Size) .. " expected=" .. tostring(target))
+        end
+        local closing = openTween and openTween.PlaybackState == Enum.PlaybackState.Playing
+        if not closing then check("visibility", Main.Visible == isUIOpen, "open=" .. tostring(isUIOpen) .. " visible=" .. tostring(Main.Visible)) end
+    end
+    local remotes = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+    local fruitRemote = remotes and remotes:FindFirstChild("CommF_")
+    check("fruit.remote", fruitRemote ~= nil and fruitRemote:IsA("RemoteFunction"), "optional; only available in the target game")
+    return {Enabled=debugEnabled, Destroyed=destroyed, State=state, Open=isUIOpen, Checks=checks}
+end
+local function getDebugLog()
+    local copy = {}
+    for i, entry in ipairs(debugHistory) do copy[i] = table.clone(entry) end
+    return copy
+end
+
+addSection(Settings, "DEBUG")
+addToggle(Settings, "Ativar DEBUG (Output)", DEBUG_DEFAULT, setDebug)
+addBtn(Settings, "Executar diagnóstico", function()
+    local report = runDebug()
+    local failures = 0
+    for _, check in ipairs(report.Checks) do if not check.Passed then failures = failures + 1 end end
+    notify({Title="DEBUG", Text=tostring(#report.Checks) .. " verificações; " .. tostring(failures)
+        .. " pontos para conferir. Ative DEBUG para detalhes no Output."})
+end)
+
 local UILib = {
+    SetDebug = function(first, second)
+        return setDebug(type(first) == "table" and second or first)
+    end,
+    IsDebugEnabled = function() return debugEnabled end,
+    RunDebug = runDebug,
+    GetDebugLog = getDebugLog,
+    ClearDebugLog = function() table.clear(debugHistory) end,
     Destroy = function() unload() end,
     SetTheme = function(name) if THEMES[name] then activeTheme=name; applyTheme({}); Float.BackgroundColor3=T().Accent end end,
     Notify = notify,
@@ -1077,5 +1199,8 @@ _G.XerecaUILib = UILib
 shared._UILibUnload = unload
 
 setOpen(true)
+debugLog("INFO", "startup", "UI ready; RightShift configured")
 print("[UILib] XERECA HUB loaded successfully.")
+return UILib
+
 
