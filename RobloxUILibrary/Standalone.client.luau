@@ -856,6 +856,7 @@ local function initImportedFeatures()
     local TeleportService = game:GetService("TeleportService")
     local jobs, generations, flags, controls = {}, {}, {}, {}
     local buttonBusy = {}
+    local onJobStop = {}
     local gates = shared._XerecaCommandGates
     if type(gates) ~= "table" then gates = {}; shared._XerecaCommandGates = gates end
     local active = true
@@ -1001,6 +1002,7 @@ local function initImportedFeatures()
         if thread and thread ~= coroutine.running() then pcall(task.cancel, thread) end
         stopMove(name)
         buttonBusy[name]=nil
+        if onJobStop[name] then onJobStop[name]() end
     end
     local function startJob(name, interval, fn)
         stopJob(name)
@@ -1122,7 +1124,7 @@ local function initImportedFeatures()
     end
     local function nearest(folder, predicate)
         local best,metric=nil,math.huge
-        if folder then for _,object in ipairs(folder:GetChildren()) do
+        if folder then for _,object in ipairs(folder:GetDescendants()) do
             local hp=health(object)
             if part(object) and hp>0 and (not predicate or predicate(object)) then
                 local d=distance(object)
@@ -1131,10 +1133,14 @@ local function initImportedFeatures()
         end end
         return best
     end
-    local function cleanName(name) return (name:gsub("%s*%[.-%]", "")) end
+    local function cleanName(name)
+        local result=tostring(name):gsub("<[^>]*>",""):gsub("%s*%[.-%]","")
+        result=result:gsub("\194\160"," "):lower():gsub("%s+"," "):gsub("^%s+",""):gsub("%s+$","")
+        return (result:gsub("posessed", "possessed"))
+    end
     local function named(folder,names)
         return nearest(folder,function(o)
-            for _,name in ipairs(names) do if cleanName(o.Name)==name then return true end end
+            for _,name in ipairs(names) do if cleanName(o.Name)==cleanName(name) then return true end end
             return false
         end)
     end
@@ -1903,35 +1909,93 @@ local function initImportedFeatures()
         local q=path(PlayerGui,"Main","Quest")
         return q and q.Visible==true,q
     end
+    local farmQuest, farmQuestKey
+    local farmStatus={Phase="idle"}
+    local lastFarmLog, lastFarmMessage=0,""
+    local function farmProgress(phase,mob,target,destination,title)
+        local _,_,root=character()
+        local point=part(target)
+        farmStatus={Phase=phase,ExpectedMob=mob,Target=target and target.Name or nil,
+            Destination=destination and destination.Position or nil,Position=root and root.Position or nil,
+            Distance=root and point and (root.Position-point.Position).Magnitude or nil,
+            QuestTitle=title,At=os.clock()}
+        local message=phase.." | expected="..tostring(mob).." | target="..tostring(farmStatus.Target)
+            .." | distance="..tostring(farmStatus.Distance).." | destination="..tostring(farmStatus.Destination)
+        local important=phase..":"..tostring(mob)..":"..tostring(farmStatus.Target)
+        if debugEnabled and (important~=lastFarmMessage or os.clock()-lastFarmLog>=5) then
+            local names={}
+            local folder=workspace:FindFirstChild("Enemies")
+            if phase=="waiting_spawn" and folder then
+                for _,object in ipairs(folder:GetDescendants()) do
+                    if object:IsA("Model") and object:FindFirstChildOfClass("Humanoid") then
+                        names[#names+1]=object.Name
+                        if #names>=6 then break end
+                    end
+                end
+            end
+            debugLog("INFO","farm.progress",message.." | quest="..tostring(title).." | nearby_names="..table.concat(names,", "))
+            lastFarmLog=os.clock();lastFarmMessage=important
+        end
+    end
+    onJobStop.Farm=function() farmProgress("idle") end
+    local function liveSpawn(mob)
+        local folder=path(workspace,"_WorldOrigin","EnemySpawns") or workspace:FindFirstChild("EnemySpawns")
+        local best,metric=nil,math.huge
+        if folder then for _,object in ipairs(folder:GetDescendants()) do
+            if cleanName(object.Name)==cleanName(mob) then
+                local point=part(object)
+                local d=point and distance(point) or math.huge
+                if d<metric then best,metric=point,d end
+            end
+        end end
+        return best
+    end
     local function farmStep()
         local mode=options.Mode
         local _,_,root=character()
-        if not root then return end
+        if not root then farmProgress("waiting_character");return end
         local enemies=workspace:FindFirstChild("Enemies")
         local target
         if mode=="Level" or mode=="Boss" then
-            local q=mode=="Level" and questForLevel() or bossForName(options.Boss)
+            local visible,questGui=questVisible()
+            local key=mode..":"..(mode=="Boss" and options.Boss or "level")
+            if key~=farmQuestKey then farmQuest=nil;farmQuestKey=key end
+            if not visible then farmQuest=nil end
+            -- Preserve the accepted quest until completion, even if level changes.
+            local q=farmQuest or (mode=="Level" and questForLevel() or bossForName(options.Boss))
             if not q then fail("Sem dados de missão para este nível/mar/boss; dados das fontes até nível 2600.") end
-            if q.Entrance and (root.Position-q.Quest.Position).Magnitude>10000 then
+            local titleObject=path(questGui,"Container","QuestTitle","Title")
+            local title=titleObject and titleObject:IsA("TextLabel") and titleObject.Text or ""
+            if q.Entrance and q.Quest and (root.Position-q.Quest.Position).Magnitude>10000 then
+                farmProgress("requesting_entrance",q.Mob,nil,CFrame.new(q.Entrance),title)
                 comm("entrance",5,"requestEntrance",q.Entrance);return
             end
-            local visible,questGui=questVisible()
             if q.Name and q.Quest then
                 if not visible then
+                    farmProgress("quest_giver",q.Mob,nil,q.Quest,title)
                     move(q.Quest,"Farm")
-                    if (root.Position-q.Quest.Position).Magnitude<12 then comm("quest.start",2,"StartQuest",q.Name,q.Tier) end
+                    if (root.Position-q.Quest.Position).Magnitude<12 then
+                        local requested=comm("quest.start",2,"StartQuest",q.Name,q.Tier)
+                        if requested then farmQuest=q end
+                    end
                     return
                 end
-                local title=path(questGui,"Container","QuestTitle","Title")
-                if title and title:IsA("TextLabel") and not title.Text:find(q.Mob,1,true) then
-                    comm("quest.abandon",3,"AbandonQuest"); return
-                end
+                -- GUI text can be translated/pluralized. It is diagnostic text,
+                -- never sufficient evidence for abandoning an accepted quest.
+                farmQuest=q
             end
             target=named(enemies,{q.Mob})
-            if not target then move(q.Spawn,"Farm") end
+            if not target then
+                local point=liveSpawn(q.Mob)
+                local destination=point and point.CFrame*CFrame.new(0,3,0) or q.Spawn
+                farmProgress("waiting_spawn",q.Mob,nil,destination,title)
+                move(destination,"Farm")
+            else
+                farmProgress(distance(target)<=100 and "combat" or "moving_to_target",q.Mob,target,part(target).CFrame,title)
+            end
         elseif mode=="Raid" then
             local timer=path(PlayerGui,"Main","Timer")
-            if not timer or not timer.Visible then return end
+            if not timer or not timer.Visible then farmProgress("waiting_raid");return end
             target=nearest(enemies,function(o) return distance(o)<1500 end)
             if not target then
                 local locations=path(workspace,"_WorldOrigin","Locations")
@@ -1954,7 +2018,10 @@ local function initImportedFeatures()
                 if not questVisible() then comm("elite.quest",5,"EliteHunter") end
             elseif mode=="White Belt" then net("dojo.quest",5,"RF/InteractDragonQuest",{NPC="Dojo Trainer",Command="RequestQuest"}) end
         end
-        if target then fight(target,"Farm") end
+        if target then
+            if mode~="Level" and mode~="Boss" then farmProgress(distance(target)<=100 and "combat" or "moving_to_target",target.Name,target,part(target).CFrame) end
+            fight(target,"Farm")
+        end
     end
     -- Original six ESP types plus event/gear/berry markers; all owned explicitly.
     local espFlags,markers={},{}
@@ -2032,12 +2099,12 @@ local function initImportedFeatures()
     local farmControl
     dropdown(Farm,"Arma",{"Melee","Sword","Gun","Blox Fruit"},options.Weapon,function(v) options.Weapon=v end)
     dropdown(Farm,"Modo",modes,"Off",function(v)
-        options.Mode=v;stopMove("Farm")
+        options.Mode=v;farmQuest=nil;farmQuestKey=nil;stopMove("Farm")
         if v=="Off" and farmControl then farmControl.Set(false) end
     end)
     options.Material="Scrap Metal"
     dropdown(Farm,"Material",materialNames,options.Material,function(v) options.Material=v end)
-    dropdown(Farm,"Boss",bossNames,options.Boss,function(v) options.Boss=v;stopMove("Farm") end)
+    dropdown(Farm,"Boss",bossNames,options.Boss,function(v) options.Boss=v;farmQuest=nil;farmQuestKey=nil;stopMove("Farm") end)
     dropdown(Farm,"Finalizar mastery",{"Off","Blox Fruit","Gun","Sword"},"Off",function(v) options.Mastery=v end)
     addSlider(Farm,{Name="Mastery: vida restante (%)",Min=5,Max=80,Default=30,Step=1,Callback=function(v) options.MasteryHealth=v end})
     addSlider(Farm,{Name="Distância acima do alvo",Min=3,Max=60,Default=20,Step=1,Callback=function(v) options.Offset=v end})
@@ -2389,7 +2456,7 @@ local function initImportedFeatures()
     report("startup",supported and "target game detected" or "UI available; target game unavailable")
     return {StopAll=stopAll,GetState=function()
         local running={};for name in pairs(jobs) do running[#running+1]=name end;table.sort(running)
-        return {Active=active,SupportedGame=supported,Mode=options.Mode,Jobs=running,Flags=table.clone(flags)}
+        return {Active=active,SupportedGame=supported,Mode=options.Mode,Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus)}
     end}
 end
 
