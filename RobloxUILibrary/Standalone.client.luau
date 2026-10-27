@@ -10,7 +10,7 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 -- Optional diagnostics. No polling, external requests or global error hooks.
 local DEBUG_DEFAULT = false
 local debugEnabled = DEBUG_DEFAULT
-local debugControl, debugPanelControl
+local debugControl, debugPanelControl, debugVisibility
 local debugHistory = {}
 local DEBUG_LIMIT = 100
 local function debugLog(level, event, detail)
@@ -29,6 +29,7 @@ local function setDebug(enabled)
     if not previous and nextValue then debugLog("INFO","debug","enabled") end
     if debugControl and debugControl.Get()~=nextValue then debugControl.Set(nextValue) end
     if debugPanelControl and debugPanelControl.Get()~=nextValue then debugPanelControl.Set(nextValue) end
+    if debugVisibility then debugVisibility(nextValue) end
     return nextValue
 end
 
@@ -614,16 +615,27 @@ local function initFastAttack()
         local targetHumanoid=enemy and enemy:FindFirstChildOfClass("Humanoid")
         local head=enemy and (enemy:FindFirstChild("Head") or enemy:FindFirstChild("HumanoidRootPart"))
         if not root or not h or h.Health<=0 or not tool then return false,"missing_character_or_tool" end
-        if tool.ToolTip=="Gun" or tool.ToolTip=="Blox Fruit" then return false,"skill_weapon" end
+        if tool.ToolTip=="Gun" then return false,"skill_weapon" end
         if not targetHumanoid or targetHumanoid.Health<=0 or not head or not head:IsA("BasePart") then return false,"invalid_target" end
         if (head.Position-root.Position).Magnitude>self.Distance then return false,"out_of_range" end
+        local leftClick=tool:FindFirstChild("LeftClickRemote")
         local attack,hit=remote("RE/RegisterAttack"),remote("RE/RegisterHit")
-        if not attack or not hit then return false,"remotes_unavailable" end
+        if not (leftClick and leftClick:IsA("RemoteEvent")) and (not attack or not hit) then return false,"remotes_unavailable" end
         if os.clock()-lastDispatch<self.Delay then return true,"cooldown" end
         lastDispatch=os.clock()
-        attack:FireServer(self.Delay)
-        hit:FireServer(head,{{enemy,head}})
-        return true,"remote_sent"
+        local ok,err=pcall(function()
+            -- Matsune prioritizes the equipped weapon's own M1 remote.
+            if leftClick and leftClick:IsA("RemoteEvent") then
+                local delta=head.Position-root.Position
+                if delta.Magnitude<=0.001 then error("target direction unavailable") end
+                leftClick:FireServer(delta.Unit,1)
+            else
+                attack:FireServer(0)
+                hit:FireServer(head,{{enemy,head}})
+            end
+        end)
+        if not ok then debugLog("WARN","combat.remote",err);return false,"remote_failed" end
+        return true,leftClick and leftClick:IsA("RemoteEvent") and "left_click_remote_sent" or "remote_sent"
     end
     function api:AttackNearest()
         local c=LocalPlayer.Character
@@ -631,25 +643,20 @@ local function initFastAttack()
         local root=c and c:FindFirstChild("HumanoidRootPart")
         local tool=c and c:FindFirstChildOfClass("Tool")
         if not root or not h or h.Health<=0 or not tool or tool.ToolTip=="Gun" then return end
-        local hits,first={},nil
+        local best,bestDistance=nil,math.huge
         local function gather(folder)
-            if folder then for _,enemy in ipairs(folder:GetChildren()) do
+            if folder then for _,enemy in ipairs(folder:GetDescendants()) do
                 local enemyHumanoid=enemy:FindFirstChildOfClass("Humanoid")
-                local head=enemy:FindFirstChild("Head")
-                if enemy~=c and enemyHumanoid and enemyHumanoid.Health>0 and head and head:IsA("BasePart")
-                    and (head.Position-root.Position).Magnitude<=self.Distance then
-                    hits[#hits+1]={enemy,head};first=first or head
+                local head=enemy:FindFirstChild("Head") or enemy:FindFirstChild("HumanoidRootPart")
+                if enemy~=c and enemyHumanoid and enemyHumanoid.Health>0 and head and head:IsA("BasePart") then
+                    local d=(head.Position-root.Position).Magnitude
+                    if d<=self.Distance and d<bestDistance then best=enemy;bestDistance=d end
                 end
             end end
         end
         if self.attackMobs then gather(workspace:FindFirstChild("Enemies") or workspace:FindFirstChild("Hostiles")) end
         if self.attackPlayers then gather(workspace:FindFirstChild("Characters")) end
-        if not first then return end
-        local attack,hit=remote("RE/RegisterAttack"),remote("RE/RegisterHit")
-        if not attack or not hit then error("FastAttack: remotes não disponíveis; contrato precisa ser confirmado no jogo.",0) end
-        if os.clock()-lastDispatch<self.Delay then return end
-        lastDispatch=os.clock()
-        attack:FireServer(self.Delay);hit:FireServer(first,hits)
+        if best then return self:AttackTarget(best) end
     end
     function api:Start()
         if destroyed or self.Running then return end
@@ -1258,6 +1265,38 @@ local function initImportedFeatures()
     local function skillAttack()
         for _,key in ipairs({"Z","X","C","V","F"}) do if options["Skill"..key] then press(key) end end
     end
+    local lastInputClick=-math.huge
+    local function inputClick(method)
+        if destroyed or not active then return false,"unloaded" end
+        if UserInputService:GetFocusedTextBox() then return false,"typing" end
+        if os.clock()-lastInputClick<0.15 then return false,"cooldown" end
+        lastInputClick=os.clock()
+        local camera=workspace.CurrentCamera
+        local function r2()
+            -- Reference: Hoho's ScriptLoad.lua contains this in a commented AutoM1 example.
+            local vim=game:GetService("VirtualInputManager")
+            local ok,err=pcall(function() vim:SendKeyEvent(true,Enum.KeyCode.ButtonR2,false,game) end)
+            local released,releaseErr=pcall(function() vim:SendKeyEvent(false,Enum.KeyCode.ButtonR2,false,game) end)
+            if not ok or not released then return false,tostring(err or releaseErr) end
+            return true,"button_r2_sent"
+        end
+        if method=="Hoho R2" then return r2() end
+        -- Matsune's farm uses VirtualUser:CaptureController()/Button1Down().
+        -- Pair it with Button1Up even if the down event errors; never leave a held click.
+        local vu
+        local point=camera and Vector2.new(camera.ViewportSize.X/2,camera.ViewportSize.Y/2) or Vector2.new(1,1)
+        local ok,err=pcall(function()
+            vu=game:GetService("VirtualUser")
+            vu:CaptureController()
+            if not camera then error("camera unavailable") end
+            vu:Button1Down(point,camera.CFrame)
+        end)
+        local released,releaseErr=pcall(function() if vu then vu:Button1Up(point,camera and camera.CFrame or CFrame.new()) end end)
+        if ok and released then return true,"virtual_user_sent" end
+        local fallback,reason=r2()
+        if fallback then return true,reason end
+        return false,"input_unavailable: "..tostring(err or releaseErr).." / "..tostring(reason)
+    end
     local attackState={Phase="idle",Method="Auto",Attempts=0}
     local lastAttackTarget,lastAttackHealth,lastDamageAt
     local function fight(target,owner)
@@ -1292,11 +1331,16 @@ local function initImportedFeatures()
         else
             -- Tool activation alone does not reach the game's newer combat remotes.
             -- Always preserve the normal tool path, then target only this farm enemy.
-            tool:Activate()
+            local activated,activateErr=pcall(function() tool:Activate() end)
+            local clicked,inputReason=false,"tool_only"
+            if attackState.Method~="Tool" then clicked,inputReason=inputClick(attackState.Method) end
+            attackState.Input=inputReason
             local sent,reason=false,"tool_only"
             if attackState.Method=="Auto" then sent,reason=fastAttackApi:AttackTarget(target) end
+            if not activated then debugLog("WARN","combat.tool",activateErr) end
+            if not activated and not clicked and not sent then debugLog("WARN","combat.input",inputReason) end
             attackState.Attempts=attackState.Attempts+1
-            attackState.Phase=sent and "attack_sent" or "tool_activated"
+            attackState.Phase=sent and "attack_sent" or clicked and "input_sent" or activated and "tool_activated" or "attack_unavailable"
             attackState.Transport=reason
         end
         debugLog("INFO","combat",attackState.Phase.." target="..tostring(target.Name).." tool="..tostring(attackState.Tool).." transport="..tostring(attackState.Transport).." hp="..tostring(hp))
@@ -2457,8 +2501,8 @@ local function initImportedFeatures()
         stopMove("Farm")
     end)
     addLabel(Farm,"Velocidade do Tween: menor = mais lento. O ajuste também vale durante o deslocamento.")
-    dropdown(Farm,"Ataque do farm",{"Auto","Tool"},"Auto",function(v) attackState.Method=v end)
-    addLabel(Farm,"Auto: ativa a arma e envia ataque ao inimigo selecionado quando os remotes existem. Tool: somente ativação normal. DEBUG mostra envio e perda de vida observada separadamente.")
+    dropdown(Farm,"Ataque do farm",{"Auto","Matsune Click","Hoho R2","Tool"},"Auto",function(v) attackState.Method=v end)
+    addLabel(Farm,"Auto: clique Matsune + ataque da arma/Net. Matsune Click: VirtualUser com alternativa R2. Hoho R2: exemplo comentado do carregador Hoho. Tool: ativação normal. DEBUG distingue envio e vida observada.")
     dropdown(Farm,"Arma",{"Melee","Sword","Gun","Blox Fruit"},options.Weapon,function(v) options.Weapon=v end)
     dropdown(Farm,"Modo",modes,"Off",function(v)
         options.Mode=v;farmQuest=nil;farmQuestKey=nil;fixedCombatTarget=nil;fixedCombatPoint=nil;stopMove("Farm")
@@ -2862,7 +2906,38 @@ local function getDebugLog()
 end
 
 -- Diagnostics stay local; no external logging or global error interception.
-local debugPage=addTab("DEBUG")
+local debugWindow=new("Frame",{Name="XerecaDebugWindow",ZIndex=20,Size=UDim2.fromOffset(460,420),Position=UDim2.fromOffset(30,80),Visible=false,Active=true,BorderSizePixel=0,Theme={BackgroundColor3="ComponentBg"}},uiGui)
+new("UICorner",{CornerRadius=UDim.new(0,8)},debugWindow)
+local debugTitle=new("TextLabel",{Text="XERECA | DEBUG • arraste aqui",Size=UDim2.new(1,-45,0,36),BackgroundTransparency=1,Active=true,Font=Enum.Font.GothamBold,TextSize=13,Theme={TextColor3="Text"}},debugWindow)
+local debugClose=new("TextButton",{Text="X",Size=UDim2.fromOffset(34,30),Position=UDim2.new(1,-38,0,3),BackgroundTransparency=1,Font=Enum.Font.GothamBold,TextSize=14,Theme={TextColor3="Text"}},debugWindow)
+local debugPage=new("ScrollingFrame",{Position=UDim2.fromOffset(12,40),Size=UDim2.new(1,-20,1,-48),BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=4,CanvasSize=UDim2.new(),AutomaticCanvasSize=Enum.AutomaticSize.Y},debugWindow)
+new("UIListLayout",{Padding=UDim.new(0,8),SortOrder=Enum.SortOrder.LayoutOrder},debugPage)
+local function fitDebugWindow()
+    local camera=workspace.CurrentCamera
+    local v=camera and camera.ViewportSize or Vector2.new(800,600)
+    debugWindow.Size=UDim2.fromOffset(math.min(460,math.max(180,v.X-24)),math.min(420,math.max(160,v.Y-48)))
+    local x=math.clamp(debugWindow.Position.X.Offset,0,math.max(0,v.X-debugWindow.Size.X.Offset))
+    local y=math.clamp(debugWindow.Position.Y.Offset,0,math.max(0,v.Y-debugWindow.Size.Y.Offset))
+    debugWindow.Position=UDim2.fromOffset(x,y)
+end
+local debugDrag,debugDragPoint,debugDragOrigin
+bind(debugTitle.InputBegan,function(input)
+    if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
+        debugDrag=input;debugDragPoint=input.Position;debugDragOrigin=debugWindow.Position
+    end
+end,"debug.drag.begin")
+bind(UserInputService.InputChanged,function(input)
+    if not debugDrag then return end
+    if debugDrag.UserInputType==Enum.UserInputType.Touch and input~=debugDrag then return end
+    if debugDrag.UserInputType~=Enum.UserInputType.Touch and input.UserInputType~=Enum.UserInputType.MouseMovement then return end
+    local delta=input.Position-debugDragPoint
+    debugWindow.Position=UDim2.fromOffset(debugDragOrigin.X.Offset+delta.X,debugDragOrigin.Y.Offset+delta.Y)
+    fitDebugWindow()
+end,"debug.drag.move")
+bind(UserInputService.InputEnded,function(input) if input==debugDrag or input.UserInputType==Enum.UserInputType.MouseButton1 then debugDrag=nil end end,"debug.drag.end")
+bind(UserInputService.WindowFocusReleased,function() debugDrag=nil end,"debug.drag.focus")
+bind(debugClose.Activated,function() setDebug(false) end,"debug.close")
+addBtn(Settings,"Abrir janela DEBUG",function() setDebug(true) end)
 addSection(debugPage,"Diagnóstico do XERECA HUB")
 addLabel(debugPage,"Envio de ataque não confirma dano. Confira a vida observada abaixo. Logs locais, limitados a 100 entradas; nenhum envio externo.")
 local panelPaused,onlyProblems=false,false
@@ -2877,7 +2952,7 @@ local function debugReportText()
     local movement=snapshot.Movement or {}
     local rows={"XERECA HUB | diagnóstico local",
         "Farm: "..tostring(farm.Phase).." | alvo: "..tostring(farm.Target or farm.ExpectedMob),
-        "Ataque: "..tostring(attack.Phase).." | método: "..tostring(attack.Method).." | transporte: "..tostring(attack.Transport),
+        "Ataque: "..tostring(attack.Phase).." | método: "..tostring(attack.Method).." | transporte: "..tostring(attack.Transport).." | clique: "..tostring(attack.Input),
         "Arma: "..tostring(attack.Tool).." | distância: "..tostring(attack.Distance).." | tentativas: "..tostring(attack.Attempts),
         "Última perda de vida observada (relógio local): "..tostring(attack.LastDamageAt),
         "Movimento: "..tostring(movement.Owner).." | suspenso: "..tostring(movement.Suspended),
@@ -2906,10 +2981,16 @@ addToggle(debugPage,"Somente avisos e erros",false,function(on) onlyProblems=on;
 addTextbox(debugPage,{Placeholder="Filtrar logs (ex.: combat)",Callback=function(text) debugSearch=tostring(text):lower();refreshDebugPanel() end})
 addBtn(debugPage,"Atualizar diagnóstico",function() runDebug();refreshDebugPanel() end)
 addBtn(debugPage,"Limpar registros",function() table.clear(debugHistory);refreshDebugPanel() end)
+debugVisibility=function(on)
+    if destroyed then return end
+    debugWindow.Visible=on
+    debugDrag=nil
+    if on then fitDebugWindow();refreshDebugPanel() end
+end
 local lastDebugPaint=0
 bind(game:GetService("RunService").Heartbeat,function()
-    if debugEnabled and not panelPaused and isUIOpen and state~="min" and os.clock()-lastDebugPaint>=1 then
-        lastDebugPaint=os.clock();refreshDebugPanel()
+    if debugEnabled and debugWindow.Visible and not panelPaused and os.clock()-lastDebugPaint>=1 then
+        lastDebugPaint=os.clock();fitDebugWindow();refreshDebugPanel()
     end
 end,"debug.panel")
 
