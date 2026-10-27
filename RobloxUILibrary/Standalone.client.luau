@@ -873,13 +873,15 @@ local function initImportedFeatures()
     end
     local moveTween, moveRoot, moveTarget, moveOwner
     local heldKeys = {}
+    local motionState
+    local fixedCombatTarget, fixedCombatPoint, fixedCombatOffset
     local collisionState = {}
     local moveVersion=0
     local function restoreCollisions()
         for object,value in pairs(collisionState) do if object.Parent then object.CanCollide=value end end
         table.clear(collisionState)
     end
-    local options = {Weapon="Melee", Mastery="Off", MasteryHealth=30, Speed=100, Offset=20,
+    local options = {Weapon="Melee", Mastery="Off", MasteryHealth=30, Speed=100, Offset=20, FixedFarm=true,
         Boss="The Gorilla King", Mode="Off", Chip="Flame", Player="", SkillZ=true, SkillX=true, SkillC=true, SkillV=false, SkillF=false}
     local supported = game.PlaceId == 2753915549 or game.PlaceId == 4442272183 or game.PlaceId == 7449423635
     local speedSliders = {}
@@ -959,12 +961,36 @@ local function initImportedFeatures()
     local function net(key, spacing, name, ...)
         return command(key, spacing, path(RS,"Modules","Net",name) or path(RS,"Packages","Net",name), ...)
     end
+    local function releaseMotion()
+        local previous=motionState
+        motionState=nil
+        if not previous then return end
+        if previous.Died then previous.Died:Disconnect() end
+        if previous.Root.Parent then
+            previous.Root.Anchored=previous.Anchored
+            previous.Root.AssemblyLinearVelocity=Vector3.new(0,0,0)
+            previous.Root.AssemblyAngularVelocity=Vector3.new(0,0,0)
+        end
+        if previous.Humanoid.Parent then previous.Humanoid.AutoRotate=previous.AutoRotate end
+    end
     local function stopMove(owner)
         if owner and moveOwner ~= owner then return end
         moveVersion=moveVersion+1
         if moveTween then moveTween:Cancel() end
         restoreCollisions()
+        releaseMotion()
         moveTween,moveRoot,moveTarget,moveOwner=nil,nil,nil,nil
+    end
+    local function suspendMotion(root,humanoid)
+        motionState={Root=root,Humanoid=humanoid,Anchored=root.Anchored,AutoRotate=humanoid.AutoRotate}
+        motionState.Died=humanoid.Died:Connect(function()
+            stopMove();fixedCombatTarget=nil;fixedCombatPoint=nil;fixedCombatOffset=nil
+        end)
+        humanoid.Sit=false
+        humanoid.AutoRotate=false
+        root.Anchored=true
+        root.AssemblyLinearVelocity=Vector3.new(0,0,0)
+        root.AssemblyAngularVelocity=Vector3.new(0,0,0)
     end
     local function move(target, owner)
         if owner=="Manual" then
@@ -972,18 +998,31 @@ local function initImportedFeatures()
         end
         local _,h,root=character()
         if not root or typeof(target) ~= "CFrame" then return end
-        if moveTween and moveRoot==root and moveOwner==owner and moveTarget
-            and (moveTarget.Position-target.Position).Magnitude < 6
-            and moveTween.PlaybackState == Enum.PlaybackState.Playing then return end
+        if moveRoot==root and moveOwner==owner and moveTarget and motionState
+            and (moveTarget.Position-target.Position).Magnitude<0.5 then
+            -- A completed farm Tween retains its world-space anchor; do not
+            -- release/reacquire it every farm tick or gravity wins between ticks.
+            if owner=="Farm" or (moveTween and moveTween.PlaybackState==Enum.PlaybackState.Playing) then return end
+        end
         stopMove()
-        local delta=(root.Position-target.Position).Magnitude
-        if delta < 3 then return end
-        h.Sit=false
         moveOwner,moveRoot,moveTarget=owner,root,target
+        suspendMotion(root,h)
+        local delta=(root.Position-target.Position).Magnitude
+        if delta<0.1 then
+            if owner~="Farm" then releaseMotion() end
+            return
+        end
         moveTween=TweenService:Create(root,TweenInfo.new(math.max(0.1,delta/options.Speed),Enum.EasingStyle.Linear),{CFrame=target})
         local version=moveVersion
-        moveTween.Completed:Once(function()
-            if moveVersion==version then restoreCollisions() end
+        moveTween.Completed:Once(function(playback)
+            if moveVersion~=version then return end
+            if playback==Enum.PlaybackState.Completed and owner=="Farm" then
+                -- Farm suspension continues until the owner explicitly stops.
+                root.CFrame=target
+            else
+                restoreCollisions()
+                releaseMotion()
+            end
         end)
         moveTween:Play()
     end
@@ -1015,14 +1054,21 @@ local function initImportedFeatures()
         return slider
     end
     bind(RunService.Stepped,function()
-        if active and not destroyed and moveTween and moveTween.PlaybackState==Enum.PlaybackState.Playing then
-            local c=character()
-            if c then for _,object in ipairs(c:GetDescendants()) do
-                if object:IsA("BasePart") then
-                    if collisionState[object]==nil then collisionState[object]=object.CanCollide end
-                    object.CanCollide=false
-                end
-            end end
+        if not motionState then return end
+        local c,h,root=character()
+        if not active or destroyed or root~=motionState.Root or h~=motionState.Humanoid then stopMove();return end
+        root.Anchored=true
+        root.AssemblyLinearVelocity=Vector3.new(0,0,0)
+        root.AssemblyAngularVelocity=Vector3.new(0,0,0)
+        if moveOwner=="Farm" and moveTarget
+            and (not moveTween or moveTween.PlaybackState~=Enum.PlaybackState.Playing) then
+            root.CFrame=moveTarget
+        end
+        for _,object in ipairs(c:GetDescendants()) do
+            if object:IsA("BasePart") then
+                if collisionState[object]==nil then collisionState[object]=object.CanCollide end
+                object.CanCollide=false
+            end
         end
     end,"features.movement.physics")
     local function stopJob(name)
@@ -1173,6 +1219,18 @@ local function initImportedFeatures()
             return false
         end)
     end
+    local function retainedFarmTarget(folder,names)
+        local target=fixedCombatTarget
+        if not options.FixedFarm or not target or not folder or not target:IsDescendantOf(folder) or health(target)<=0 or not part(target) then return nil end
+        if names then
+            for _,name in ipairs(names) do if cleanName(target.Name)==cleanName(name) then return target end end
+            return nil
+        end
+        return target
+    end
+    local function farmNamed(folder,names)
+        return retainedFarmTarget(folder,names) or named(folder,names)
+    end
     local function skillAttack()
         for _,key in ipairs({"Z","X","C","V","F"}) do if options["Skill"..key] then press(key) end end
     end
@@ -1180,7 +1238,16 @@ local function initImportedFeatures()
         local root=part(target)
         local hp,maxHP=health(target)
         if not root or hp<=0 then return end
-        move(root.CFrame*CFrame.new(0,options.Offset,4),owner)
+        local destination=root.CFrame*CFrame.new(0,options.Offset,4)
+        if owner=="Farm" and options.FixedFarm then
+            if fixedCombatTarget~=target or fixedCombatOffset~=options.Offset then
+                fixedCombatTarget=target
+                fixedCombatPoint=destination
+                fixedCombatOffset=options.Offset
+            end
+            destination=fixedCombatPoint
+        end
+        move(destination,owner)
         local mastery=options.Mastery~="Off" and hp/math.max(1,maxHP)*100 <= options.MasteryHealth
         local tool=equip(mastery and options.Mastery or options.Weapon)
         if distance(target)<=100 and tool then
@@ -1966,7 +2033,7 @@ local function initImportedFeatures()
             lastFarmLog=os.clock();lastFarmMessage=important
         end
     end
-    onJobStop.Farm=function() farmProgress("idle") end
+    onJobStop.Farm=function() fixedCombatTarget=nil;fixedCombatPoint=nil;fixedCombatOffset=nil;farmProgress("idle") end
     local function liveSpawn(mob)
         local folder=path(workspace,"_WorldOrigin","EnemySpawns") or workspace:FindFirstChild("EnemySpawns")
         local best,metric=nil,math.huge
@@ -2013,7 +2080,7 @@ local function initImportedFeatures()
                 -- never sufficient evidence for abandoning an accepted quest.
                 farmQuest=q
             end
-            target=named(enemies,{q.Mob})
+            target=farmNamed(enemies,{q.Mob})
             if not target then
                 local point=liveSpawn(q.Mob)
                 local destination=point and point.CFrame*CFrame.new(0,3,0) or q.Spawn
@@ -2033,16 +2100,16 @@ local function initImportedFeatures()
                     if point then move(point.CFrame*CFrame.new(0,25,0),"Farm");break end
                 end
             end
-        elseif mode=="Nearest" then target=nearest(enemies)
+        elseif mode=="Nearest" then target=retainedFarmTarget(enemies) or nearest(enemies)
         elseif mode=="Material" then
             local data=materialForName(options.Material)
-            if data then target=named(enemies,{data.Mob});if not target then move(data.Spawn,"Farm") end end
-        elseif mode=="Law" then target=named(enemies,{"Order"})
+            if data then target=farmNamed(enemies,{data.Mob});if not target then move(data.Spawn,"Farm") end end
+        elseif mode=="Law" then target=farmNamed(enemies,{"Order"})
         elseif mode=="Player" then
             local p=Players:FindFirstChild(options.Player)
             if p and p~=LocalPlayer then target=p.Character end
         else
-            target=named(enemies,mobGroups[mode] or {})
+            target=farmNamed(enemies,mobGroups[mode] or {})
             if mode=="Elite" then
                 if not questVisible() then comm("elite.quest",5,"EliteHunter") end
             elseif mode=="White Belt" then net("dojo.quest",5,"RF/InteractDragonQuest",{NPC="Dojo Trainer",Command="RequestQuest"}) end
@@ -2127,15 +2194,20 @@ local function initImportedFeatures()
     addLabel(Farm,"Um modo de farm por vez. Coordenadas/missões vêm das fontes; progresso e dano dependem do servidor. Dados de nível limitados a 2600.")
     local farmControl
     speedSlider(Farm)
+    addToggle(Farm,"Manter posição fixa no farm",true,function(on)
+        options.FixedFarm=on
+        fixedCombatTarget=nil;fixedCombatPoint=nil;fixedCombatOffset=nil
+        stopMove("Farm")
+    end)
     addLabel(Farm,"Velocidade do Tween: menor = mais lento. O ajuste também vale durante o deslocamento.")
     dropdown(Farm,"Arma",{"Melee","Sword","Gun","Blox Fruit"},options.Weapon,function(v) options.Weapon=v end)
     dropdown(Farm,"Modo",modes,"Off",function(v)
-        options.Mode=v;farmQuest=nil;farmQuestKey=nil;stopMove("Farm")
+        options.Mode=v;farmQuest=nil;farmQuestKey=nil;fixedCombatTarget=nil;fixedCombatPoint=nil;stopMove("Farm")
         if v=="Off" and farmControl then farmControl.Set(false) end
     end)
     options.Material="Scrap Metal"
     dropdown(Farm,"Material",materialNames,options.Material,function(v) options.Material=v end)
-    dropdown(Farm,"Boss",bossNames,options.Boss,function(v) options.Boss=v;farmQuest=nil;farmQuestKey=nil;stopMove("Farm") end)
+    dropdown(Farm,"Boss",bossNames,options.Boss,function(v) options.Boss=v;farmQuest=nil;farmQuestKey=nil;fixedCombatTarget=nil;fixedCombatPoint=nil;stopMove("Farm") end)
     dropdown(Farm,"Finalizar mastery",{"Off","Blox Fruit","Gun","Sword"},"Off",function(v) options.Mastery=v end)
     addSlider(Farm,{Name="Mastery: vida restante (%)",Min=5,Max=80,Default=30,Step=1,Callback=function(v) options.MasteryHealth=v end})
     addSlider(Farm,{Name="Distância acima do alvo",Min=3,Max=60,Default=20,Step=1,Callback=function(v) options.Offset=v end})
@@ -2457,7 +2529,12 @@ local function initImportedFeatures()
     end
     button(pageStatus,"Atualizar status",status)
     toggleJob(pageStatus,"Atualizar status automaticamente","Status",5,status)
-    bind(LocalPlayer.CharacterAdded,function() stopMove();restoreCamera() end,"features.respawn")
+    bind(LocalPlayer.CharacterAdded,function()
+        stopMove();fixedCombatTarget=nil;fixedCombatPoint=nil;fixedCombatOffset=nil;restoreCamera()
+    end,"features.respawn")
+    bind(LocalPlayer.CharacterRemoving,function()
+        stopMove();fixedCombatTarget=nil;fixedCombatPoint=nil;fixedCombatOffset=nil
+    end,"features.character_removing")
     local function restoreVisuals()
         if lightingOriginal then Lighting.ClockTime=lightingOriginal;lightingOriginal=nil end
         if fogOriginal then
@@ -2487,7 +2564,7 @@ local function initImportedFeatures()
     report("startup",supported and "target game detected" or "UI available; target game unavailable")
     return {StopAll=stopAll,GetState=function()
         local running={};for name in pairs(jobs) do running[#running+1]=name end;table.sort(running)
-        return {Active=active,SupportedGame=supported,Mode=options.Mode,TweenSpeed=options.Speed,Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus)}
+        return {Active=active,SupportedGame=supported,Mode=options.Mode,TweenSpeed=options.Speed,Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),Movement={Owner=moveOwner,Suspended=motionState~=nil,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
     end}
 end
 
