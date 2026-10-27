@@ -1995,6 +1995,164 @@ local function initImportedFeatures()
         {Name="Tomoe Ring", Calls={{"BuyItem", "Tomoe Ring"}}},
         {Name="Bizarre Rifle", Calls={{"Ectoplasm", "Buy", 1}}},
     }
+    -- Adapted from Kaitun GetBestQuest/GetQuestPosition and QuestUpdate handling.
+    -- Only named in-game modules are consulted; never executes the uploaded script.
+    local function initQuestRuntime()
+        local cache={}
+        local state={Known=false,Active=false,Name=nil,Mob=nil,Modules="not_loaded"}
+        local watchedRemote,questConnection
+        local excluded={BartiloQuest=true,Trainees=true,MarineQuest=true,CitizenQuest=true}
+        local function moduleData(name)
+            local module=RS:FindFirstChild(name)
+            local entry=cache[name]
+            if entry and entry.Module==module and (entry.Data or os.clock()<entry.RetryAt) then return entry.Data end
+            entry={Module=module,RetryAt=os.clock()+5}
+            cache[name]=entry
+            if not module or not module:IsA("ModuleScript") then return nil end
+            local ok,data=pcall(require,module)
+            if not active or destroyed then return nil end
+            if ok and type(data)=="table" then entry.Data=data;return data end
+            state.LastError=name..": "..tostring(ok and "unexpected module schema" or data)
+            debugLog("WARN","quests.module",state.LastError)
+        end
+        local function cframeOf(value)
+            if typeof(value)=="CFrame" then return value end
+            if typeof(value)=="Vector3" then return CFrame.new(value) end
+            if typeof(value)=="Instance" then
+                if value:IsA("BasePart") then return value.CFrame end
+                if value:IsA("Model") then return value:GetPivot() end
+            end
+        end
+        local function referencesQuest(entry,name,depth,visited)
+            if type(entry)~="table" or depth>2 or visited[entry] then return false end
+            visited[entry]=true
+            for _,value in pairs(entry) do
+                if value==name then return true end
+                if type(value)=="table" and referencesQuest(value,name,depth+1,visited) then return true end
+            end
+            return false
+        end
+        local function GetQuestPosition(name)
+            if type(name)~="string" or name=="" then return nil end
+            local guide=moduleData("GuideModule")
+            local list=guide and type(guide.Data)=="table" and guide.Data.NPCList
+            if type(list)~="table" then return nil end
+            local _,_,root=character()
+            local nearestPosition,shortest=nil,math.huge
+            for _,entry in pairs(list) do
+                if type(entry)=="table" and referencesQuest(entry,name,0,{}) then
+                    local position=cframeOf(entry.Position)
+                    if position then
+                        local d=root and (root.Position-position.Position).Magnitude or 0
+                        if d<shortest then nearestPosition,shortest=position,d end
+                    end
+                end
+            end
+            return nearestPosition
+        end
+        local function onQuestUpdate(payload)
+            if not active or destroyed then return end
+            if payload==nil or payload==false then
+                state.Known=true;state.Active=false;state.Name=nil;state.Mob=nil
+            elseif type(payload)=="table" and type(payload.Progress)=="table" then
+                local mob
+                for name in pairs(payload.Progress) do
+                    if type(name)=="string" and name~="" and (not mob or name<mob) then mob=name end
+                end
+                if not mob then
+                    state.Known=true;state.Active=false;state.Name=nil;state.Mob=nil
+                elseif type(payload.InternalQuestName)=="string" and payload.InternalQuestName~="" then
+                    state.Known=true;state.Active=true;state.Name=payload.InternalQuestName;state.Mob=mob
+                else
+                    debugLog("WARN","quests.event","quest update ignored: missing InternalQuestName")
+                    return
+                end
+            else
+                debugLog("WARN","quests.event","unrecognized payload ignored")
+                return
+            end
+            debugLog("INFO","quests.event",state.Active and (state.Name.." / "..state.Mob) or "quest completed/cleared")
+        end
+        local function observeQuestUpdate()
+            local remote=path(RS,"Remotes","QuestUpdate")
+            if remote==watchedRemote then return end
+            if questConnection then questConnection:Disconnect();questConnection=nil end
+            watchedRemote=remote
+            state.Known=false;state.Active=false;state.Name=nil;state.Mob=nil
+            if remote and remote:IsA("RemoteEvent") then
+                questConnection=bind(remote.OnClientEvent,onQuestUpdate,"quests.update")
+            end
+        end
+        local function Refresh()
+            observeQuestUpdate()
+            local quests=moduleData("Quests")
+            local guide=moduleData("GuideModule")
+            state.Modules=quests and guide and "available" or "fallback"
+            return quests
+        end
+        local function record(name,tier,mob,definition)
+            return {Name=name,Tier=tonumber(tier) or tier,Mob=mob,Quest=GetQuestPosition(name),
+                LevelReq=definition and definition.LevelReq,Source="game_modules"}
+        end
+        local function GetBestQuest()
+            local quests=Refresh()
+            local value=path(LocalPlayer,"Data","Level")
+            local level=value and tonumber(value.Value)
+            if not quests or not level then return nil end
+            -- In-game tables can contain all seas. Keep selection in the current sea's level band.
+            if game.PlaceId==2753915549 then level=math.min(level,699)
+            elseif game.PlaceId==4442272183 then level=math.min(level,1499) end
+            local best,bestLevel,bestKey=nil,-1,nil
+            for name,stages in pairs(quests) do
+                if type(name)=="string" and not excluded[name] and type(stages)=="table" then
+                    for tier,definition in pairs(stages) do
+                        if (type(tier)=="number" or type(tier)=="string") and type(definition)=="table" then
+                            local req,tasks=definition.LevelReq,definition.Task
+                            if type(req)=="number" and req>=0 and req<=level and type(tasks)=="table" then
+                                for mob,count in pairs(tasks) do
+                                    if type(mob)=="string" and type(count)=="number" and count>1 and count<math.huge then
+                                        local key=name..":"..tostring(tier)..":"..mob
+                                        if req>bestLevel or (req==bestLevel and (not bestKey or key<bestKey)) then
+                                            best={Name=name,Tier=tonumber(tier) or tier,Mob=mob,LevelReq=req,Source="game_modules"}
+                                            bestLevel,bestKey=req,key
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            if best then best.Quest=GetQuestPosition(best.Name) end
+            return best
+        end
+        local function GetActiveQuest()
+            local quests=Refresh()
+            if not state.Known or not state.Active then return nil end
+            local stages=quests and quests[state.Name]
+            if type(stages)=="table" then
+                for tier,definition in pairs(stages) do
+                    if type(definition)=="table" and type(definition.Task)=="table" then
+                        for mob in pairs(definition.Task) do
+                            if type(mob)=="string" and cleanName(mob)==cleanName(state.Mob) then
+                                return record(state.Name,tier,mob,definition)
+                            end
+                        end
+                    end
+                end
+            end
+            -- A recognized event still supplies the real current target if module layout changed.
+            return {Name=state.Name,Mob=state.Mob,Quest=GetQuestPosition(state.Name),Source="quest_event"}
+        end
+        table.insert(cleanupFns,function()
+            if questConnection then questConnection:Disconnect();questConnection=nil end
+            watchedRemote=nil
+            table.clear(cache)
+        end)
+        return {Refresh=Refresh,GetBestQuest=GetBestQuest,GetQuestPosition=GetQuestPosition,
+            GetActiveQuest=GetActiveQuest,GetState=function() return table.clone(state) end}
+    end
+    local questRuntime=initQuestRuntime()
     local modes={"Off","Level","Nearest","Raid","Material","Bone","Cake","Ectoplasm","Elite","Boss","Law","White Belt","Dragon Hunter","Sea Event","Golem","Player"}
     local mobGroups={Bone={"Reborn Skeleton","Living Zombie","Demonic Soul","Posessed Mummy"},
         Cake={"Cookie Crafter","Cake Guard","Baking Staff","Head Baker","Cake Prince","Dough King"},
@@ -2006,6 +2164,8 @@ local function initImportedFeatures()
         return q and q.Visible==true,q
     end
     local farmQuest, farmQuestKey
+    local farmQuestSource="legacy_data"
+    local farmSpawnSource
     local farmStatus={Phase="idle"}
     local lastFarmLog, lastFarmMessage=0,""
     local function farmProgress(phase,mob,target,destination,title)
@@ -2014,7 +2174,7 @@ local function initImportedFeatures()
         farmStatus={Phase=phase,ExpectedMob=mob,Target=target and target.Name or nil,
             Destination=destination and destination.Position or nil,Position=root and root.Position or nil,
             Distance=root and point and (root.Position-point.Position).Magnitude or nil,
-            QuestTitle=title,At=os.clock()}
+            QuestTitle=title,At=os.clock(),QuestSource=farmQuestSource,SpawnSource=farmSpawnSource}
         local message=phase.." | expected="..tostring(mob).." | target="..tostring(farmStatus.Target)
             .." | distance="..tostring(farmStatus.Distance).." | destination="..tostring(farmStatus.Destination)
         local important=phase..":"..tostring(mob)..":"..tostring(farmStatus.Target)
@@ -2029,22 +2189,54 @@ local function initImportedFeatures()
                     end
                 end
             end
-            debugLog("INFO","farm.progress",message.." | quest="..tostring(title).." | nearby_names="..table.concat(names,", "))
+            debugLog("INFO","farm.progress",message.." | quest="..tostring(title).." | source="..tostring(farmQuestSource).." | spawn="..tostring(farmSpawnSource).." | nearby_names="..table.concat(names,", "))
             lastFarmLog=os.clock();lastFarmMessage=important
         end
     end
     onJobStop.Farm=function() fixedCombatTarget=nil;fixedCombatPoint=nil;fixedCombatOffset=nil;farmProgress("idle") end
+    local function spawnCFrame(object)
+        if object:IsA("BasePart") then return object.CFrame end
+        if object:IsA("Model") then
+            local ok,pivot=pcall(function() return object:GetPivot() end)
+            if ok and typeof(pivot)=="CFrame" then return pivot end
+        end
+        if object:IsA("Attachment") then return object.WorldCFrame end
+    end
     local function liveSpawn(mob)
-        local folder=path(workspace,"_WorldOrigin","EnemySpawns") or workspace:FindFirstChild("EnemySpawns")
-        local best,metric=nil,math.huge
-        if folder then for _,object in ipairs(folder:GetDescendants()) do
-            if cleanName(object.Name)==cleanName(mob) then
-                local point=part(object)
-                local d=point and distance(point) or math.huge
-                if d<metric then best,metric=point,d end
+        local folders={}
+        local function add(folder,label) if folder then folders[#folders+1]={Folder=folder,Label=label} end end
+        add(path(workspace,"_WorldOrigin","EnemySpawns"),"world_spawns")
+        add(workspace:FindFirstChild("EnemySpawns"),"workspace_spawns")
+        add(RS:FindFirstChild("FortBuilderReplicatedSpawnPositionsFolder"),"replicated_spawns")
+        local _,_,root=character()
+        local best,metric,source=nil,math.huge,nil
+        for _,entry in ipairs(folders) do
+            for _,object in ipairs(entry.Folder:GetDescendants()) do
+                if cleanName(object.Name)==cleanName(mob) then
+                    local cf=spawnCFrame(object)
+                    local d=cf and root and (root.Position-cf.Position).Magnitude or math.huge
+                    if d<metric then best,metric,source=cf,d,entry.Label end
+                end
             end
-        end end
-        return best
+        end
+        return best,source
+    end
+    local function levelQuest(visible)
+        local current=visible and questRuntime.GetActiveQuest() or nil
+        local q=current or (visible and farmQuest) or questRuntime.GetBestQuest()
+        local legacy=questForLevel()
+        if not q then
+            if legacy then legacy.Source="legacy_data" end
+            return legacy
+        end
+        -- Use old coordinates only if they identify the exact same mission/mob/stage.
+        if legacy and legacy.Name==q.Name and cleanName(legacy.Mob)==cleanName(q.Mob)
+            and (q.Tier==nil or tostring(legacy.Tier)==tostring(q.Tier)) then
+            q.Tier=q.Tier or legacy.Tier
+            q.Spawn=legacy.Spawn
+            if not q.Quest then q.Quest=legacy.Quest;q.Entrance=legacy.Entrance;q.Source=q.Source.."+legacy_position" end
+        end
+        return q
     end
     local function farmStep()
         local mode=options.Mode
@@ -2054,20 +2246,36 @@ local function initImportedFeatures()
         local target
         if mode=="Level" or mode=="Boss" then
             local visible,questGui=questVisible()
+            if mode=="Level" then
+                questRuntime.Refresh()
+                local observed=questRuntime.GetState()
+                if observed.Known then visible=observed.Active end
+            end
             local key=mode..":"..(mode=="Boss" and options.Boss or "level")
             if key~=farmQuestKey then farmQuest=nil;farmQuestKey=key end
             if not visible then farmQuest=nil end
             -- Preserve the accepted quest until completion, even if level changes.
-            local q=farmQuest or (mode=="Level" and questForLevel() or bossForName(options.Boss))
-            if not q then fail("Sem dados de missão para este nível/mar/boss; dados das fontes até nível 2600.") end
+            local q
+            if mode=="Level" then q=levelQuest(visible) else q=farmQuest or bossForName(options.Boss) end
+            if not q then
+                farmProgress("waiting_quest_data")
+                stopMove("Farm")
+                return
+            end
+            farmQuestSource=q.Source or "legacy_boss_data"
             local titleObject=path(questGui,"Container","QuestTitle","Title")
             local title=titleObject and titleObject:IsA("TextLabel") and titleObject.Text or ""
             if q.Entrance and q.Quest and (root.Position-q.Quest.Position).Magnitude>10000 then
                 farmProgress("requesting_entrance",q.Mob,nil,CFrame.new(q.Entrance),title)
                 comm("entrance",5,"requestEntrance",q.Entrance);return
             end
-            if q.Name and q.Quest then
+            if q.Name then
                 if not visible then
+                    if not q.Quest or q.Tier==nil then
+                        farmProgress("waiting_quest_position",q.Mob,nil,nil,title)
+                        stopMove("Farm")
+                        return
+                    end
                     farmProgress("quest_giver",q.Mob,nil,q.Quest,title)
                     move(q.Quest,"Farm")
                     if (root.Position-q.Quest.Position).Magnitude<12 then
@@ -2082,11 +2290,13 @@ local function initImportedFeatures()
             end
             target=farmNamed(enemies,{q.Mob})
             if not target then
-                local point=liveSpawn(q.Mob)
-                local destination=point and point.CFrame*CFrame.new(0,3,0) or q.Spawn
+                local point,source=liveSpawn(q.Mob)
+                local destination=point and point*CFrame.new(0,3,0) or q.Spawn
+                farmSpawnSource=source or (q.Spawn and "legacy_position" or "unavailable")
                 farmProgress("waiting_spawn",q.Mob,nil,destination,title)
                 move(destination,"Farm")
             else
+                farmSpawnSource=nil
                 farmProgress(distance(target)<=100 and "combat" or "moving_to_target",q.Mob,target,part(target).CFrame,title)
             end
         elseif mode=="Raid" then
@@ -2191,7 +2401,7 @@ local function initImportedFeatures()
     local pageRace=addTab("Race V4")
     local pageStatus=addTab("Status")
     addSection(Farm,"Farm integrado")
-    addLabel(Farm,"Um modo de farm por vez. Coordenadas/missões vêm das fontes; progresso e dano dependem do servidor. Dados de nível limitados a 2600.")
+    addLabel(Farm,"Um modo de farm por vez. Coordenadas/missões vêm das fontes; progresso e dano dependem do servidor. Missões consultadas no jogo; tabela alternativa até nível 2600.")
     local farmControl
     speedSlider(Farm)
     addToggle(Farm,"Manter posição fixa no farm",true,function(on)
@@ -2524,7 +2734,7 @@ local function initImportedFeatures()
         local text="Mar/PlaceId: "..tostring(game.PlaceId).." | Horário: "..tostring(Lighting.ClockTime)
         for _,pair in ipairs({{"Mirage","MysticIsland"},{"Kitsune","KitsuneIsland"},{"Prehistoric","PrehistoricIsland"}}) do text=text.."\n"..pair[1]..": "..(eventPart(pair[2]) and "presente" or "não encontrado") end
         if sky then text=text.."\nLua (asset): "..tostring(sky.MoonTextureId) end
-        local quest=questForLevel();text=text.."\nQuest da fonte: "..(quest and quest.Mob or "sem dados")
+        local quest=questRuntime.GetBestQuest() or questForLevel();text=text.."\nQuest selecionada: "..(quest and quest.Mob or "sem dados")
         statusLabel.Text=text
     end
     button(pageStatus,"Atualizar status",status)
@@ -2564,7 +2774,7 @@ local function initImportedFeatures()
     report("startup",supported and "target game detected" or "UI available; target game unavailable")
     return {StopAll=stopAll,GetState=function()
         local running={};for name in pairs(jobs) do running[#running+1]=name end;table.sort(running)
-        return {Active=active,SupportedGame=supported,Mode=options.Mode,TweenSpeed=options.Speed,Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),Movement={Owner=moveOwner,Suspended=motionState~=nil,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
+        return {Active=active,SupportedGame=supported,Mode=options.Mode,TweenSpeed=options.Speed,Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),QuestRuntime=questRuntime.GetState(),Movement={Owner=moveOwner,Suspended=motionState~=nil,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
     end}
 end
 
@@ -2612,7 +2822,10 @@ addBtn(Settings, "Executar diagnóstico", function()
         .. " pontos para conferir. Ative DEBUG para detalhes no Output."})
 end)
 
+addBtn(Settings, "KILL / Descarregar script", unload)
+
 local UILib = {
+    Kill = function() unload() end,
     Features = importedFeatures,
     SetDebug = function(first, second)
         if type(first)=="table" then return setDebug(second) end
