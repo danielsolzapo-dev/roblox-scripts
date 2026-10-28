@@ -41094,6 +41094,79 @@ watchCamera()
 cancelDrag=function() fd=false;touchId=nil end
 bind(UserInputService.WindowFocusReleased,cancelDrag)
 
+-- Optional Discord transport. URL is session-only and never placed in logs/preferences.
+local function initHubWebhook()
+    local Http=game:GetService("HttpService")
+    local enabled,url=false,nil
+    local queue,session={},0
+    local nextSend,busy=0,false
+    local selections={itens=true,metas=true,loja=true,nivel=false}
+    local status=addLabel(Settings,"Webhook desligado. Nenhum dado enviado.")
+    local toggle,input
+    local function stop()
+        enabled=false;session=session+1;table.clear(queue)
+        if toggle and toggle.Get()then toggle.Set(false)end
+    end
+    local function emit(category,title,detail)
+        if not enabled or not url or (category~="teste"and not selections[category])then return false end
+        if #queue>=20 then table.remove(queue,1)end
+        local data=LocalPlayer:FindFirstChild("Data")
+        local level=data and data:FindFirstChild("Level");local money=data and data:FindFirstChild("Beli")
+        queue[#queue+1]={content=("XERECA HUB | "..tostring(title).."\n"..tostring(detail or "").."\nSea: "..tostring(seaPolicy and seaPolicy.Sea or "?").." | Level: "..tostring(level and level.Value or "?").." | Beli: "..tostring(money and money.Value or "?")):sub(1,1900),allowed_mentions={parse={}}}
+        return true
+    end
+    input=addTextbox(Settings,{Placeholder="URL do webhook Discord",Callback=function(value)
+        if value=="[URL configurada]"then return end
+        local id,token=tostring(value):match('^https://discord%.com/api/webhooks/(%d+)/([%w_.%-]+)$')
+        if not id then id,token=tostring(value):match('^https://discordapp%.com/api/webhooks/(%d+)/([%w_.%-]+)$')end
+        stop();url=id and ("https://discord.com/api/webhooks/"..id.."/"..token)or nil
+        status.Text=url and "URL configurada nesta sessão. Escolha eventos e ative o webhook."or "URL inválida; use a URL de webhook do Discord."
+        if input then input.Set(url and "[URL configurada]"or "")end
+    end})
+    toggle=addToggle(Settings,"Ativar webhook Discord",false,function(on)
+        session=session+1;table.clear(queue)
+        enabled=on and url~=nil
+        status.Text=enabled and "Webhook ativo: itens, metas e loja conforme seleção."or "Webhook desligado; configure uma URL válida."
+        if on and not enabled then trackTask(task.defer(function()if toggle and not destroyed then toggle.Set(false)end end))end
+    end)
+    for _,entry in ipairs({{"itens","Itens obtidos"},{"metas","Metas concluídas"},{"loja","Compra da loja"},{"nivel","Subir nível"}})do
+        addToggle(Settings,"Webhook: "..entry[2],selections[entry[1]],function(on)selections[entry[1]]=on end)
+    end
+    addBtn(Settings,"Testar webhook",function()if not emit("teste","Teste","Integração configurada pelo usuário.")then status.Text="Configure a URL e ative o webhook antes do teste."end end)
+    local lastLevel
+    bind(game:GetService("RunService").Heartbeat,function()
+        if destroyed or not enabled then return end
+        if selections.nivel then
+            local data=LocalPlayer:FindFirstChild("Data");local lv=data and data:FindFirstChild("Level");local n=lv and tonumber(lv.Value)
+            if n and lastLevel and n>lastLevel then emit("nivel","Nível aumentado",tostring(lastLevel).." → "..n)end
+            lastLevel=n
+        end
+        if busy or #queue==0 or os.clock()<nextSend then return end
+        local sender=request or http_request or (syn and syn.request)
+        if type(sender)~="function"then stop();status.Text="HTTP de webhook indisponível neste ambiente.";return end
+        local payload=table.remove(queue,1);local token=session;local destination=url
+        busy=true;nextSend=os.clock()+5
+        -- In-flight HTTP cannot be undone, but disabling invalidates any queued send/retry.
+        task.defer(function()
+            if destroyed or not enabled or token~=session then busy=false;return end
+            local ok,response=pcall(function()return sender({Url=destination.."?wait=true",Method="POST",Headers={["Content-Type"]="application/json"},Body=Http:JSONEncode(payload)})end)
+            busy=false
+            if destroyed or token~=session then return end
+            local code=ok and type(response)=="table"and tonumber(response.StatusCode or response.Status)or nil
+            if code and code>=200 and code<300 then status.Text="Webhook enviado."
+            elseif code==429 then
+                local retry=30
+                local parsed,data=pcall(function()return Http:JSONDecode(response.Body or "")end)
+                if parsed and type(data)=="table"and type(data.retry_after)=="number"then retry=math.clamp(data.retry_after,1,300)end
+                nextSend=os.clock()+retry;if #queue>=20 then table.remove(queue)end;table.insert(queue,1,payload);status.Text="Limite do Discord: aguardando para tentar novamente."
+            else status.Text="Falha no webhook"..(code and (" (HTTP "..code..")")or " HTTP")..". URL não registrada nos logs." end
+        end)
+    end,"webhook.queue")
+    table.insert(cleanupFns,stop)
+    return {Emit=emit,Stop=stop,GetState=function()return {Enabled=enabled,Configured=url~=nil,Queued=#queue,Busy=busy}end}
+end
+local hubWebhook=initHubWebhook()
+
 -- Gameplay ports from supplied Cokka/Matsune sources; UI stays owned by XERECA.
 -- Source command names/coordinates are historical data, not verified game contracts.
 local function initImportedFeatures()
@@ -41112,7 +41185,7 @@ local function initImportedFeatures()
     local active = true
     local requestSession=0
     local requestOwners=setmetatable({}, {__mode="k"})
-    local movementJobs={Farm=true,SeaCombat=true,FruitCollect=true,RaidNext=true,Boat=true,Trials=true,TrialPath=true,Azure=true,BoneCollect=true,EggCollect=true,FirstSea=true,Berries=true,Chests=true}
+    local movementJobs={Farm=true,SeaCombat=true,FruitCollect=true,RaidNext=true,Boat=true,Trials=true,TrialPath=true,Azure=true,BoneCollect=true,EggCollect=true,FirstSea=true,DropFarm=true,MaterialGoal=true,Berries=true,Chests=true}
     local function requestToken()
         local owner=requestOwners[coroutine.running()]
         return {Session=requestSession,Owner=owner}
@@ -41689,7 +41762,7 @@ progressTracker=initProgressTracker()
         move(destination,owner)
         local mastery=options.Mastery~="Off" and hp/math.max(1,maxHP)*100 <= options.MasteryHealth
         local c=LocalPlayer.Character
-        local levelAuto=(owner=="Farm" and options.Mode=="Level") or owner=="FirstSea"
+        local levelAuto=(owner=="Farm" and options.Mode=="Level") or owner=="FirstSea"or owner=="DropFarm"or owner=="MaterialGoal"
         local tool=(levelAuto or options.AutoEquip) and equip(levelAuto and options.Weapon or mastery and options.Mastery or options.Weapon) or (c and c:FindFirstChildOfClass("Tool"))
         if owner=="Farm" then progressTracker.Track(target) end
         attackState.Target=target.Name
@@ -43307,7 +43380,7 @@ local bring=initMissionBring()
     local previousFarmStop=onJobStop.Farm
     onJobStop.Farm=function()previousFarmStop();releaseLevelSupport()end
     fastAttackApi.CombatFallback=function(owner,target,reason)
-        if not ((owner=="Farm" and options.Mode=="Level" and flags.Farm) or (owner=="FirstSea" and flags.FirstSea)) or os.clock()<manualUntil then return false end
+        if not ((owner=="Farm" and options.Mode=="Level" and flags.Farm) or (owner=="FirstSea" and flags.FirstSea)or(owner=="DropFarm"and flags.DropFarm)or(owner=="MaterialGoal"and flags.MaterialGoal)) or os.clock()<manualUntil then return false end
         if reason~="remotes_unavailable" and reason~="remote_failed"then return false end
         local c=LocalPlayer.Character;local tool=c and c:FindFirstChildOfClass("Tool")
         if not tool or distance(target)>fastAttackApi.Distance then return false end
@@ -43372,6 +43445,29 @@ local bring=initMissionBring()
         local point=best and (part(best:FindFirstChild(name,true)) or part(best))
         if point then move(point.CFrame*CFrame.new(0,1,0),"Berries");if distance(point)<10 then press("E") end end
     end)
+    local function initFruitProtection()
+    local protectedFruitText=type(shared._XerecaProtectedFruitText)=="string"and shared._XerecaProtectedFruitText or ""
+    local protectFruits=true
+    local function fruitKey(value)return tostring(value):lower():gsub("%s+fruit$",""):gsub("^%s+",""):gsub("%s+$","")end
+    local function isFruitProtected(fruit)
+        if not protectFruits then return false end
+        local name=fruitKey(fruit.Name);local original=fruitKey(fruit:GetAttribute("OriginalName")or "")
+        for value in protectedFruitText:gmatch("[^,]+")do local key=fruitKey(value);if key~=""and (key==name or key==original or key.."-"..key==original)then return true end end
+        return false
+    end
+    addSection(Fruit,"Frutas protegidas")
+    addToggle(Fruit,"Proteger favoritas ao soltar",true,function(on)protectFruits=on end)
+    local protectionLabel=addLabel(Fruit,protectedFruitText~=""and ("Protegidas: "..protectedFruitText)or "Nenhuma fruta marcada.")
+    local protectionInput=addTextbox(Fruit,{Placeholder="Frutas protegidas (separadas por vírgula)",Callback=function(value)
+        protectedFruitText=tostring(value):sub(1,2000);shared._XerecaProtectedFruitText=protectedFruitText
+        protectionLabel.Text=protectedFruitText~=""and ("Protegidas: "..protectedFruitText)or "Nenhuma fruta marcada."
+    end})
+    if protectedFruitText~=""then protectionInput.Set(protectedFruitText)end
+
+        return isFruitProtected
+    end
+    local isFruitProtected=initFruitProtection()
+
     local function fruits(container)
         local found={}
         if container then for _,o in ipairs(container:GetChildren())do
@@ -43401,6 +43497,10 @@ local bring=initMissionBring()
     end
     local function transactFruit(fruit,action,manual)
         if not supported or not ownedFruit(fruit)then return end
+        if action=="drop"and isFruitProtected(fruit)then
+            if manual then notify({Title="Fruta protegida",Text="O hub não soltou "..fruit.Name})end
+            return
+        end
         local gate=fruitTransactions[fruit]
         if gate and (gate.Busy or os.clock()<(gate.Next or 0))then return end
         local remote,id
@@ -43422,7 +43522,7 @@ local bring=initMissionBring()
                     local _,h=character();if not h then error("Personagem indisponível")end
                     h:EquipTool(fruit)
                     task.wait(0.1)
-                    if not validRequest(token)or not ownedFruit(fruit)then return "cancelado"end
+                    if not validRequest(token)or not ownedFruit(fruit)or isFruitProtected(fruit)then return "cancelado"end
                     return remote:InvokeServer("Drop")
                 end
                 return remote:InvokeServer("StoreFruit",id,fruit)
@@ -43855,7 +43955,210 @@ local bring=initMissionBring()
         onJobStop.FirstSea=function()releaseInput();firstSeaState.Phase="Parado";if firstLabel then firstLabel.Text="Parado"end end
     end
 
+    local function initExtraFeatures()
+    -- Inventory data adapter: named game modules from supplied Kaitun, with legacy query fallback.
+    local goalInventory={Known=false,Counts={},Owned={},Mastery={},Next=0,Busy=false}
+    local function keyOf(name)return tostring(name):lower():gsub("%s+","")end
+    local function inventoryForGoals()
+        if os.clock()<goalInventory.Next or goalInventory.Busy then return goalInventory end
+        goalInventory.Next=os.clock()+5
+        local service=RS:FindFirstChild("ItemReplicationService")
+        local keys=service and service:FindFirstChild("KEYS")
+        local storage=path(RS,"ItemConfig","Storage")
+        if service and service:IsA("ModuleScript")and keys and storage then
+            local ok,result=pcall(function()
+                local irs,k,match=require(service),require(keys),require(storage).match
+                local items=irs:GetItems(k.QUANTITY)
+                if type(items)~="table"then error("quantity schema unavailable")end
+                local result={Known=true,Counts={},Owned={},Mastery={}}
+                for _,entry in pairs(items)do
+                    local matched=type(entry)=="table"and match(entry.ItemId)
+                    local item=matched and matched._ok
+                    local name=item and item.Index and item.Index.StorageKey
+                    if name then local key=keyOf(name);result.Counts[key]=tonumber(entry.Value)or 0;result.Owned[key]=(tonumber(entry.Value)or 0)>0 end
+                end
+                local mastery
+                if k.MASTERY then local ok,value=pcall(function()return irs:GetItems(k.MASTERY)end);if ok then mastery=value end end
+                if type(mastery)=="table"then for _,entry in pairs(mastery)do
+                    local matched=type(entry)=="table"and match(entry.ItemId);local item=matched and matched._ok
+                    if item and item.Index then result.Mastery[keyOf(item.Index.StorageKey)]=tonumber(entry.Value)end
+                end end
+                return result
+            end)
+            if ok then goalInventory.Known=true;goalInventory.Counts=result.Counts;goalInventory.Owned=result.Owned;goalInventory.Mastery=result.Mastery;return goalInventory end
+        end
+        local remote=path(RS,"Remotes","CommF_")
+        if not remote then return goalInventory end
+        goalInventory.Busy=true
+        local token=requestToken()
+        task.defer(function()
+            if not validRequest(token)then goalInventory.Busy=false;goalInventory.Next=0;return end
+            local ok,data=pcall(function()return remote:InvokeServer("getInventory")end)
+            goalInventory.Busy=false
+            if not validRequest(token)then return end
+            if ok and type(data)=="table"then
+                local counts,owned,mastery={},{},{}
+                local recognized=0
+                for _,entry in pairs(data)do if type(entry)=="table"and type(entry.Name)=="string"then
+                    recognized=recognized+1
+                    local key=keyOf(entry.Name);counts[key]=tonumber(entry.Count or entry.Value or entry.Amount)or 1;owned[key]=counts[key]>0;mastery[key]=tonumber(entry.Mastery)
+                end end
+                if next(data)and recognized==0 then goalInventory.Known=false;return end
+                goalInventory.Known=true;goalInventory.Counts=counts;goalInventory.Owned=owned;goalInventory.Mastery=mastery
+            else goalInventory.Known=false end
+        end)
+        return goalInventory
+    end
+    local function ownsAny(names)
+        for _,name in ipairs(names)do if hasTool(name)then return true end end
+        local inv=inventoryForGoals()
+        if inv.Busy then return end
+        if inv.Known then for _,name in ipairs(names)do if inv.Owned[keyOf(name)]then return true end end;return false end
+    end
+    local function goalFight(target,owner)
+        local c=character();if c and not c:FindFirstChild("HasBuso")then comm("haki.buso",3,"Buso")end
+        fight(target,owner)
+    end
+    local dropChoice="Pole V1"
+    local dropGoals={['Pole V1']={Boss="Thunder God",Items={"Pole (1st Form)","Pole"}},['Shark Saw']={Boss="The Saw",Items={"Shark Saw"}},Coat={Boss="Vice Admiral",Items={"Coat","Vice Admiral's Coat"}}}
+    local extraState={Drops="Parado",Materials="Parado",Mastery="Parado",Stock="Parado"}
+    if seaIndex()==1 then
+        addSection(Farm,"Itens do First Sea")
+        dropdown(Farm,"Item do boss",{"Pole V1","Shark Saw","Coat"},dropChoice,function(v)dropChoice=v;goalInventory.Next=0 end)
+        local label=addLabel(Farm,"")
+        toggleJob(Farm,"Auto item de boss","DropFarm",0.4,function()
+            local goal=dropGoals[dropChoice];local owned=ownsAny(goal.Items)
+            if owned then
+                extraState.Drops="Obtido: "..dropChoice;label.Text=extraState.Drops
+                hubWebhook.Emit("itens","Item observado",dropChoice);notify({Title="Meta",Text=extraState.Drops});controls.DropFarm.Set(false);return
+            end
+            if owned==nil then label.Text="Consultando inventário...";return end
+            local target=named(workspace:FindFirstChild("Enemies"),{goal.Boss})
+            if target then extraState.Drops="Combatendo "..goal.Boss;goalFight(target,"DropFarm")
+            else
+                extraState.Drops="Esperando "..goal.Boss;fastAttackApi:ReleaseCombat("DropFarm")
+                local data=bossForName(goal.Boss);if data and data.Spawn then move(data.Spawn,"DropFarm")end
+            end
+            label.Text=extraState.Drops
+        end)
+    end
+    addSection(Farm,"Meta de materiais")
+    local materialGoal=options.Material;local amount=100
+    dropdown(Farm,"Material da meta",materialNames,materialGoal,function(v)materialGoal=v end)
+    addSlider(Farm,{Name="Quantidade total de material",Min=1,Max=9999,Default=100,Step=1,Callback=function(v)amount=v end})
+    local materialLabel=addLabel(Farm,"")
+    toggleJob(Farm,"Farm de material até a meta","MaterialGoal",0.4,function()
+        local inv=inventoryForGoals()
+        if inv.Busy or not inv.Known then materialLabel.Text="Consultando quantidade no inventário...";return end
+        local count=inv.Counts[keyOf(materialGoal)]or 0
+        extraState.Materials=materialGoal..": "..count.." / "..amount;materialLabel.Text=extraState.Materials
+        if count>=amount then
+            hubWebhook.Emit("metas","Meta de material concluída",extraState.Materials);notify({Title="Meta",Text=extraState.Materials});controls.MaterialGoal.Set(false);return
+        end
+        local data=materialForName(materialGoal);if not data then return end
+        local target=named(workspace:FindFirstChild("Enemies"),{data.Mob})
+        if target then goalFight(target,"MaterialGoal")else fastAttackApi:ReleaseCombat("MaterialGoal");move(data.Spawn,"MaterialGoal")end
+    end)
+    addSection(Farm,"Meta de mastery")
+    addLabel(Farm,"Estilos corpo a corpo e espadas já possuídos. A fila troca de arma ao atingir a meta.")
+    local queueText="";local masteryGoal=400;local masteryQueue,index,previousWeapon,ownsFarm
+    addTextbox(Farm,{Placeholder="Fila de mastery (nomes separados por vírgula)",Callback=function(v)queueText=tostring(v):sub(1,2000)end})
+    addSlider(Farm,{Name="Mastery desejada",Min=1,Max=600,Default=400,Step=1,Callback=function(v)masteryGoal=v end})
+    local masteryLabel=addLabel(Farm,"")
+    onJobStop.MasteryGoal=function()
+        if previousWeapon then options.Weapon=previousWeapon;previousWeapon=nil end
+        if ownsFarm then ownsFarm=false;farmControl.Set(false)end
+        masteryQueue=nil
+    end
+    toggleJob(Farm,"Treinar mastery até a meta","MasteryGoal",0.5,function()
+        if not masteryQueue then
+            previousWeapon=options.Weapon;masteryQueue={};index=1
+            for value in queueText:gmatch("[^,]+")do value=value:match("^%s*(.-)%s*$");if value~=""and #masteryQueue<32 then masteryQueue[#masteryQueue+1]=value end end
+            if #masteryQueue==0 then masteryQueue={options.Weapon}end
+            ownsFarm=not flags.Farm
+            if ownsFarm then modeControl.Set("Level");farmControl.Set(true)end
+        end
+        if not flags.Farm then controls.MasteryGoal.Set(false);return end
+        options.Weapon=masteryQueue[index]
+        local tool=equip(options.Weapon)
+        if not tool then masteryLabel.Text="Arma não encontrada: "..options.Weapon;return end
+        if tool.ToolTip=="Gun"or tool.ToolTip=="Blox Fruit"or tool:FindFirstChild("EatRemote",true)then masteryLabel.Text="Use estilo corpo a corpo ou espada.";controls.MasteryGoal.Set(false);return end
+        local lv=tool:FindFirstChild("Level");local value=lv and tonumber(lv.Value)
+        if not value then value=inventoryForGoals().Mastery[keyOf(tool.Name)]end
+        extraState.Mastery=tool.Name..": "..tostring(value or "indisponível").." / "..masteryGoal;masteryLabel.Text=extraState.Mastery
+        if value and value>=masteryGoal then
+            hubWebhook.Emit("metas","Meta de mastery concluída",extraState.Mastery)
+            index=index+1
+            if index>#masteryQueue then notify({Title="Mastery",Text="Fila concluída."});controls.MasteryGoal.Set(false)else options.Weapon=masteryQueue[index]end
+        end
+    end)
+
+    addSection(Fruit,"Compra automática da loja")
+    addLabel(Fruit,"Compra normal com Beli; pode substituir a fruta equipada. Para após uma tentativa de compra.")
+    local stock={Rows=nil,Busy=false,Next=0}
+    local selectedStock
+    local stockDropdown,stockLabel
+    local purchaseGate=shared._XerecaStockPurchase
+    if type(purchaseGate)~="table"then purchaseGate={Busy=false,Next=0};shared._XerecaStockPurchase=purchaseGate end
+    local function refreshStock(force)
+        if stock.Busy or (not force and os.clock()<stock.Next)then return end
+        local remote=path(RS,"Remotes","CommF_")
+        if not remote or not supported then stockLabel.Text="Loja indisponível neste jogo.";return end
+        stock.Busy=true;stock.Next=os.clock()+60
+        local token=requestToken()
+        task.defer(function()
+            if not validRequest(token)then stock.Busy=false;stock.Next=0;return end
+            local ok,data=pcall(function()return remote:InvokeServer("GetFruits")end)
+            stock.Busy=false
+            if not validRequest(token)then return end
+            if not ok or type(data)~="table"then stockLabel.Text="Não foi possível ler o estoque da loja.";return end
+            stock.Rows={};local names={}
+            for _,row in pairs(data)do if type(row)=="table"and type(row.Name)=="string"then stock.Rows[row.Name]=row;names[#names+1]=row.Name end end
+            table.sort(names);stockDropdown.Refresh(names)
+            if selectedStock and stock.Rows[selectedStock]then stockDropdown.Set(selectedStock,true)else selectedStock=nil end
+            stockLabel.Text="Estoque atualizado. Selecione a fruta desejada."
+        end)
+    end
+    stockDropdown=dropdown(Fruit,"Fruta da loja",{},nil,function(value)selectedStock=value end)
+    stockLabel=addLabel(Fruit,"Atualize o estoque para carregar as frutas disponíveis.")
+    addBtn(Fruit,"Atualizar estoque de frutas",function()refreshStock(true)end)
+    toggleJob(Fruit,"Auto comprar fruta em estoque","StockBuy",1,function()
+        if not selectedStock then stockLabel.Text="Escolha uma fruta após atualizar o estoque.";return end
+        refreshStock(false)
+        if stock.Busy then return end
+        local row=stock.Rows and stock.Rows[selectedStock]
+        if not row then return end
+        local onSale=row.OnSale==true or (row.OnSale==nil and type(row.Stock)=="number"and row.Stock>0)
+        if not onSale then extraState.Stock="Aguardando estoque: "..selectedStock;stockLabel.Text=extraState.Stock;return end
+        local current=path(LocalPlayer,"Data","DevilFruit")
+        if current and current.Value==selectedStock then stockLabel.Text="Essa fruta já está equipada.";controls.StockBuy.Set(false);return end
+        local price=tonumber(row.Price or row.MoneyPrice)
+        local money=path(LocalPlayer,"Data","Beli");local balance=money and tonumber(money.Value)
+        if not price or price<0 then stockLabel.Text="Preço com Beli indisponível; compra não enviada.";return end
+        if balance and balance<price then stockLabel.Text="Beli insuficiente: "..balance.." / "..price;return end
+        if purchaseGate.Busy or os.clock()<(purchaseGate.Next or 0)then return end
+        local remote=path(RS,"Remotes","CommF_");if not remote then return end
+        purchaseGate.Busy=true;purchaseGate.Next=os.clock()+60
+        local wanted=selectedStock;local token=requestToken()
+        task.defer(function()
+            if not validRequest(token)then purchaseGate.Busy=false;purchaseGate.Next=0;return end
+            local ok,result=pcall(function()return remote:InvokeServer("PurchaseRawFruit",wanted)end)
+            purchaseGate.Busy=false
+            if not validRequest(token)then return end
+            local observed=path(LocalPlayer,"Data","DevilFruit")
+            local confirmed=observed and observed.Value==wanted
+            extraState.Stock=confirmed and ("Fruta equipada observada: "..wanted)or (ok and ("Compra solicitada: "..wanted.." | resposta: "..tostring(result):sub(1,100))or "Falha ao solicitar compra.")
+            stockLabel.Text=extraState.Stock
+            hubWebhook.Emit("loja",confirmed and "Fruta da loja observada"or "Tentativa de compra",wanted..(confirmed and " | equipada"or " | confira o resultado no jogo"))
+            notify({Title="Loja",Text=extraState.Stock});controls.StockBuy.Set(false)
+        end)
+    end)
+
+        return extraState
+    end
+    local extraState=initExtraFeatures()
     local function stopAll()
+        hubWebhook.Stop()
         fastToggle.Set(false)
         fastAttackApi:StopAll()
         releaseInput()
@@ -43879,7 +44182,7 @@ local bring=initMissionBring()
     report("startup",supported and "target game detected" or "UI available; target game unavailable")
     return {IsLightMode=function()return options.LightMode end,SetLightMode=function(v)options.LightMode=v==true end,StopAll=stopAll,ResetProgress=progressTracker.Reset,GetState=function()
         local running={};for name in pairs(jobs) do running[#running+1]=name end;table.sort(running)
-        return {Sea=seaIndex(),Active=active,SupportedGame=supported,Mode=options.Mode,AutoEquip=options.AutoEquip,Progress=progressTracker.GetState(),Attack=table.clone(attackState),TweenSpeed=options.Speed,Bring=bring.GetState(),Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),FastAttack=fastAttackApi:GetState(),FirstSea=table.clone(firstSeaState),LevelFarm=table.clone(levelState),QuestRuntime=questRuntime.GetState(),Preload=preload.GetState(),Movement={Distance=moveRoot and moveTarget and (moveRoot.Position-moveTarget.Position).Magnitude or 0,ActualSpeed=actualSpeed,Backend="physics_path",Phase=movementPhase,Rebases=movementRebases,Owner=moveOwner,Suspended=motionState~=nil,Holding=motionState and motionState.Holding==true or false,Anchored=moveRoot and moveRoot.Anchored or false,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
+        return {Extra=table.clone(extraState),Webhook=hubWebhook.GetState(),Sea=seaIndex(),Active=active,SupportedGame=supported,Mode=options.Mode,AutoEquip=options.AutoEquip,Progress=progressTracker.GetState(),Attack=table.clone(attackState),TweenSpeed=options.Speed,Bring=bring.GetState(),Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),FastAttack=fastAttackApi:GetState(),FirstSea=table.clone(firstSeaState),LevelFarm=table.clone(levelState),QuestRuntime=questRuntime.GetState(),Preload=preload.GetState(),Movement={Distance=moveRoot and moveTarget and (moveRoot.Position-moveTarget.Position).Magnitude or 0,ActualSpeed=actualSpeed,Backend="physics_path",Phase=movementPhase,Rebases=movementRebases,Owner=moveOwner,Suspended=motionState~=nil,Holding=motionState and motionState.Holding==true or false,Anchored=moveRoot and moveRoot.Anchored or false,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
     end}
 end
 
