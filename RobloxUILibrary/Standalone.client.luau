@@ -40943,7 +40943,7 @@ end)
 
 -- Farm tab
 addSection(Farm, "Farm")
-local fastToggle = addToggle(Farm, "Fast Attack (Matsune, server hits)", false, function(v)
+local fastToggle = addToggle(Farm, "Fast Attack", false, function(v)
     if v then
         if _G.MatsuneFastAttack and _G.MatsuneFastAttack.Start then
             _G.MatsuneFastAttack:Start()
