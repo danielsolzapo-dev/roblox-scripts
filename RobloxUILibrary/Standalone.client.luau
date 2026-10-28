@@ -41779,18 +41779,11 @@ progressTracker=initProgressTracker()
         if os.clock()-lastInputClick<0.15 then return false,"cooldown" end
         lastInputClick=os.clock()
         local camera=workspace.CurrentCamera
-        local function r2()
-            local vim=game:GetService("VirtualInputManager")
-            local ok,err=heldInput(function() vim:SendKeyEvent(false,Enum.KeyCode.ButtonR2,false,game) end,
-                function() vim:SendKeyEvent(true,Enum.KeyCode.ButtonR2,false,game) end)
-            return ok,ok and "button_r2_sent" or err
-        end
-        if method=="Hoho R2" then return r2() end
         local point=clearClickPoint()
         attackState.ClickPosition=point
         if not point then
             attackState.InputFallback="no_clear_click_position"
-            return r2()
+            return false,"no_clear_click_position"
         end
         local vu
         local available,serviceErr=pcall(function() vu=game:GetService("VirtualUser") end)
@@ -41803,9 +41796,7 @@ progressTracker=initProgressTracker()
         if ok then attackState.InputFallback=nil;return true,"virtual_user_sent" end
         attackState.InputFallback=tostring(err)
         if inputLease then return false,"release_failed" end
-        local fallback,reason=r2()
-        if fallback then return true,reason end
-        return false,"input_unavailable: "..tostring(err).." / "..tostring(reason)
+        return false,"input_unavailable: "..tostring(err)
     end
     local lastAttackTarget,lastAttackHealth,lastDamageAt
     local function fight(target,owner)
@@ -43420,7 +43411,7 @@ local bring=initMissionBring()
         stopMove("Farm")
     end)
     addLabel(Farm,"Velocidade do Tween: menor = mais lento. O ajuste também vale durante o deslocamento.")
-    dropdown(Farm,"Ataque do farm",{"Auto","Matsune Click","Hoho R2","Tool"},"Auto",function(v) attackState.Method=v end)
+    dropdown(Farm,"Ataque do farm",{"Auto","Matsune Click","Tool"},"Auto",function(v) attackState.Method=v end)
     addToggle(Farm,"Auto equipar arma selecionada",true,function(on) options.AutoEquip=on end)
     dropdown(Farm,"Arma",{"Melee","Sword","Gun","Blox Fruit"},options.Weapon,function(v) options.Weapon=v end)
     modeControl=dropdown(Farm,"Modo",modes,"Off",function(v)
