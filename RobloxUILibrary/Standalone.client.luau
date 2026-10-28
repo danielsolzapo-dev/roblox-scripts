@@ -130,6 +130,8 @@ ownedGui = uiGui
 bind(uiGui.Destroying, unload)
 shared._UILibUnload = unload
 
+
+local stopLedger
 -- Availability is determined before creating controls; unavailable actions are never registered.
 local seaPolicy={Sea=({[2753915549]=1,[85211729168715]=1,[4442272183]=2,[79091703265657]=2,[7449423635]=3,[100117331123089]=3})[game.PlaceId]}
 seaPolicy.Aliases={["Haki & Stats"]="Player",Status="Home"}
@@ -40865,6 +40867,7 @@ local function initFastAttack()
         self.ManualEnabled=true;ensureWorker()
     end
     function api:Stop()
+        if self.ManualEnabled and stopLedger then stopLedger.Record("Fast Attack")end
         self.ManualEnabled=false
         if not currentCombat() then cancelWorker() end
     end
@@ -40878,6 +40881,7 @@ local function initFastAttack()
         if not self.ManualEnabled and not currentCombat() then cancelWorker() end
     end
     function api:StopAll()
+        if self.ManualEnabled and stopLedger then stopLedger.Record("Fast Attack",destroyed and "Script descarregado"or nil)end
         self.ManualEnabled=false;table.clear(combatOwners);cancelWorker()
     end
     function api:GetState()
@@ -41051,6 +41055,7 @@ armFruit=function(session)
     end)
 end
 local function setFruitEnabled(on)
+    if fruitEnabled and on~=true and stopLedger then stopLedger.Record("Auto Random Fruit",destroyed and "Script descarregado"or nil)end
     fruitSession=fruitSession+1;fruitEnabled=on==true;cancelFruitTimer()
     if fruitGate.wake==fruitWake then fruitGate.wake=nil end
     local session=fruitSession
@@ -41094,6 +41099,40 @@ watchCamera()
 cancelDrag=function() fd=false;touchId=nil end
 bind(UserInputService.WindowFocusReleased,cancelDrag)
 
+-- Bounded local reasons; never interprets a waiting farm as stopped.
+local function initStopLedger()
+    local ledger={Pending={},Context=nil,Names={},Waits={}}
+    local records={}
+    local label=addLabel(Settings,"Nenhuma automação interrompida nesta sessão.")
+    local function paint()
+        local rows={"Resumo das automações"}
+        for name,reason in pairs(ledger.Waits)do rows[#rows+1]="Aguardando • "..(ledger.Names[name]or name)..": "..reason end
+        for i=#records,math.max(1,#records-7),-1 do
+            local entry=records[i];rows[#rows+1]=string.format("[%.1fs] %s: %s",entry.Time,entry.Name,entry.Reason)
+        end
+        if #rows==1 then rows[#rows+1]="Nenhuma parada registrada."end
+        label.Text=table.concat(rows,"\n")
+    end
+    function ledger.Record(key,reason)
+        if key:sub(1,7)=="button."then return end
+        reason=reason or ledger.Pending[key]or ledger.Context or "Desativado pelo controle"
+        ledger.Pending[key]=nil;ledger.Waits[key]=nil
+        if #records>=50 then table.remove(records,1)end
+        records[#records+1]={Key=key,Name=ledger.Names[key]or key,Reason=tostring(reason):sub(1,240),Time=os.clock()}
+        paint()
+    end
+    function ledger.Wait(key,reason)
+        if ledger.Waits[key]==reason then return end
+        ledger.Waits[key]=reason;paint()
+    end
+    function ledger.Get()
+        local list={};for _,entry in ipairs(records)do list[#list+1]=table.clone(entry)end;return list
+    end
+    addBtn(Settings,"Limpar resumo de paradas",function()table.clear(records);paint()end)
+    return ledger
+end
+stopLedger=initStopLedger()
+
 -- Optional Discord transport. URL is session-only and never placed in logs/preferences.
 local function initHubWebhook()
     local Http=game:GetService("HttpService")
@@ -41104,6 +41143,7 @@ local function initHubWebhook()
     local status=addLabel(Settings,"Webhook desligado. Nenhum dado enviado.")
     local toggle,input
     local function stop()
+        if enabled and stopLedger then stopLedger.Record("Webhook Discord",destroyed and "Script descarregado"or nil)end
         enabled=false;session=session+1;table.clear(queue)
         if toggle and toggle.Get()then toggle.Set(false)end
     end
@@ -41124,6 +41164,7 @@ local function initHubWebhook()
         if input then input.Set(url and "[URL configurada]"or "")end
     end})
     toggle=addToggle(Settings,"Ativar webhook Discord",false,function(on)
+        if enabled and not on and stopLedger then stopLedger.Record("Webhook Discord")end
         session=session+1;table.clear(queue)
         enabled=on and url~=nil
         status.Text=enabled and "Webhook ativo: itens, metas e loja conforme seleção."or "Webhook desligado; configure uma URL válida."
@@ -41466,7 +41507,11 @@ local function initImportedFeatures()
         movementPhase="travelling"
     end,"features.movement.path")
 
-    local function stopJob(name)
+    local function stopJob(name,reason)
+        local priorContext=stopLedger.Context
+        local why=reason or stopLedger.Pending[name]or stopLedger.Context or "Desativado pelo controle"
+        if jobs[name]then stopLedger.Record(name,why)end
+        stopLedger.Pending[name]=nil;stopLedger.Context=why
         fastAttackApi:ReleaseCombat(name)
         generations[name]=(generations[name] or 0)+1
         local thread=jobs[name]; jobs[name]=nil
@@ -41474,11 +41519,12 @@ local function initImportedFeatures()
         stopMove(name)
         buttonBusy[name]=nil
         if onJobStop[name] then onJobStop[name]() end
+        stopLedger.Context=priorContext
     end
     local function startJob(name, interval, fn)
-        stopJob(name)
+        stopJob(name,"Reiniciado")
         if movementJobs[name] then
-            for other in pairs(movementJobs) do if other~=name and flags[other] and controls[other] then controls[other].Set(false) end end
+            for other in pairs(movementJobs) do if other~=name and flags[other] and controls[other] then stopLedger.Pending[other]="Movimento assumido por "..(stopLedger.Names[name]or name);controls[other].Set(false) end end
         end
         if not active or destroyed then return end
         local generation=generations[name]
@@ -41493,7 +41539,7 @@ local function initImportedFeatures()
                     if errors==1 then notify({Title=name,Text=tostring(err):sub(1,160)}) end
                     -- Exit after repeated failures instead of silently spinning forever.
                     if errors>=3 then
-                        if controls[name] then controls[name].Set(false) end
+                        if controls[name] then stopLedger.Pending[name]="Falha após 3 erros consecutivos";controls[name].Set(false) end
                         break
                     end
                 else errors=0 end
@@ -41504,10 +41550,12 @@ local function initImportedFeatures()
         end)
     end
     local function toggleJob(page, label, key, interval, fn)
+        stopLedger.Names[key]=label
         local control=addToggle(page,label,false,function(on)
             if key=="Farm" and on and options.Mode=="Off"then
                 options.Mode="Level";if modeControl then modeControl.Set("Level",true)end
             end
+            if key=="Farm"then stopLedger.Names.Farm=options.Mode=="Level"and "Level Farm"or ("Farm: "..options.Mode)end
             flags[key]=on
             if on then startJob(key,interval,fn) else stopJob(key) end
             if key=="Farm" and progressTracker then progressTracker.SetRunning(on) end
@@ -41773,6 +41821,7 @@ progressTracker=initProgressTracker()
         if hp<lastAttackHealth then lastDamageAt=os.clock() end
         lastAttackHealth=hp
         attackState.LastDamageAt=lastDamageAt
+        stopLedger.Wait(owner,not tool and "Arma selecionada ausente; automação continua aguardando"or nil)
         if not tool then
             fastAttackApi:ReleaseCombat(owner);attackState.Phase="missing_weapon"
         elseif attackState.Distance>100 then
@@ -43166,7 +43215,7 @@ local bring=initMissionBring()
         elseif os.clock()-watchdog.At>=options.StallSeconds then
             watchdog.At=os.clock();watchdog.Retries=watchdog.Retries+1
             debugLog("WARN","farm.stalled","No observed progress; recovery "..watchdog.Retries.."/3")
-            if watchdog.Retries>=3 then controls.Farm.Set(false);notify({Title="Farm",Text="Farm parado após três tentativas sem progresso."});return end
+            if watchdog.Retries>=3 then stopLedger.Pending.Farm="Sem progresso após 3 tentativas de recuperação";controls.Farm.Set(false);notify({Title="Farm",Text="Farm parado após três tentativas sem progresso."});return end
             if fixedCombatTarget then rejectedTargets[fixedCombatTarget]=os.clock()+options.StallSeconds end
             fixedCombatTarget=nil;fixedCombatPoint=nil;farmQuest=nil;stopMove("Farm");fastAttackApi:ReleaseCombat("Farm")
         end
@@ -43666,7 +43715,7 @@ local bring=initMissionBring()
     controls.Spectate.Set=function(v) oldSpectateSet(v);if not v then restoreCamera() end end
     -- A normal user click goes through the job callback, so stopJob also restores below.
     local baseStopJob=stopJob
-    stopJob=function(name) baseStopJob(name);if name=="Spectate" then restoreCamera() end end
+    stopJob=function(name,reason) baseStopJob(name,reason);if name=="Spectate" then restoreCamera() end end
     toggleJob(pageTP,"Câmera no jogador selecionado","AimCamera",0.1,function()
         if UserInputService:GetFocusedTextBox() then return end
         local camera=workspace.CurrentCamera
@@ -43859,7 +43908,7 @@ local bring=initMissionBring()
             elseif not data.KilledIceBoss then firstFight("Ice Admiral",CFrame.new(1328,43,-1346))
             else firstSeaState.Phase="Viajar ao Segundo Sea";stopMove("FirstSea");comm("travel",5,"TravelDressrosa")end
         else
-            if hasTool("Saber")then firstSeaState.Phase="Saber obtido";controls.FirstSea.Set(false);return end
+            if hasTool("Saber")then firstSeaState.Phase="Saber obtido";stopLedger.Pending.FirstSea="Saber observado na mochila/personagem";controls.FirstSea.Set(false);return end
             if level<200 then firstSeaState.Phase="Saber requer nível 200";return end
             local data=firstQuery("saber","ProQuestProgress")
             if type(data)~="table"then firstSeaState.Phase="Consultando progresso Saber";return end
@@ -44030,7 +44079,7 @@ local bring=initMissionBring()
             local goal=dropGoals[dropChoice];local owned=ownsAny(goal.Items)
             if owned then
                 extraState.Drops="Obtido: "..dropChoice;label.Text=extraState.Drops
-                hubWebhook.Emit("itens","Item observado",dropChoice);notify({Title="Meta",Text=extraState.Drops});controls.DropFarm.Set(false);return
+                hubWebhook.Emit("itens","Item observado",dropChoice);notify({Title="Meta",Text=extraState.Drops});stopLedger.Pending.DropFarm="Item obtido: "..dropChoice;controls.DropFarm.Set(false);return
             end
             if owned==nil then label.Text="Consultando inventário...";return end
             local target=named(workspace:FindFirstChild("Enemies"),{goal.Boss})
@@ -44053,7 +44102,7 @@ local bring=initMissionBring()
         local count=inv.Counts[keyOf(materialGoal)]or 0
         extraState.Materials=materialGoal..": "..count.." / "..amount;materialLabel.Text=extraState.Materials
         if count>=amount then
-            hubWebhook.Emit("metas","Meta de material concluída",extraState.Materials);notify({Title="Meta",Text=extraState.Materials});controls.MaterialGoal.Set(false);return
+            hubWebhook.Emit("metas","Meta de material concluída",extraState.Materials);notify({Title="Meta",Text=extraState.Materials});stopLedger.Pending.MaterialGoal="Meta de material atingida: "..extraState.Materials;controls.MaterialGoal.Set(false);return
         end
         local data=materialForName(materialGoal);if not data then return end
         local target=named(workspace:FindFirstChild("Enemies"),{data.Mob})
@@ -44078,18 +44127,18 @@ local bring=initMissionBring()
             ownsFarm=not flags.Farm
             if ownsFarm then modeControl.Set("Level");farmControl.Set(true)end
         end
-        if not flags.Farm then controls.MasteryGoal.Set(false);return end
+        if not flags.Farm then stopLedger.Pending.MasteryGoal="Farm de apoio interrompido";controls.MasteryGoal.Set(false);return end
         options.Weapon=masteryQueue[index]
         local tool=equip(options.Weapon)
         if not tool then masteryLabel.Text="Arma não encontrada: "..options.Weapon;return end
-        if tool.ToolTip=="Gun"or tool.ToolTip=="Blox Fruit"or tool:FindFirstChild("EatRemote",true)then masteryLabel.Text="Use estilo corpo a corpo ou espada.";controls.MasteryGoal.Set(false);return end
+        if tool.ToolTip=="Gun"or tool.ToolTip=="Blox Fruit"or tool:FindFirstChild("EatRemote",true)then masteryLabel.Text="Use estilo corpo a corpo ou espada.";stopLedger.Pending.MasteryGoal="Arma incompatível com esta fila de mastery";controls.MasteryGoal.Set(false);return end
         local lv=tool:FindFirstChild("Level");local value=lv and tonumber(lv.Value)
         if not value then value=inventoryForGoals().Mastery[keyOf(tool.Name)]end
         extraState.Mastery=tool.Name..": "..tostring(value or "indisponível").." / "..masteryGoal;masteryLabel.Text=extraState.Mastery
         if value and value>=masteryGoal then
             hubWebhook.Emit("metas","Meta de mastery concluída",extraState.Mastery)
             index=index+1
-            if index>#masteryQueue then notify({Title="Mastery",Text="Fila concluída."});controls.MasteryGoal.Set(false)else options.Weapon=masteryQueue[index]end
+            if index>#masteryQueue then notify({Title="Mastery",Text="Fila concluída."});stopLedger.Pending.MasteryGoal="Meta de mastery atingida; fila concluída";controls.MasteryGoal.Set(false)else options.Weapon=masteryQueue[index]end
         end
     end)
 
@@ -44131,7 +44180,7 @@ local bring=initMissionBring()
         local onSale=row.OnSale==true or (row.OnSale==nil and type(row.Stock)=="number"and row.Stock>0)
         if not onSale then extraState.Stock="Aguardando estoque: "..selectedStock;stockLabel.Text=extraState.Stock;return end
         local current=path(LocalPlayer,"Data","DevilFruit")
-        if current and current.Value==selectedStock then stockLabel.Text="Essa fruta já está equipada.";controls.StockBuy.Set(false);return end
+        if current and current.Value==selectedStock then stockLabel.Text="Essa fruta já está equipada.";stopLedger.Pending.StockBuy="Fruta desejada já equipada";controls.StockBuy.Set(false);return end
         local price=tonumber(row.Price or row.MoneyPrice)
         local money=path(LocalPlayer,"Data","Beli");local balance=money and tonumber(money.Value)
         if not price or price<0 then stockLabel.Text="Preço com Beli indisponível; compra não enviada.";return end
@@ -44150,14 +44199,75 @@ local bring=initMissionBring()
             extraState.Stock=confirmed and ("Fruta equipada observada: "..wanted)or (ok and ("Compra solicitada: "..wanted.." | resposta: "..tostring(result):sub(1,100))or "Falha ao solicitar compra.")
             stockLabel.Text=extraState.Stock
             hubWebhook.Emit("loja",confirmed and "Fruta da loja observada"or "Tentativa de compra",wanted..(confirmed and " | equipada"or " | confira o resultado no jogo"))
-            notify({Title="Loja",Text=extraState.Stock});controls.StockBuy.Set(false)
+            notify({Title="Loja",Text=extraState.Stock});stopLedger.Pending.StockBuy=confirmed and "Fruta da loja observada equipada"or(ok and "Tentativa de compra enviada; conferir resposta da loja"or "Falha na solicitação de compra");controls.StockBuy.Set(false)
         end)
     end)
 
         return extraState
     end
     local extraState=initExtraFeatures()
-    local function stopAll()
+    local function initCompatibility()
+        local state={CheckedAt=nil,Checks={},Text="Compatibilidade ainda não verificada."}
+        addSection(Settings,"Diagnóstico de compatibilidade")
+        local label=addLabel(Settings,state.Text)
+        local function read()
+            local checks={};local lines={"Compatibilidade • leitura local"}
+            local function check(name,status,detail)
+                checks[#checks+1]={Name=name,State=status,Detail=detail}
+                lines[#lines+1]=(status=="ok"and "✔ "or status=="missing"and "✖ "or "? ")..name..": "..detail
+            end
+            local _,h,root=character()
+            check("Sea",supported and "ok"or "unknown",seaIndex()and tostring(seaIndex())or "PlaceId não reconhecido")
+            check("Personagem",root and "ok"or "missing",root and "Humanoid e root disponíveis"or "Aguardando personagem vivo")
+            local selected
+            for _,container in pairs({LocalPlayer.Character,LocalPlayer:FindFirstChildOfClass("Backpack")})do
+                if container then for _,tool in ipairs(container:GetChildren())do
+                    if tool:IsA("Tool")and(tool.Name==options.Weapon or tool.ToolTip==options.Weapon)then selected=tool;break end
+                end end
+            end
+            check("Arma selecionada",selected and "ok"or "missing",selected and selected.Name or ("Não encontrada: "..tostring(options.Weapon)))
+            local comm=path(RS,"Remotes","CommF_")
+            local commPresent=comm and comm:IsA("RemoteFunction")
+            check("Comandos do jogo",commPresent and "ok"or "missing",commPresent and "CommF_ encontrado; aceitação de comandos não testada"or "CommF_ ausente")
+            local quests,guide=RS:FindFirstChild("Quests"),RS:FindFirstChild("GuideModule")
+            local questModules=quests and quests:IsA("ModuleScript")and guide and guide:IsA("ModuleScript")
+            check("Missões",questModules and "ok"or "unknown",questModules and "Quests e GuideModule encontrados, sem executar require"or "Módulos incompletos; catálogo alternativo depende do nível")
+            local own=selected and selected:FindFirstChild("LeftClickRemote")
+            local attack,hit
+            for _,name in ipairs({"Packages","Modules",""})do
+                local parent=name==""and RS or RS:FindFirstChild(name)
+                local net=parent and parent:FindFirstChild("Net")
+                if net then attack=attack or net:FindFirstChild("RE/RegisterAttack");hit=hit or net:FindFirstChild("RE/RegisterHit")end
+            end
+            local m1=own and own:IsA("RemoteEvent")or(attack and attack:IsA("RemoteEvent")and hit and hit:IsA("RemoteEvent"))
+            check("Ataque M1",m1 and "ok"or "unknown",m1 and "Transporte M1 encontrado; dano não testado"or "Remotes M1 ausentes; fallback de clique requer teste no jogo")
+            local irs=RS:FindFirstChild("ItemReplicationService");local storage=path(RS,"ItemConfig","Storage")
+            local keys=irs and irs:FindFirstChild("KEYS")
+            local inventoryModules=irs and irs:IsA("ModuleScript")and keys and keys:IsA("ModuleScript")and storage and storage:IsA("ModuleScript")
+            check("Inventário",inventoryModules and "ok"or "unknown",inventoryModules and "Módulos de inventário encontrados, sem carregá-los"or "Consulta getInventory alternativa ainda não testada")
+            check("Loja de frutas","unknown",commPresent and "GetFruits/PurchaseRawFruit não executados neste diagnóstico"or "Depende de CommF_ ausente")
+            check("Haki",h and h.Parent:FindFirstChild("HasBuso")and "ok"or "unknown",h and h.Parent:FindFirstChild("HasBuso")and "Armamento observado ativo"or "Buso não acionado pelo diagnóstico")
+            local sender=request or http_request or (syn and syn.request)
+            check("Webhook",type(sender)=="function"and "ok"or "missing",type(sender)=="function"and "Cliente HTTP disponível; nenhum POST enviado"or "Este ambiente não expõe request/http_request")
+            lines[#lines+1]="Esta verificação não inicia farms, cliques, compras nem envia mensagens."
+            state={CheckedAt=os.clock(),Checks=checks,Text=table.concat(lines,"\n")};label.Text=state.Text
+            return state
+        end
+        addBtn(Settings,"Verificar compatibilidade",read)
+        addBtn(Settings,"Copiar diagnóstico de compatibilidade",function()
+            local report=read().Text
+            if type(setclipboard)=="function"and pcall(setclipboard,report)then notify({Title="Diagnóstico",Text="Relatório copiado."})
+            else notify({Title="Diagnóstico",Text="Relatório disponível nesta aba; clipboard indisponível."})end
+        end)
+        return {Read=read,Get=function()
+            local checks={};for _,entry in ipairs(state.Checks)do checks[#checks+1]=table.clone(entry)end
+            return {CheckedAt=state.CheckedAt,Text=state.Text,Checks=checks}
+        end}
+    end
+    local compatibility=initCompatibility()
+
+    local function stopAll(reason)
+        local previousReason=stopLedger.Context;stopLedger.Context=reason or "Parada geral"
         hubWebhook.Stop()
         fastToggle.Set(false)
         fastAttackApi:StopAll()
@@ -44168,10 +44278,11 @@ local bring=initMissionBring()
         for _,control in pairs(espControls) do control.Set(false) end
         for name in pairs(jobs) do stopJob(name) end
         stopMove();clearMarkers();restoreCamera();restoreVisuals()
+        stopLedger.Context=previousReason
     end
     local function cleanup()
         if not active then return end
-        active=false;stopAll()
+        active=false;stopAll("Script descarregado")
         local vim=game:GetService("VirtualInputManager")
         for key in pairs(heldKeys) do pcall(function() vim:SendKeyEvent(false,key,false,game) end) end
     end
@@ -44180,9 +44291,9 @@ local bring=initMissionBring()
     button(Settings,"Parar funções importadas",stopAll)
     addLabel(Settings,"Portes Cokka/Matsune: funções ativadas somente pelos controles. Contratos do jogo e coordenadas precisam de validação no cliente.")
     report("startup",supported and "target game detected" or "UI available; target game unavailable")
-    return {IsLightMode=function()return options.LightMode end,SetLightMode=function(v)options.LightMode=v==true end,StopAll=stopAll,ResetProgress=progressTracker.Reset,GetState=function()
+    return {GetCompatibility=compatibility.Get,CheckCompatibility=compatibility.Read,GetStopSummary=stopLedger.Get,IsLightMode=function()return options.LightMode end,SetLightMode=function(v)options.LightMode=v==true end,StopAll=stopAll,ResetProgress=progressTracker.Reset,GetState=function()
         local running={};for name in pairs(jobs) do running[#running+1]=name end;table.sort(running)
-        return {Extra=table.clone(extraState),Webhook=hubWebhook.GetState(),Sea=seaIndex(),Active=active,SupportedGame=supported,Mode=options.Mode,AutoEquip=options.AutoEquip,Progress=progressTracker.GetState(),Attack=table.clone(attackState),TweenSpeed=options.Speed,Bring=bring.GetState(),Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),FastAttack=fastAttackApi:GetState(),FirstSea=table.clone(firstSeaState),LevelFarm=table.clone(levelState),QuestRuntime=questRuntime.GetState(),Preload=preload.GetState(),Movement={Distance=moveRoot and moveTarget and (moveRoot.Position-moveTarget.Position).Magnitude or 0,ActualSpeed=actualSpeed,Backend="physics_path",Phase=movementPhase,Rebases=movementRebases,Owner=moveOwner,Suspended=motionState~=nil,Holding=motionState and motionState.Holding==true or false,Anchored=moveRoot and moveRoot.Anchored or false,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
+        return {Stops=stopLedger.Get(),Compatibility=compatibility.Get(),Extra=table.clone(extraState),Webhook=hubWebhook.GetState(),Sea=seaIndex(),Active=active,SupportedGame=supported,Mode=options.Mode,AutoEquip=options.AutoEquip,Progress=progressTracker.GetState(),Attack=table.clone(attackState),TweenSpeed=options.Speed,Bring=bring.GetState(),Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),FastAttack=fastAttackApi:GetState(),FirstSea=table.clone(firstSeaState),LevelFarm=table.clone(levelState),QuestRuntime=questRuntime.GetState(),Preload=preload.GetState(),Movement={Distance=moveRoot and moveTarget and (moveRoot.Position-moveTarget.Position).Magnitude or 0,ActualSpeed=actualSpeed,Backend="physics_path",Phase=movementPhase,Rebases=movementRebases,Owner=moveOwner,Suspended=motionState~=nil,Holding=motionState and motionState.Holding==true or false,Anchored=moveRoot and moveRoot.Anchored or false,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
     end}
 end
 
@@ -44479,10 +44590,13 @@ local function initProductivity(api)
     end
     if type(shared._XerecaSavedPreferences)~="table" then shared._XerecaSavedPreferences={} end
     local function stopEverything()
+        local priorReason=stopLedger and stopLedger.Context
+        if stopLedger then stopLedger.Context="Parada geral"end
         setFruitEnabled(false)
         if fruitControl then fruitControl.Set(false) end
         importedFeatures.StopAll()
         fastAttackApi:StopAll()
+        if stopLedger then stopLedger.Context=priorReason end
     end
     api.StopAll=stopEverything
     local function finite(value) return type(value)=="number" and value==value and math.abs(value)<math.huge end
