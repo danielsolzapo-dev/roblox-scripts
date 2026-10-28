@@ -40791,23 +40791,41 @@ local function initFastAttack()
         transport.LastTransport=leftClick and leftClick:IsA("RemoteEvent") and "left_click_remote_sent" or "remote_sent"
         return true,transport.LastTransport
     end
-    local observedTarget,observedHealth,observedAt
+    local observedTarget,observedHealth,observedAt,lastCycle=nil,nil,nil,-math.huge
     function api:DispatchTarget(owner,target)
-        local humanoid=target and target:FindFirstChildOfClass("Humanoid")
-        local hp=humanoid and humanoid.Health
-        if target~=observedTarget or hp~=observedHealth then
-            observedTarget=target;observedHealth=hp;observedAt=os.clock()
+        local c=LocalPlayer.Character
+        local h=c and c:FindFirstChildOfClass("Humanoid")
+        local root=c and c:FindFirstChild("HumanoidRootPart")
+        local tool=c and c:FindFirstChildOfClass("Tool")
+        local targetHumanoid=target and target:FindFirstChildOfClass("Humanoid")
+        local point=target and (target:FindFirstChild("Head")or target:FindFirstChild("HumanoidRootPart"))
+        local reason
+        if not root or not h or h.Health<=0 or not tool then reason="missing_character_or_tool"
+        elseif UserInputService:GetFocusedTextBox()then reason="typing"
+        elseif tool.Enabled==false then reason="tool_disabled"
+        elseif not point or not point:IsA("BasePart")or not targetHumanoid or targetHumanoid.Health<=0 then reason="invalid_target"
+        elseif (root.Position-point.Position).Magnitude>self.Distance then reason="out_of_range"end
+        if reason then transport.LastTransport=reason;return false,reason end
+        if os.clock()-lastCycle<self.Delay then return false,"cooldown"end
+        lastCycle=os.clock()
+        local hp=targetHumanoid.Health
+        if target~=observedTarget or (observedHealth and hp<observedHealth) then
+            observedTarget=target;observedAt=os.clock()
         end
-        local sent,reason=self:AttackTarget(target)
-        -- FireServer succeeding only confirms dispatch, never server damage.
-        local stalled=sent and reason~="cooldown" and observedAt and os.clock()-observedAt>=2
-        if (not sent or stalled) and self.CombatFallback then
-            local fallback,method=self.CombatFallback(owner,target,stalled and "no_damage_observed" or reason)
-            if fallback then sent=true;reason=method end
-        end
-        transport.LastTransport=reason
-        transport.Health=hp;transport.NoDamageFor=observedAt and os.clock()-observedAt or nil
-        return sent,reason
+        observedHealth=hp
+        local method=self.GetMethod and self.GetMethod(owner)or "Auto"
+        local clicked,inputReason=false,"normal_click_unavailable"
+        if self.NormalClick then clicked,inputReason=self.NormalClick(owner,target,method)end
+        local sent,remoteReason=false,"disabled_by_method"
+        if method=="Auto"then sent,remoteReason=self:AttackTarget(target)end
+        transport.Target=target.Name;transport.Method=method
+        transport.Input=inputReason;transport.Remote=remoteReason
+        transport.Health=hp;transport.NoDamageFor=os.clock()-observedAt
+        transport.DamageObserved=transport.NoDamageFor==0 and hp< (transport.PreviousHealth or hp) and transport.PreviousTarget==target
+        transport.PreviousHealth=hp;transport.PreviousTarget=target
+        transport.DamageStatus=transport.NoDamageFor>=2 and "sem queda de vida observada; confira arma, alcance e altura"or "observando vida do alvo"
+        transport.LastTransport=sent and remoteReason or clicked and "normal_click_sent"or inputReason
+        return sent or clicked,transport.LastTransport
     end
     function api:AttackNearest()
         if self.EquipSelected then self.EquipSelected() end
@@ -40849,6 +40867,7 @@ local function initFastAttack()
     end
     local function cancelWorker()
         api.Running=false;transport.Owner=nil
+        if api.ReleaseInput then api.ReleaseInput()end
         if worker and worker~=coroutine.running() then pcall(task.cancel,worker) end
         worker=nil
     end
@@ -40865,7 +40884,10 @@ local function initFastAttack()
                     if combat then
                         if combat.Target then
                             api:DispatchTarget(combat.Owner,combat.Target)
-                        else transport.LastTransport="paused_for_skills" end
+                        else
+                            transport.LastTransport="paused_without_target"
+                            if api.ReleaseInput then api.ReleaseInput()end
+                        end
                     else api:AttackNearest() end
                 end)
                 if not ok then
@@ -40875,6 +40897,7 @@ local function initFastAttack()
                 task.wait(api.Delay)
             end
             api.Running=false;worker=nil;transport.Owner=nil
+            if api.ReleaseInput then api.ReleaseInput()end
         end)
     end
     function api:Start()
@@ -40900,6 +40923,7 @@ local function initFastAttack()
     end
     function api:GetState()
         local result=table.clone(transport)
+        result.PreviousTarget=nil
         result.Running=self.Running;result.ManualEnabled=self.ManualEnabled
         return result
     end
@@ -41785,6 +41809,15 @@ progressTracker=initProgressTracker()
             attackState.InputFallback="no_clear_click_position"
             return false,"no_clear_click_position"
         end
+        local mouseOK,mouseErr=pcall(function()
+            local vim=game:GetService("VirtualInputManager")
+            if type(vim.SendMouseButtonEvent)~="function"then error("mouse input unavailable")end
+            local sent,err=heldInput(function() vim:SendMouseButtonEvent(point.X,point.Y,0,false,game,0) end,
+                function() vim:SendMouseButtonEvent(point.X,point.Y,0,true,game,0) end)
+            if not sent then error(err)end
+        end)
+        if mouseOK then attackState.InputFallback=nil;return true,"mouse_button_sent"end
+        if inputLease then return false,"release_failed"end
         local vu
         local available,serviceErr=pcall(function() vu=game:GetService("VirtualUser") end)
         local ok,err=false,serviceErr
@@ -41803,25 +41836,13 @@ progressTracker=initProgressTracker()
         local root=part(target)
         local hp,maxHP=health(target)
         if not root or hp<=0 then fastAttackApi:ReleaseCombat(owner);return end
-        local sharedState=fastAttackApi:GetState()
-        if attackState.CloseTarget~=target then attackState.CloseTarget=nil end
-        -- Normal M1 cannot use the remote attack's broad acquisition radius.
-        -- Latch the close stance for this target, so health updates do not oscillate the hold.
-        if owner=="Farm" and options.Mode=="Level" and distance(target)<=40
-            and (not fastAttackApi:CanAttack() or (sharedState.Target==target.Name
-                and (sharedState.NoDamageFor or 0)>=2)) then
-            attackState.CloseTarget=target
-        end
-        local close=attackState.CloseTarget==target
-        local vertical=close and math.min(options.Offset,3) or options.Offset
-        local horizontal=close and math.min(options.Horizontal,4) or options.Horizontal
-        attackState.Stance=close and "normal_click_close_range" or "configured_offset"
-        local destination=root.CFrame*CFrame.new(0,vertical,horizontal)
+        attackState.Stance="configured_offset"
+        local destination=root.CFrame*CFrame.new(0,options.Offset,options.Horizontal)
         if owner=="Farm" and options.FixedFarm then
-            if fixedCombatTarget~=target or fixedCombatOffset~=vertical..":"..horizontal then
+            if fixedCombatTarget~=target or fixedCombatOffset~=options.Offset..":"..options.Horizontal then
                 fixedCombatTarget=target
                 fixedCombatPoint=destination
-                fixedCombatOffset=vertical..":"..horizontal
+                fixedCombatOffset=options.Offset..":"..options.Horizontal
             end
             destination=fixedCombatPoint
         end
@@ -41853,27 +41874,11 @@ progressTracker=initProgressTracker()
             -- Pause manual M1 while the selected mastery/skills path owns combat.
             fastAttackApi:SetCombatTarget(owner,nil)
             skillAttack();attackState.Phase="skills_sent"
-        elseif fastAttackApi.ManualEnabled or (attackState.Method=="Auto" and fastAttackApi:CanAttack()) then
+        else
             fastAttackApi:SetCombatTarget(owner,target)
-            attackState.Input="shared_fast_attack"
-            attackState.Phase="shared_fast_attack"
+            attackState.Input="shared_fast_attack";attackState.Phase="shared_fast_attack"
             attackState.Transport=fastAttackApi:GetState().LastTransport or "worker_started"
             attackState.Attempts=attackState.Attempts+1
-        else
-            fastAttackApi:ReleaseCombat(owner)
-            -- Tool activation alone does not reach the game's newer combat remotes.
-            -- Always preserve the normal tool path, then target only this farm enemy.
-            local activated,activateErr=pcall(function() tool:Activate() end)
-            local clicked,inputReason=false,"tool_only"
-            if attackState.Method~="Tool" then clicked,inputReason=inputClick(attackState.Method) end
-            attackState.Input=inputReason
-            local sent,reason=false,"tool_only"
-            if attackState.Method=="Auto" then sent,reason=fastAttackApi:AttackTarget(target) end
-            if not activated then debugLog("WARN","combat.tool",activateErr) end
-            if not activated and not clicked and not sent then debugLog("WARN","combat.input",inputReason) end
-            attackState.Attempts=attackState.Attempts+1
-            attackState.Phase=sent and "attack_sent" or clicked and "input_sent" or activated and "tool_activated" or "attack_unavailable"
-            attackState.Transport=reason
         end
         debugLog("INFO","combat",attackState.Phase.." target="..tostring(target.Name).." tool="..tostring(attackState.Tool).." transport="..tostring(attackState.Transport).." hp="..tostring(hp))
     end
@@ -43424,7 +43429,9 @@ local bring=initMissionBring()
     dropdown(Farm,"Boss",bossNames,options.Boss,function(v) options.Boss=v;farmQuest=nil;farmQuestKey=nil;fixedCombatTarget=nil;fixedCombatPoint=nil;stopMove("Farm") end)
     dropdown(Farm,"Finalizar mastery",{"Off","Blox Fruit","Gun","Sword"},"Off",function(v) options.Mastery=v end)
     addSlider(Farm,{Name="Mastery: vida restante (%)",Min=5,Max=80,Default=30,Step=1,Callback=function(v) options.MasteryHealth=v end})
-    addSlider(Farm,{Name="Distância acima do alvo",Min=3,Max=60,Default=20,Step=1,Callback=function(v) options.Offset=v end})
+    addSlider(Farm,{Name="Distância acima do alvo",Min=3,Max=60,Default=20,Step=1,Callback=function(v)
+        options.Offset=v;fixedCombatTarget=nil;fixedCombatPoint=nil;fixedCombatOffset=nil
+    end})
     farmControl=toggleJob(Farm,"Ativar farm selecionado","Farm",0.3,farmStep)
     local levelToggle,syncingLevel
     onFarmChange=function(on)
@@ -43443,15 +43450,33 @@ local bring=initMissionBring()
     controls.LevelFarm=levelToggle
     local previousFarmStop=onJobStop.Farm
     onJobStop.Farm=function()previousFarmStop();releaseLevelSupport()end
-    fastAttackApi.CombatFallback=function(owner,target,reason)
-        if not ((owner=="Manual" and fastAttackApi.ManualEnabled) or (owner=="Farm" and flags.Farm) or (owner=="FirstSea" and flags.FirstSea)or(owner=="DropFarm"and flags.DropFarm)or(owner=="MaterialGoal"and flags.MaterialGoal)) or os.clock()<manualUntil then return false end
-        if reason~="remotes_unavailable" and reason~="remote_failed" and reason~="no_damage_observed"then return false end
-        local c=LocalPlayer.Character;local tool=c and c:FindFirstChildOfClass("Tool")
-        if not tool or distance(target)>fastAttackApi.Distance then return false end
-        if owner~="Manual" and distance(target)>10 then return false,"approaching_normal_click_range" end
-        local activated=pcall(function()tool:Activate()end)
-        local clicked=inputClick("Matsune Click")
-        return activated or clicked,"normal_click_sent"
+    fastAttackApi.GetMethod=function(owner) return owner=="Manual" and "Auto" or attackState.Method end
+    do
+        local toolLease
+        local function releaseTool()
+            local lease=toolLease;toolLease=nil
+            if lease then pcall(function()lease.Tool:Deactivate()end)end
+        end
+        fastAttackApi.ReleaseInput=function()releaseInput();releaseTool()end
+        table.insert(cleanupFns,fastAttackApi.ReleaseInput)
+        fastAttackApi.NormalClick=function(owner,target,method)
+            if not active or destroyed or UserInputService:GetFocusedTextBox()then return false,"typing_or_unloaded"end
+            if owner=="Farm" and os.clock()<manualUntil then return false,"manual_pause"end
+            local c,h=character();local tool=c and c:FindFirstChildOfClass("Tool")
+            if not tool or not h or h.Health<=0 then return false,"missing_character_or_tool"end
+            if tool.Enabled==false then return false,"tool_disabled"end
+            if toolLease then releaseTool()end
+            local activated,activationError=pcall(function()tool:Activate()end)
+            if activated then
+                local lease={Tool=tool};toolLease=lease
+                trackTask(task.delay(0.06,function()if toolLease==lease then releaseTool()end end))
+            end
+            local clicked,inputReason=false,"tool_only"
+            if method~="Tool" then clicked,inputReason=inputClick("Matsune Click")end
+            attackState.Input=inputReason
+            attackState.ActivationError=not activated and tostring(activationError)or nil
+            return activated or clicked,clicked and inputReason or activated and "tool_activated"or "normal_click_unavailable"
+        end
     end
     controls.Bring=addToggle(Farm,"BRING: agrupar NPCs da missão",false,function(on) flags.Bring=on;bring.Reset() end)
     addSlider(Farm,{Name="Alcance do BRING",Min=25,Max=400,Default=150,Step=25,Suffix=" studs",Callback=bring.SetRadius})
@@ -43862,7 +43887,7 @@ local bring=initMissionBring()
         stopMove();fixedCombatTarget=nil;fixedCombatPoint=nil;fixedCombatOffset=nil;restoreCamera()
     end,"features.respawn")
     bind(LocalPlayer.CharacterRemoving,function()
-        releaseInput()
+        fastAttackApi.ReleaseInput()
         stopMove();fixedCombatTarget=nil;fixedCombatPoint=nil;fixedCombatOffset=nil
     end,"features.character_removing")
     local function restoreVisuals()
@@ -44493,6 +44518,8 @@ local function debugReportText()
         "Farm: "..tostring(farm.Phase).." | alvo: "..tostring(farm.Target or farm.ExpectedMob),
         "Ataque: "..tostring(attack.Phase).." | método: "..tostring(attack.Method).." | transporte: "..tostring(attack.Transport).." | clique: "..tostring(attack.Input),
         "FastAttack compartilhado: "..tostring(sharedAttack.Running).." | manual: "..tostring(sharedAttack.ManualEnabled).." | controle: "..tostring(sharedAttack.Owner).." | envios: "..tostring(sharedAttack.Dispatches),
+        "Ciclo M1: "..tostring(sharedAttack.Method).." | entrada: "..tostring(sharedAttack.Input).." | remote: "..tostring(sharedAttack.Remote),
+        "Observação M1: "..tostring(sharedAttack.DamageStatus),
         "Arma: "..tostring(attack.Tool).." | distância: "..tostring(attack.Distance).." | tentativas: "..tostring(attack.Attempts),
         "Vida do alvo: "..tostring(attack.Health).." / "..tostring(attack.MaxHealth).." | última queda de vida: "..(attack.LastDamageAt and string.format("há %.1fs",os.clock()-attack.LastDamageAt) or "não observada"),
         "Soltar clique: "..tostring(attack.InputRelease).." | alternativa: "..tostring(attack.InputFallback),
