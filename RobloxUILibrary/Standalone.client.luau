@@ -1044,6 +1044,7 @@ local function initImportedFeatures()
         motionState=nil
         if not previous then return end
         if previous.Died then previous.Died:Disconnect() end
+        for i=#(previous.Owned or {}),1,-1 do previous.Owned[i]:Destroy() end
         if previous.Root.Parent then
             previous.Root.Anchored=previous.Anchored
             previous.Root.AssemblyLinearVelocity=Vector3.new(0,0,0)
@@ -1070,6 +1071,46 @@ local function initImportedFeatures()
         root.AssemblyLinearVelocity=Vector3.new(0,0,0)
         root.AssemblyAngularVelocity=Vector3.new(0,0,0)
     end
+    local function holdFarmPosition(target)
+        local lease=motionState
+        if not lease or not lease.Root.Parent then return end
+        if not lease.Holding then
+            lease.Owned={}
+            local function own(class,name)
+                local object=Instance.new(class)
+                lease.Owned[#lease.Owned+1]=object
+                object.Name=name;object.Parent=lease.Root
+                return object
+            end
+            local attachment=own("Attachment","_XerecaFarmHoldAttachment")
+            local position=own("AlignPosition","_XerecaFarmHoldPosition")
+            position.Mode=Enum.PositionAlignmentMode.OneAttachment
+            position.Attachment0=attachment
+            position.ApplyAtCenterOfMass=true
+            position.RigidityEnabled=false
+            position.MaxForce=100000000
+            position.MaxVelocity=100
+            position.Responsiveness=100
+            position.Position=target.Position
+            local orientation=own("AlignOrientation","_XerecaFarmHoldOrientation")
+            orientation.Mode=Enum.OrientationAlignmentMode.OneAttachment
+            orientation.Attachment0=attachment
+            orientation.RigidityEnabled=false
+            orientation.MaxTorque=100000000
+            orientation.MaxAngularVelocity=50
+            orientation.Responsiveness=100
+            orientation.CFrame=target-target.Position
+            lease.PositionHold=position;lease.OrientationHold=orientation
+            lease.Holding=true
+        end
+        lease.PositionHold.Position=target.Position
+        lease.OrientationHold.CFrame=target-target.Position
+        -- Anchoring is only temporary during travel. Combat uses world-space forces.
+        -- Preserve a root that the game had already anchored before our movement.
+        lease.Root.Anchored=lease.Anchored
+        lease.Root.AssemblyLinearVelocity=Vector3.new(0,0,0)
+        lease.Root.AssemblyAngularVelocity=Vector3.new(0,0,0)
+    end
     local function move(target, owner)
         if owner=="Manual" then
             for name in pairs(movementJobs) do if flags[name] and controls[name] then controls[name].Set(false) end end
@@ -1078,8 +1119,8 @@ local function initImportedFeatures()
         if not root or typeof(target) ~= "CFrame" then return end
         if moveRoot==root and moveOwner==owner and moveTarget and motionState
             and (moveTarget.Position-target.Position).Magnitude<0.5 then
-            -- A completed farm Tween retains its world-space anchor; do not
-            -- release/reacquire it every farm tick or gravity wins between ticks.
+            -- Reuse the completed world's fixed hold without re-anchoring the root.
+            -- Reacquiring an identical destination every farm tick interrupts attacks.
             if owner=="Farm" or (moveTween and moveTween.PlaybackState==Enum.PlaybackState.Playing) then return end
         end
         stopMove()
@@ -1087,7 +1128,7 @@ local function initImportedFeatures()
         suspendMotion(root,h)
         local delta=(root.Position-target.Position).Magnitude
         if delta<0.1 then
-            if owner~="Farm" then releaseMotion() end
+            if owner=="Farm" then holdFarmPosition(target) else releaseMotion() end
             return
         end
         moveTween=TweenService:Create(root,TweenInfo.new(math.max(0.1,delta/options.Speed),Enum.EasingStyle.Linear),{CFrame=target})
@@ -1095,8 +1136,8 @@ local function initImportedFeatures()
         moveTween.Completed:Once(function(playback)
             if moveVersion~=version then return end
             if playback==Enum.PlaybackState.Completed and owner=="Farm" then
-                -- Farm suspension continues until the owner explicitly stops.
                 root.CFrame=target
+                holdFarmPosition(target)
             else
                 restoreCollisions()
                 releaseMotion()
@@ -1135,12 +1176,14 @@ local function initImportedFeatures()
         if not motionState then return end
         local c,h,root=character()
         if not active or destroyed or root~=motionState.Root or h~=motionState.Humanoid then stopMove();return end
-        root.Anchored=true
-        root.AssemblyLinearVelocity=Vector3.new(0,0,0)
-        root.AssemblyAngularVelocity=Vector3.new(0,0,0)
-        if moveOwner=="Farm" and moveTarget
-            and (not moveTween or moveTween.PlaybackState~=Enum.PlaybackState.Playing) then
-            root.CFrame=moveTarget
+        if motionState.Holding then
+            -- Do not force Anchored=true or overwrite CFrame while fighting.
+            -- Constraints hold a world point and are independent of platforms/NPC falls.
+            root.Anchored=motionState.Anchored
+        else
+            root.Anchored=true
+            root.AssemblyLinearVelocity=Vector3.new(0,0,0)
+            root.AssemblyAngularVelocity=Vector3.new(0,0,0)
         end
         for _,object in ipairs(c:GetDescendants()) do
             if object:IsA("BasePart") then
@@ -3137,7 +3180,7 @@ local questRuntime=initQuestRuntime()
     report("startup",supported and "target game detected" or "UI available; target game unavailable")
     return {StopAll=stopAll,GetState=function()
         local running={};for name in pairs(jobs) do running[#running+1]=name end;table.sort(running)
-        return {Active=active,SupportedGame=supported,Mode=options.Mode,Attack=table.clone(attackState),TweenSpeed=options.Speed,Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),FastAttack=fastAttackApi:GetState(),QuestRuntime=questRuntime.GetState(),Preload=preload.GetState(),Movement={Owner=moveOwner,Suspended=motionState~=nil,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
+        return {Active=active,SupportedGame=supported,Mode=options.Mode,Attack=table.clone(attackState),TweenSpeed=options.Speed,Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),FastAttack=fastAttackApi:GetState(),QuestRuntime=questRuntime.GetState(),Preload=preload.GetState(),Movement={Owner=moveOwner,Suspended=motionState~=nil,Holding=motionState and motionState.Holding==true or false,Anchored=moveRoot and moveRoot.Anchored or false,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
     end}
 end
 
@@ -3223,7 +3266,7 @@ local function debugReportText()
         "Arma: "..tostring(attack.Tool).." | distância: "..tostring(attack.Distance).." | tentativas: "..tostring(attack.Attempts),
         "Vida do alvo: "..tostring(attack.Health).." / "..tostring(attack.MaxHealth).." | última queda de vida: "..(attack.LastDamageAt and string.format("há %.1fs",os.clock()-attack.LastDamageAt) or "não observada"),
         "Soltar clique: "..tostring(attack.InputRelease).." | alternativa: "..tostring(attack.InputFallback),
-        "Movimento: "..tostring(movement.Owner).." | suspenso: "..tostring(movement.Suspended),
+        "Movimento: "..tostring(movement.Owner).." | fixo: "..tostring(movement.Holding).." | ancorado: "..tostring(movement.Anchored),
         "Preload: "..tostring(snapshot.Preload and snapshot.Preload.Rows).." registros | mar: "..tostring(snapshot.Preload and snapshot.Preload.Sea),
         "Missão: "..tostring(farm.QuestSource).." | spawn: "..tostring(farm.SpawnSource),
         "Interface: "..tostring(state).." | aberta: "..tostring(isUIOpen).." | descarregada: "..tostring(destroyed)}
