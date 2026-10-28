@@ -40725,6 +40725,10 @@ local function initFastAttack()
                     if combat then
                         if combat.Target then
                             local sent,reason=api:AttackTarget(combat.Target)
+                            if not sent and api.CombatFallback then
+                                local fallback,method=api.CombatFallback(combat.Owner,combat.Target,reason)
+                                if fallback then sent=true;transport.LastTransport=method end
+                            end
                             if not sent then transport.LastTransport=reason end
                         else transport.LastTransport="paused_for_skills" end
                     else api:AttackNearest() end
@@ -40954,6 +40958,8 @@ local function initImportedFeatures()
     local jobs, generations, flags, controls = {}, {}, {}, {}
     local buttonBusy = {}
     local onJobStop = {}
+    local onFarmChange
+    local modeControl
     local progressTracker
     local gates = shared._XerecaCommandGates
     if type(gates) ~= "table" then gates = {}; shared._XerecaCommandGates = gates end
@@ -41280,9 +41286,13 @@ local function initImportedFeatures()
     end
     local function toggleJob(page, label, key, interval, fn)
         local control=addToggle(page,label,false,function(on)
+            if key=="Farm" and on and options.Mode=="Off"then
+                options.Mode="Level";if modeControl then modeControl.Set("Level",true)end
+            end
             flags[key]=on
             if on then startJob(key,interval,fn) else stopJob(key) end
             if key=="Farm" and progressTracker then progressTracker.SetRunning(on) end
+            if key=="Farm" and onFarmChange then onFarmChange(on)end
             report(key,on and "enabled" or "disabled")
         end)
         controls[key]=control
@@ -41533,7 +41543,8 @@ progressTracker=initProgressTracker()
         move(destination,owner)
         local mastery=options.Mastery~="Off" and hp/math.max(1,maxHP)*100 <= options.MasteryHealth
         local c=LocalPlayer.Character
-        local tool=options.AutoEquip and equip(mastery and options.Mastery or options.Weapon) or (c and c:FindFirstChildOfClass("Tool"))
+        local levelAuto=owner=="Farm" and options.Mode=="Level"
+        local tool=(levelAuto or options.AutoEquip) and equip(levelAuto and options.Weapon or mastery and options.Mastery or options.Weapon) or (c and c:FindFirstChildOfClass("Tool"))
         if owner=="Farm" then progressTracker.Track(target) end
         attackState.Target=target.Name
         attackState.Health=hp;attackState.MaxHealth=maxHP
@@ -41547,6 +41558,11 @@ progressTracker=initProgressTracker()
             fastAttackApi:ReleaseCombat(owner);attackState.Phase="missing_weapon"
         elseif attackState.Distance>100 then
             fastAttackApi:ReleaseCombat(owner);attackState.Phase="approaching"
+        elseif levelAuto then
+            releaseInput();fastAttackApi:SetCombatTarget(owner,target)
+            attackState.Input="shared_fast_attack";attackState.Phase="shared_fast_attack"
+            attackState.Transport=fastAttackApi:GetState().LastTransport or "worker_started"
+            attackState.Attempts=attackState.Attempts+1
         elseif mastery or flags.SkillSpam or owner=="SeaCombat" then
             -- Pause manual M1 while the selected mastery/skills path owns combat.
             fastAttackApi:SetCombatTarget(owner,nil)
@@ -42839,6 +42855,84 @@ local bring=initMissionBring()
     bind(UserInputService.InputEnded,function(input)
         if options.PauseManual and input.UserInputType==Enum.UserInputType.Keyboard and (input.KeyCode==Enum.KeyCode.W or input.KeyCode==Enum.KeyCode.A or input.KeyCode==Enum.KeyCode.S or input.KeyCode==Enum.KeyCode.D) then manualUntil=os.clock()+3 end
     end,"farm.manual.resume")
+    -- Explicit level-farm lifecycle: quest -> travel/spawn -> combat -> next quest.
+    local levelState={Phase="off",Quest=nil,Target=nil}
+    local levelOwnsHaki=false
+    local function releaseLevelSupport()
+        fastAttackApi:ReleaseCombat("Farm")
+        if levelOwnsHaki and controls.Buso then controls.Buso.Set(false)end
+        levelOwnsHaki=false
+        levelState={Phase="off",Quest=nil,Target=nil}
+    end
+    local function ensureLevelSupport()
+        if controls.Buso and not controls.Buso.Get()then
+            controls.Buso.Set(true);levelOwnsHaki=true
+        end
+        -- Keep one attack worker leased to this farm; nil means no arbitrary nearby target.
+        fastAttackApi:SetCombatTarget("Farm",levelState.Target)
+    end
+    local function levelFarmStep()
+        ensureLevelSupport()
+        bring.BeginStep()
+        local _,_,root=character()
+        if not root then
+            levelState.Target=nil;fastAttackApi:SetCombatTarget("Farm",nil)
+            levelState.Phase="waiting_character";farmProgress(levelState.Phase);return
+        end
+        questRuntime.Refresh()
+        local guiVisible,questGui=questVisible()
+        local observed=questRuntime.GetState()
+        -- A visible accepted quest must not be masked by an earlier empty QuestUpdate.
+        local questActive=guiVisible or (observed.Known and observed.Active)
+        if not questActive then levelState.Quest=nil end
+        local q=questActive and (questRuntime.GetActiveQuest() or levelState.Quest or farmQuest) or nil
+        q=q or levelQuest(false)
+        if not q then
+            levelState.Target=nil;fastAttackApi:SetCombatTarget("Farm",nil);stopMove("Farm")
+            levelState.Phase="waiting_quest_data";farmProgress(levelState.Phase);return
+        end
+        farmQuestSource=q.Source or "legacy_data"
+        local titleObject=path(questGui,"Container","QuestTitle","Title")
+        local title=titleObject and titleObject.Text or ""
+        local function phase(name,target,destination)
+            levelState.Phase=name;levelState.Target=target
+            farmProgress(name,q.Mob,target,destination,title)
+        end
+        if q.Entrance and q.Quest and (root.Position-q.Quest.Position).Magnitude>10000 then
+            phase("requesting_entrance",nil,CFrame.new(q.Entrance));fastAttackApi:SetCombatTarget("Farm",nil)
+            comm("entrance",5,"requestEntrance",q.Entrance);return
+        end
+        if not questActive then
+            fastAttackApi:SetCombatTarget("Farm",nil)
+            fixedCombatTarget=nil;fixedCombatPoint=nil;fixedCombatOffset=nil
+            if not q.Quest or q.Tier==nil or not q.Name then
+                stopMove("Farm");phase("waiting_quest_position");return
+            end
+            phase("quest_giver",nil,q.Quest);move(q.Quest,"Farm")
+            if (root.Position-q.Quest.Position).Magnitude<12 then
+                local sent=comm("quest.start",2,"StartQuest",q.Name,q.Tier)
+                if sent then levelState.Quest=q;farmQuest=q end
+            end
+            return
+        end
+        levelState.Quest=q;farmQuest=q;farmQuestKey="Level:level"
+        local target=farmNamed(workspace:FindFirstChild("Enemies"),{q.Mob})
+        if not target then
+            fastAttackApi:SetCombatTarget("Farm",nil)
+            fixedCombatTarget=nil;fixedCombatPoint=nil;fixedCombatOffset=nil
+            local point,source=liveSpawn(q.Mob)
+            local destination=point and point*CFrame.new(0,3,0) or q.Spawn
+            farmSpawnSource=source or (q.Spawn and "legacy_position" or "unavailable")
+            phase("waiting_spawn",nil,destination)
+            if destination then move(destination,"Farm")else stopMove("Farm")end
+            return
+        end
+        farmSpawnSource=nil
+        phase(distance(target)<=100 and "combat" or "moving_to_target",target,part(target).CFrame)
+        bring.Update(q,target,true)
+        fight(target,"Farm")
+    end
+
     local function farmStep()
         local p=progressTracker.GetState()
         local _,_,r=character()
@@ -42857,25 +42951,21 @@ local bring=initMissionBring()
             if fixedCombatTarget then rejectedTargets[fixedCombatTarget]=os.clock()+options.StallSeconds end
             fixedCombatTarget=nil;fixedCombatPoint=nil;farmQuest=nil;stopMove("Farm");fastAttackApi:ReleaseCombat("Farm")
         end
-        bring.BeginStep()
         local mode=options.Mode
+        if mode=="Level"then levelFarmStep();return end
+        bring.BeginStep()
         local _,_,root=character()
         if not root then farmProgress("waiting_character");return end
         local enemies=workspace:FindFirstChild("Enemies")
         local target
-        if mode=="Level" or mode=="Boss" then
+        if mode=="Boss" then
             local visible,questGui=questVisible()
-            if mode=="Level" then
-                questRuntime.Refresh()
-                local observed=questRuntime.GetState()
-                if observed.Known then visible=observed.Active end
-            end
             local key=mode..":"..(mode=="Boss" and options.Boss or "level")
             if key~=farmQuestKey then farmQuest=nil;farmQuestKey=key end
             if not visible then farmQuest=nil end
             -- Preserve the accepted quest until completion, even if level changes.
             local q
-            if mode=="Level" then q=levelQuest(visible) else q=preload.Complement(farmQuest or bossForName(options.Boss)) end
+            q=preload.Complement(farmQuest or bossForName(options.Boss))
             if not q then
                 farmProgress("waiting_quest_data")
                 stopMove("Farm")
@@ -42909,7 +42999,6 @@ local bring=initMissionBring()
                 farmQuest=q
             end
             target=farmNamed(enemies,{q.Mob})
-            if mode=="Level" then bring.Update(q,target,visible) end
             if not target then
                 local point,source=liveSpawn(q.Mob)
                 local destination=point and point*CFrame.new(0,3,0) or q.Spawn
@@ -43037,9 +43126,10 @@ local bring=initMissionBring()
     dropdown(Farm,"Ataque do farm",{"Auto","Matsune Click","Hoho R2","Tool"},"Auto",function(v) attackState.Method=v end)
     addToggle(Farm,"Auto equipar arma selecionada",true,function(on) options.AutoEquip=on end)
     dropdown(Farm,"Arma",{"Melee","Sword","Gun","Blox Fruit"},options.Weapon,function(v) options.Weapon=v end)
-    dropdown(Farm,"Modo",modes,"Off",function(v)
+    modeControl=dropdown(Farm,"Modo",modes,"Off",function(v)
         options.Mode=v;farmQuest=nil;farmQuestKey=nil;fixedCombatTarget=nil;fixedCombatPoint=nil;stopMove("Farm")
         if v=="Off" and farmControl then farmControl.Set(false) end
+        if onFarmChange then onFarmChange(flags.Farm==true)end
     end)
     options.Material="Scrap Metal"
     dropdown(Farm,"Material",materialNames,options.Material,function(v) options.Material=v end)
@@ -43048,6 +43138,32 @@ local bring=initMissionBring()
     addSlider(Farm,{Name="Mastery: vida restante (%)",Min=5,Max=80,Default=30,Step=1,Callback=function(v) options.MasteryHealth=v end})
     addSlider(Farm,{Name="Distância acima do alvo",Min=3,Max=60,Default=20,Step=1,Callback=function(v) options.Offset=v end})
     farmControl=toggleJob(Farm,"Ativar farm selecionado","Farm",0.3,farmStep)
+    local levelToggle,syncingLevel
+    onFarmChange=function(on)
+        local levelOn=on and options.Mode=="Level"
+        if levelOn then
+            levelState.Quest=nil;levelState.Target=nil
+            ensureLevelSupport()
+        else releaseLevelSupport()end
+        if levelToggle and levelToggle.Get()~=levelOn then syncingLevel=true;levelToggle.Set(levelOn);syncingLevel=false end
+    end
+    levelToggle=addToggle(Farm,"Auto farm de level (Haki + ataque)",false,function(on)
+        if syncingLevel then return end
+        if on then modeControl.Set("Level");farmControl.Set(true)
+        elseif flags.Farm and options.Mode=="Level"then farmControl.Set(false)end
+    end)
+    controls.LevelFarm=levelToggle
+    local previousFarmStop=onJobStop.Farm
+    onJobStop.Farm=function()previousFarmStop();releaseLevelSupport()end
+    fastAttackApi.CombatFallback=function(owner,target,reason)
+        if owner~="Farm" or options.Mode~="Level" or not flags.Farm or os.clock()<manualUntil then return false end
+        if reason~="remotes_unavailable" and reason~="remote_failed"then return false end
+        local c=LocalPlayer.Character;local tool=c and c:FindFirstChildOfClass("Tool")
+        if not tool or distance(target)>fastAttackApi.Distance then return false end
+        local activated=pcall(function()tool:Activate()end)
+        local clicked=inputClick("Matsune Click")
+        return activated or clicked,"normal_click_sent"
+    end
     controls.Bring=addToggle(Farm,"BRING: agrupar NPCs da missão",false,function(on) flags.Bring=on;bring.Reset() end)
     addSlider(Farm,{Name="Alcance do BRING",Min=25,Max=400,Default=150,Step=25,Suffix=" studs",Callback=bring.SetRadius})
     addSlider(Farm,{Name="Máximo de NPCs no BRING",Min=1,Max=20,Default=20,Step=1,Callback=bring.SetLimit})
@@ -43464,7 +43580,7 @@ local bring=initMissionBring()
     report("startup",supported and "target game detected" or "UI available; target game unavailable")
     return {IsLightMode=function()return options.LightMode end,SetLightMode=function(v)options.LightMode=v==true end,StopAll=stopAll,ResetProgress=progressTracker.Reset,GetState=function()
         local running={};for name in pairs(jobs) do running[#running+1]=name end;table.sort(running)
-        return {Active=active,SupportedGame=supported,Mode=options.Mode,AutoEquip=options.AutoEquip,Progress=progressTracker.GetState(),Attack=table.clone(attackState),TweenSpeed=options.Speed,Bring=bring.GetState(),Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),FastAttack=fastAttackApi:GetState(),QuestRuntime=questRuntime.GetState(),Preload=preload.GetState(),Movement={Distance=moveRoot and moveTarget and (moveRoot.Position-moveTarget.Position).Magnitude or 0,ActualSpeed=actualSpeed,Backend="physics_path",Phase=movementPhase,Rebases=movementRebases,Owner=moveOwner,Suspended=motionState~=nil,Holding=motionState and motionState.Holding==true or false,Anchored=moveRoot and moveRoot.Anchored or false,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
+        return {Active=active,SupportedGame=supported,Mode=options.Mode,AutoEquip=options.AutoEquip,Progress=progressTracker.GetState(),Attack=table.clone(attackState),TweenSpeed=options.Speed,Bring=bring.GetState(),Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),FastAttack=fastAttackApi:GetState(),LevelFarm=table.clone(levelState),QuestRuntime=questRuntime.GetState(),Preload=preload.GetState(),Movement={Distance=moveRoot and moveTarget and (moveRoot.Position-moveTarget.Position).Magnitude or 0,ActualSpeed=actualSpeed,Backend="physics_path",Phase=movementPhase,Rebases=movementRebases,Owner=moveOwner,Suspended=motionState~=nil,Holding=motionState and motionState.Holding==true or false,Anchored=moveRoot and moveRoot.Anchored or false,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
     end}
 end
 
