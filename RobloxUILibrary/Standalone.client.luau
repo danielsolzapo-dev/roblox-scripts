@@ -2550,6 +2550,81 @@ local function initQuestRuntime()
 end
 local questRuntime=initQuestRuntime()
 
+-- Optional mission-only clustering; no hidden-property or network-ownership changes.
+local function initMissionBring()
+    local state={Phase="off",Moved=0,Grouped=0,Eligible=0,Radius=150,Limit=20}
+    local center,centerTarget,centerQuest
+    local label
+    local bosses={}
+    for _,name in ipairs(bossNames) do bosses[cleanName(name)]=true end
+    local function paint()
+        if label then label.Text="BRING: "..state.Phase.." | NPCs extras no grupo: "..tostring(state.Grouped).." | alcance: "..tostring(state.Radius).." studs" end
+    end
+    local function reset()
+        center=nil;centerTarget=nil;centerQuest=nil
+        state.Phase=flags.Bring and "aguardando farm de nível" or "off"
+        state.Moved=0;state.Grouped=0;state.Eligible=0;paint()
+    end
+    local function beginStep()
+        state.Moved=0;state.Grouped=0;state.Eligible=0
+        state.Phase=not flags.Bring and "off" or options.Mode~="Level" and "somente modo Level" or "aguardando missão/alvo"
+        paint()
+    end
+    local function update(q,target,questActive)
+        if not active or destroyed or not flags.Bring or not flags.Farm or options.Mode~="Level" or not questActive then return end
+        if not q or not q.Name or not q.Mob or not target then return end
+        local enemies=workspace:FindFirstChild("Enemies")
+        local targetRoot=target:FindFirstChild("HumanoidRootPart")
+        local _,_,root=character()
+        if not enemies or not root or not targetRoot or not target:IsDescendantOf(enemies) then return end
+        if bosses[cleanName(q.Mob)] or target.Name:lower():find("boss",1,true) or target:GetAttribute("IsBoss")==true or target:GetAttribute("Boss")==true or Players:GetPlayerFromCharacter(target) then state.Phase="boss excluído";paint();return end
+        if (root.Position-targetRoot.Position).Magnitude>math.max(60,options.Offset+15) then state.Phase="aproximando do alvo";paint();return end
+        local key=q.Name..":"..tostring(q.Tier)..":"..cleanName(q.Mob)
+        if centerTarget~=target or centerQuest~=key then
+            centerTarget=target;centerQuest=key
+            center=options.FixedFarm and fixedCombatTarget==target and fixedCombatPoint
+                and fixedCombatPoint*CFrame.new(0,-options.Offset,-4) or targetRoot.CFrame
+        end
+        if (root.Position-center.Position).Magnitude>state.Radius then state.Phase="ponto fora do alcance";paint();return end
+        local candidates={}
+        for _,object in ipairs(enemies:GetDescendants()) do
+            if object:IsA("Model") and object~=target and cleanName(object.Name)==cleanName(q.Mob)
+                and not bosses[cleanName(object.Name)] and not object.Name:lower():find("boss",1,true)
+                and object:GetAttribute("IsBoss")~=true and object:GetAttribute("Boss")~=true
+                and not Players:GetPlayerFromCharacter(object) then
+                local humanoid=object:FindFirstChildOfClass("Humanoid")
+                local point=object:FindFirstChild("HumanoidRootPart")
+                if humanoid and humanoid.Health>0 and point and point:IsA("BasePart") and not point.Anchored then
+                    local d=(root.Position-point.Position).Magnitude
+                    if d<=state.Radius then candidates[#candidates+1]={Root=point,Distance=d} end
+                end
+            end
+        end
+        table.sort(candidates,function(a,b)return a.Distance<b.Distance end)
+        state.Eligible=#candidates
+        state.Grouped=math.min(#candidates,state.Limit)
+        for index=1,math.min(#candidates,state.Limit) do
+            local point=candidates[index].Root
+            -- Leave the chosen attack target untouched; distribute extras around it.
+            local x=((index-1)%5-2)*3
+            local z=(math.floor((index-1)/5)-2)*3
+            local destination=center*CFrame.new(x,0,z)
+            if (point.Position-destination.Position).Magnitude>1 then
+                point.CFrame=destination
+                point.AssemblyLinearVelocity=Vector3.new(0,0,0)
+                point.AssemblyAngularVelocity=Vector3.new(0,0,0)
+                state.Moved=state.Moved+1
+            end
+        end
+        state.Phase="ativo";paint()
+    end
+    return {Update=update,BeginStep=beginStep,Reset=reset,
+        SetRadius=function(value) state.Radius=math.clamp(value,25,400);paint() end,
+        BindLabel=function(value) label=value;paint() end,
+        GetState=function()local copy=table.clone(state);copy.Enabled=flags.Bring==true;return copy end}
+end
+local bring=initMissionBring()
+
     local modes={"Off","Level","Nearest","Raid","Material","Bone","Cake","Ectoplasm","Elite","Boss","Law","White Belt","Dragon Hunter","Sea Event","Golem","Player"}
     local mobGroups={Bone={"Reborn Skeleton","Living Zombie","Demonic Soul","Posessed Mummy"},
         Cake={"Cookie Crafter","Cake Guard","Baking Staff","Head Baker","Cake Prince","Dough King"},
@@ -2590,7 +2665,7 @@ local questRuntime=initQuestRuntime()
             lastFarmLog=os.clock();lastFarmMessage=important
         end
     end
-    onJobStop.Farm=function() releaseInput();attackState.Phase="idle";fixedCombatTarget=nil;fixedCombatPoint=nil;fixedCombatOffset=nil;farmProgress("idle") end
+    onJobStop.Farm=function() bring.Reset();releaseInput();attackState.Phase="idle";fixedCombatTarget=nil;fixedCombatPoint=nil;fixedCombatOffset=nil;farmProgress("idle") end
     local function spawnCFrame(object)
         if object:IsA("BasePart") then return object.CFrame end
         if object:IsA("Model") then
@@ -2639,6 +2714,7 @@ local questRuntime=initQuestRuntime()
         return q
     end
     local function farmStep()
+        bring.BeginStep()
         local mode=options.Mode
         local _,_,root=character()
         if not root then farmProgress("waiting_character");return end
@@ -2689,6 +2765,7 @@ local questRuntime=initQuestRuntime()
                 farmQuest=q
             end
             target=farmNamed(enemies,{q.Mob})
+            if mode=="Level" then bring.Update(q,target,visible) end
             if not target then
                 local point,source=liveSpawn(q.Mob)
                 local destination=point and point*CFrame.new(0,3,0) or q.Spawn
@@ -2824,6 +2901,10 @@ local questRuntime=initQuestRuntime()
     addSlider(Farm,{Name="Mastery: vida restante (%)",Min=5,Max=80,Default=30,Step=1,Callback=function(v) options.MasteryHealth=v end})
     addSlider(Farm,{Name="Distância acima do alvo",Min=3,Max=60,Default=20,Step=1,Callback=function(v) options.Offset=v end})
     farmControl=toggleJob(Farm,"Ativar farm selecionado","Farm",0.3,farmStep)
+    controls.Bring=addToggle(Farm,"BRING: agrupar NPCs da missão",false,function(on) flags.Bring=on;bring.Reset() end)
+    addSlider(Farm,{Name="Alcance do BRING",Min=25,Max=400,Default=150,Step=25,Suffix=" studs",Callback=bring.SetRadius})
+    bring.BindLabel(addLabel(Farm,""))
+    addLabel(Farm,"BRING funciona no modo Level, com missão ativa e perto do alvo. Agrupa até 20 inimigos próximos por etapa; jogadores e bosses ficam de fora.")
     controls.SkillSpam=addToggle(Farm,"Usar skills Z/X/C/V/F",false,function(on) flags.SkillSpam=on end)
     for _,key in ipairs({"Z","X","C","V","F"}) do
         addToggle(Farm,"Skill "..key,options["Skill"..key],function(on) options["Skill"..key]=on end)
@@ -3180,7 +3261,7 @@ local questRuntime=initQuestRuntime()
     report("startup",supported and "target game detected" or "UI available; target game unavailable")
     return {StopAll=stopAll,GetState=function()
         local running={};for name in pairs(jobs) do running[#running+1]=name end;table.sort(running)
-        return {Active=active,SupportedGame=supported,Mode=options.Mode,Attack=table.clone(attackState),TweenSpeed=options.Speed,Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),FastAttack=fastAttackApi:GetState(),QuestRuntime=questRuntime.GetState(),Preload=preload.GetState(),Movement={Owner=moveOwner,Suspended=motionState~=nil,Holding=motionState and motionState.Holding==true or false,Anchored=moveRoot and moveRoot.Anchored or false,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
+        return {Active=active,SupportedGame=supported,Mode=options.Mode,Attack=table.clone(attackState),TweenSpeed=options.Speed,Bring=bring.GetState(),Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),FastAttack=fastAttackApi:GetState(),QuestRuntime=questRuntime.GetState(),Preload=preload.GetState(),Movement={Owner=moveOwner,Suspended=motionState~=nil,Holding=motionState and motionState.Holding==true or false,Anchored=moveRoot and moveRoot.Anchored or false,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
     end}
 end
 
@@ -3267,6 +3348,7 @@ local function debugReportText()
         "Vida do alvo: "..tostring(attack.Health).." / "..tostring(attack.MaxHealth).." | última queda de vida: "..(attack.LastDamageAt and string.format("há %.1fs",os.clock()-attack.LastDamageAt) or "não observada"),
         "Soltar clique: "..tostring(attack.InputRelease).." | alternativa: "..tostring(attack.InputFallback),
         "Movimento: "..tostring(movement.Owner).." | fixo: "..tostring(movement.Holding).." | ancorado: "..tostring(movement.Anchored),
+        "BRING: "..tostring(snapshot.Bring and snapshot.Bring.Phase).." | grupo: "..tostring(snapshot.Bring and snapshot.Bring.Grouped),
         "Preload: "..tostring(snapshot.Preload and snapshot.Preload.Rows).." registros | mar: "..tostring(snapshot.Preload and snapshot.Preload.Sea),
         "Missão: "..tostring(farm.QuestSource).." | spawn: "..tostring(farm.SpawnSource),
         "Interface: "..tostring(state).." | aberta: "..tostring(isUIOpen).." | descarregada: "..tostring(destroyed)}
