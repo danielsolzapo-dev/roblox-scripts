@@ -594,9 +594,11 @@ addLabel(Settings, "Aba Settings: demonstração/informativa. Configurações pe
 
 -- === Inlined FastAttack module (Matsune) ===
 local function initFastAttack()
-    local api={Distance=100,attackMobs=true,attackPlayers=true,Running=false,Delay=0.15}
+    local api={Distance=100,attackMobs=true,attackPlayers=true,Running=false,ManualEnabled=false,Delay=0.15}
     local RS=game:GetService("ReplicatedStorage")
     local worker
+    local combatOwners={}
+    local transport={Dispatches=0}
     local function remote(name)
         for _,nameOfContainer in ipairs({"Packages","Modules",""}) do
             local container=nameOfContainer=="" and RS or RS:FindFirstChild(nameOfContainer)
@@ -635,7 +637,10 @@ local function initFastAttack()
             end
         end)
         if not ok then debugLog("WARN","combat.remote",err);return false,"remote_failed" end
-        return true,leftClick and leftClick:IsA("RemoteEvent") and "left_click_remote_sent" or "remote_sent"
+        transport.Dispatches=transport.Dispatches+1
+        transport.LastSentAt=os.clock();transport.Target=enemy.Name
+        transport.LastTransport=leftClick and leftClick:IsA("RemoteEvent") and "left_click_remote_sent" or "remote_sent"
+        return true,transport.LastTransport
     end
     function api:AttackNearest()
         local c=LocalPlayer.Character
@@ -658,26 +663,75 @@ local function initFastAttack()
         if self.attackPlayers then gather(workspace:FindFirstChild("Characters")) end
         if best then return self:AttackTarget(best) end
     end
-    function api:Start()
-        if destroyed or self.Running then return end
-        self.Running=true
-        worker=task.defer(function()
-            local failures=0
-            while self.Running and not destroyed do
-                local ok,err=pcall(function() self:AttackNearest() end)
-                if not ok then
-                    failures=failures+1;debugLog("ERROR","FastAttack",err)
-                    if failures>=3 then self.Running=false;notify({Title="FastAttack",Text=tostring(err)});break end
-                else failures=0 end
-                task.wait(self.Delay)
-            end
-            worker=nil
-        end)
+    function api:CanAttack()
+        local c=LocalPlayer.Character
+        local tool=c and c:FindFirstChildOfClass("Tool")
+        if not tool or tool.ToolTip=="Gun" then return false end
+        local own=tool:FindFirstChild("LeftClickRemote")
+        return (own and own:IsA("RemoteEvent")) or (remote("RE/RegisterAttack")~=nil and remote("RE/RegisterHit")~=nil)
     end
-    function api:Stop()
-        self.Running=false
+    local function currentCombat()
+        local newest
+        for owner,entry in pairs(combatOwners) do
+            if os.clock()-entry.Updated>0.8 then combatOwners[owner]=nil
+            elseif not newest or entry.Updated>newest.Updated then newest=entry end
+        end
+        return newest
+    end
+    local function cancelWorker()
+        api.Running=false;transport.Owner=nil
         if worker and worker~=coroutine.running() then pcall(task.cancel,worker) end
         worker=nil
+    end
+    local function ensureWorker()
+        if destroyed or worker then return end
+        api.Running=true
+        worker=task.defer(function()
+            local failures=0
+            while not destroyed do
+                local combat=currentCombat()
+                if not api.ManualEnabled and not combat then break end
+                transport.Owner=combat and combat.Owner or "Manual"
+                local ok,err=pcall(function()
+                    if combat then
+                        if combat.Target then
+                            local sent,reason=api:AttackTarget(combat.Target)
+                            if not sent then transport.LastTransport=reason end
+                        else transport.LastTransport="paused_for_skills" end
+                    else api:AttackNearest() end
+                end)
+                if not ok then
+                    failures=failures+1;debugLog("ERROR","FastAttack",err)
+                    if failures>=3 then api.ManualEnabled=false;table.clear(combatOwners);notify({Title="FastAttack",Text=tostring(err)});break end
+                else failures=0 end
+                task.wait(api.Delay)
+            end
+            api.Running=false;worker=nil;transport.Owner=nil
+        end)
+    end
+    function api:Start()
+        self.ManualEnabled=true;ensureWorker()
+    end
+    function api:Stop()
+        self.ManualEnabled=false
+        if not currentCombat() then cancelWorker() end
+    end
+    function api:SetCombatTarget(owner,target)
+        if destroyed then return end
+        combatOwners[owner]={Owner=owner,Target=target,Updated=os.clock()}
+        ensureWorker()
+    end
+    function api:ReleaseCombat(owner)
+        combatOwners[owner]=nil
+        if not self.ManualEnabled and not currentCombat() then cancelWorker() end
+    end
+    function api:StopAll()
+        self.ManualEnabled=false;table.clear(combatOwners);cancelWorker()
+    end
+    function api:GetState()
+        local result=table.clone(transport)
+        result.Running=self.Running;result.ManualEnabled=self.ManualEnabled
+        return result
     end
     function api:SetDelay(value)
         if type(value)=="number" and value==value then self.Delay=math.clamp(value,0.1,5) end
@@ -693,7 +747,7 @@ debugLog("INFO", "initFastAttack", "starting")
 local fastAttackApi = initFastAttack()
 debugLog("INFO", "initFastAttack", "ready")
 _G.MatsuneFastAttack = fastAttackApi
-table.insert(cleanupFns, function() fastAttackApi:Stop(); if _G.MatsuneFastAttack==fastAttackApi then _G.MatsuneFastAttack=nil end end)
+table.insert(cleanupFns, function() fastAttackApi:StopAll(); if _G.MatsuneFastAttack==fastAttackApi then _G.MatsuneFastAttack=nil end end)
 
 -- === Inlined ESP module (Matsune) ===
 local function initESP()
@@ -1096,6 +1150,7 @@ local function initImportedFeatures()
         end
     end,"features.movement.physics")
     local function stopJob(name)
+        fastAttackApi:ReleaseCombat(name)
         generations[name]=(generations[name] or 0)+1
         local thread=jobs[name]; jobs[name]=nil
         if thread and thread ~= coroutine.running() then pcall(task.cancel, thread) end
@@ -1311,7 +1366,7 @@ local function initImportedFeatures()
     local function fight(target,owner)
         local root=part(target)
         local hp,maxHP=health(target)
-        if not root or hp<=0 then return end
+        if not root or hp<=0 then fastAttackApi:ReleaseCombat(owner);return end
         local destination=root.CFrame*CFrame.new(0,options.Offset,4)
         if owner=="Farm" and options.FixedFarm then
             if fixedCombatTarget~=target or fixedCombatOffset~=options.Offset then
@@ -1333,12 +1388,22 @@ local function initImportedFeatures()
         lastAttackHealth=hp
         attackState.LastDamageAt=lastDamageAt
         if not tool then
-            attackState.Phase="missing_weapon"
+            fastAttackApi:ReleaseCombat(owner);attackState.Phase="missing_weapon"
         elseif attackState.Distance>100 then
-            attackState.Phase="approaching"
+            fastAttackApi:ReleaseCombat(owner);attackState.Phase="approaching"
         elseif mastery or flags.SkillSpam or owner=="SeaCombat" then
+            -- Pause manual M1 while the selected mastery/skills path owns combat.
+            fastAttackApi:SetCombatTarget(owner,nil)
             skillAttack();attackState.Phase="skills_sent"
+        elseif fastAttackApi.ManualEnabled or (attackState.Method=="Auto" and fastAttackApi:CanAttack()) then
+            releaseInput()
+            fastAttackApi:SetCombatTarget(owner,target)
+            attackState.Input="shared_fast_attack"
+            attackState.Phase="shared_fast_attack"
+            attackState.Transport=fastAttackApi:GetState().LastTransport or "worker_started"
+            attackState.Attempts=attackState.Attempts+1
         else
+            fastAttackApi:ReleaseCombat(owner)
             -- Tool activation alone does not reach the game's newer combat remotes.
             -- Always preserve the normal tool path, then target only this farm enemy.
             local activated,activateErr=pcall(function() tool:Activate() end)
@@ -1355,1053 +1420,1054 @@ local function initImportedFeatures()
         end
         debugLog("INFO","combat",attackState.Phase.." target="..tostring(target.Name).." tool="..tostring(attackState.Tool).." transport="..tostring(attackState.Transport).." hp="..tostring(hp))
     end
-    -- Adapted static quest/boss/island/shop data from the two supplied sources.
-    local function questForLevel()
-        local MyLevel, CFrameQuest, CFrameMon, Mon, NameMon, NameQuest, LevelQuest, Entrance
-        local data = LocalPlayer:FindFirstChild("Data")
-        local level = data and data:FindFirstChild("Level")
-        if not level or level.Value > 2600 then return nil end
-        local L_23_, L_24_, L_25_ = sourcePlaceId() == 2753915549, sourcePlaceId() == 4442272183, sourcePlaceId() == 7449423635
-    	MyLevel = game:GetService('Players').LocalPlayer.Data.Level.Value;
-    	if L_23_ then
-    		if MyLevel == 1 or MyLevel <= 9 then
-    			Mon, NameMon, NameQuest, LevelQuest = "Bandit", "Bandit", "BanditQuest1", 1;
-    			CFrameQuest = CFrame.new(1059.37195, 15.4495068, 1550.4231, 0.939700544, - 0, - 0.341998369, 0, 1, - 0, 0.341998369, 0, 0.939700544)
-    			CFrameMon = CFrame.new(1045.962646484375, 27.00250816345215, 1560.8203125)
-    		elseif MyLevel == 10 or MyLevel <= 14 then
-    			Mon, NameMon, NameQuest, LevelQuest = "Monkey", "Monkey", "JungleQuest", 1;
-    			CFrameQuest = CFrame.new(- 1598.08911, 35.5501175, 153.377838, 0, 0, 1, 0, 1, - 0, - 1, 0, 0)
-    			CFrameMon = CFrame.new(- 1448.51806640625, 67.85301208496094, 11.46579647064209)
-    		elseif MyLevel == 15 or MyLevel <= 29 then
-    			Mon, NameMon, NameQuest, LevelQuest = "Gorilla", "Gorilla", "JungleQuest", 2;
-    			CFrameQuest = CFrame.new(- 1598.08911, 35.5501175, 153.377838, 0, 0, 1, 0, 1, - 0, - 1, 0, 0)
-    			CFrameMon = CFrame.new(- 1129.8836669921875, 40.46354675292969, - 525.4237060546875)
-    		elseif MyLevel == 30 or MyLevel <= 39 then
-    			Mon, NameMon, NameQuest, LevelQuest = "Pirate", "Pirate", "BuggyQuest1", 1;
-    			CFrameQuest = CFrame.new(- 1141.07483, 4.10001802, 3831.5498, 0.965929627, - 0, - 0.258804798, 0, 1, - 0, 0.258804798, 0, 0.965929627)
-    			CFrameMon = CFrame.new(- 1103.513427734375, 13.752052307128906, 3896.091064453125)
-    		elseif MyLevel == 40 or MyLevel <= 59 then
-    			Mon, NameMon, NameQuest, LevelQuest = "Brute", "Brute", "BuggyQuest1", 2;
-    			CFrameQuest = CFrame.new(- 1141.07483, 4.10001802, 3831.5498, 0.965929627, - 0, - 0.258804798, 0, 1, - 0, 0.258804798, 0, 0.965929627)
-    			CFrameMon = CFrame.new(- 1140.083740234375, 14.809885025024414, 4322.92138671875)
-    		elseif MyLevel == 60 or MyLevel <= 74 then
-    			Mon, NameMon, NameQuest, LevelQuest = "Desert Bandit", "Desert Bandit", "DesertQuest", 1;
-    			CFrameQuest = CFrame.new(894.488647, 5.14000702, 4392.43359, 0.819155693, - 0, - 0.573571265, 0, 1, - 0, 0.573571265, 0, 0.819155693)
-    			CFrameMon = CFrame.new(924.7998046875, 6.44867467880249, 4481.5859375)
-    		elseif MyLevel == 75 or MyLevel <= 89 then
-    			NameMon, NameQuest, LevelQuest = "Desert Officer", "DesertQuest", 2;
-    			CFrameQuest = CFrame.new(894.488647, 5.14000702, 4392.43359, 0.819155693, - 0, - 0.573571265, 0, 1, - 0, 0.573571265, 0, 0.819155693)
-    			CFrameMon = CFrame.new(1608.2822265625, 8.614224433898926, 4371.00732421875)
-    		elseif MyLevel == 90 or MyLevel <= 99 then
-    			NameMon, NameQuest, LevelQuest = "Snow Bandit", "SnowQuest", 1;
-    			CFrameQuest = CFrame.new(1389.74451, 88.1519318, - 1298.90796, - 0.342042685, 0, 0.939684391, 0, 1, 0, - 0.939684391, 0, - 0.342042685)
-    			CFrameMon = CFrame.new(1354.347900390625, 87.27277374267578, - 1393.946533203125)
-    		elseif MyLevel == 100 or MyLevel <= 119 then
-    			NameMon, NameQuest, LevelQuest = "Snowman", "SnowQuest", 2;
-    			CFrameQuest = CFrame.new(1389.74451, 88.1519318, - 1298.90796, - 0.342042685, 0, 0.939684391, 0, 1, 0, - 0.939684391, 0, - 0.342042685)
-    			CFrameMon = CFrame.new(1201.6412353515625, 144.57958984375, - 1550.0670166015625)
-    		elseif MyLevel == 120 or MyLevel <= 149 then
-    			NameMon, NameQuest, LevelQuest = "Chief Petty Officer", "MarineQuest2", 1;
-    			CFrameQuest = CFrame.new(- 5039.58643, 27.3500385, 4324.68018, 0, 0, - 1, 0, 1, 0, 1, 0, 0)
-    			CFrameMon = CFrame.new(- 4881.23095703125, 22.65204429626465, 4273.75244140625)
-    		elseif MyLevel == 150 or MyLevel <= 174 then
-    			NameMon, NameQuest, LevelQuest = "Sky Bandit", "SkyQuest", 1;
-    			CFrameQuest = CFrame.new(- 4839.53027, 716.368591, - 2619.44165, 0.866007268, 0, 0.500031412, 0, 1, 0, - 0.500031412, 0, 0.866007268)
-    			CFrameMon = CFrame.new(- 4953.20703125, 295.74420166015625, - 2899.22900390625)
-    		elseif MyLevel == 175 or MyLevel <= 189 then
-    			NameMon, NameQuest, LevelQuest = "Dark Master", "SkyQuest", 2;
-    			CFrameQuest = CFrame.new(- 4839.53027, 716.368591, - 2619.44165, 0.866007268, 0, 0.500031412, 0, 1, 0, - 0.500031412, 0, 0.866007268)
-    			CFrameMon = CFrame.new(- 5259.8447265625, 391.3976745605469, - 2229.035400390625)
-    		elseif MyLevel == 190 or MyLevel <= 209 then
-    			NameMon, NameQuest, LevelQuest = "Prisoner", "PrisonerQuest", 1;
-    			CFrameQuest = CFrame.new(5308.93115, 1.65517521, 475.120514, - 0.0894274712, - 5.00292918e-09, - 0.995993316, 1.60817859e-09, 1, - 5.16744869e-09, 0.995993316, - 2.06384709e-09, - 0.0894274712)
-    			CFrameMon = CFrame.new(5098.9736328125, - 0.3204058110713959, 474.2373352050781)
-    		elseif MyLevel == 210 or MyLevel <= 249 then
-    			NameMon, NameQuest, LevelQuest = "Dangerous Prisoner", "PrisonerQuest", 2;
-    			CFrameQuest = CFrame.new(5308.93115, 1.65517521, 475.120514, - 0.0894274712, - 5.00292918e-09, - 0.995993316, 1.60817859e-09, 1, - 5.16744869e-09, 0.995993316, - 2.06384709e-09, - 0.0894274712)
-    			CFrameMon = CFrame.new(5654.5634765625, 15.633401870727539, 866.2991943359375)
-    		elseif MyLevel == 250 or MyLevel <= 274 then
-    			NameMon, NameQuest, LevelQuest = "Toga Warrior", "ColosseumQuest", 1;
-    			CFrameQuest = CFrame.new(- 1580.04663, 6.35000277, - 2986.47534, - 0.515037298, 0, - 0.857167721, 0, 1, 0, 0.857167721, 0, - 0.515037298)
-    			CFrameMon = CFrame.new(- 1820.21484375, 51.68385696411133, - 2740.6650390625)
-    		elseif MyLevel == 275 or MyLevel <= 299 then
-    			NameMon, NameQuest, LevelQuest = "Gladiator", "ColosseumQuest", 2;
-    			CFrameQuest = CFrame.new(- 1580.04663, 6.35000277, - 2986.47534, - 0.515037298, 0, - 0.857167721, 0, 1, 0, 0.857167721, 0, - 0.515037298)
-    			CFrameMon = CFrame.new(- 1292.838134765625, 56.380882263183594, - 3339.031494140625)
-    		elseif MyLevel == 300 or MyLevel <= 324 then
-    			NameMon, NameQuest, LevelQuest = "Military Soldier", "MagmaQuest", 1;
-    			CFrameQuest = CFrame.new(- 5313.37012, 10.9500084, 8515.29395, - 0.499959469, 0, 0.866048813, 0, 1, 0, - 0.866048813, 0, - 0.499959469)
-    			CFrameMon = CFrame.new(- 5411.16455078125, 11.081554412841797, 8454.29296875)
-    		elseif MyLevel == 325 or MyLevel <= 374 then
-    			NameMon, NameQuest, LevelQuest = "Military Spy", "MagmaQuest", 2;
-    			CFrameQuest = CFrame.new(- 5313.37012, 10.9500084, 8515.29395, - 0.499959469, 0, 0.866048813, 0, 1, 0, - 0.866048813, 0, - 0.499959469)
-    			CFrameMon = CFrame.new(- 5802.8681640625, 86.26241302490234, 8828.859375)
-    		elseif MyLevel == 375 or MyLevel <= 399 then
-    			NameMon, NameQuest, LevelQuest = "Fishman Warrior", "FishmanQuest", 1;
-    			CFrameQuest = CFrame.new(61122.65234375, 18.497442245483, 1569.3997802734)
-    			CFrameMon = CFrame.new(60878.30078125, 18.482830047607422, 1543.7574462890625)
-    			Entrance=Vector3.new(61163.8515625, 11.6796875, 1819.7841796875)
-    		elseif MyLevel == 400 or MyLevel <= 449 then
-    			NameMon, NameQuest, LevelQuest = "Fishman Commando", "FishmanQuest", 2;
-    			CFrameQuest = CFrame.new(61122.65234375, 18.497442245483, 1569.3997802734)
-    			CFrameMon = CFrame.new(61922.6328125, 18.482830047607422, 1493.934326171875)
-    			Entrance=Vector3.new(61163.8515625, 11.6796875, 1819.7841796875)
-    		elseif MyLevel == 450 or MyLevel <= 474 then
-    			NameMon, NameQuest, LevelQuest = "God's Guard", "SkyExp1Quest", 1;
-    			CFrameQuest = CFrame.new(- 4721.88867, 843.874695, - 1949.96643, 0.996191859, - 0, - 0.0871884301, 0, 1, - 0, 0.0871884301, 0, 0.996191859)
-    			CFrameMon = CFrame.new(- 4710.04296875, 845.2769775390625, - 1927.3079833984375)
-    			Entrance=Vector3.new(- 4607.82275, 872.54248, - 1667.55688)
-    		elseif MyLevel == 475 or MyLevel <= 524 then
-    			NameMon, NameQuest, LevelQuest = "Shanda", "SkyExp1Quest", 2;
-    			CFrameQuest = CFrame.new(- 7859.09814, 5544.19043, - 381.476196, - 0.422592998, 0, 0.906319618, 0, 1, 0, - 0.906319618, 0, - 0.422592998)
-    			CFrameMon = CFrame.new(- 7678.48974609375, 5566.40380859375, - 497.2156066894531)
-    			Entrance=Vector3.new(- 7894.6176757813, 5547.1416015625, - 380.29119873047)
-    		elseif MyLevel == 525 or MyLevel <= 549 then
-    			NameMon, NameQuest, LevelQuest = "Royal Squad", "SkyExp2Quest", 1;
-    			CFrameQuest = CFrame.new(- 7906.81592, 5634.6626, - 1411.99194, 0, 0, - 1, 0, 1, 0, 1, 0, 0)
-    			CFrameMon = CFrame.new(- 7624.25244140625, 5658.13330078125, - 1467.354248046875)
-    		elseif MyLevel == 550 or MyLevel <= 624 then
-    			NameMon, NameQuest, LevelQuest = "Royal Soldier", "SkyExp2Quest", 2;
-    			CFrameQuest = CFrame.new(- 7906.81592, 5634.6626, - 1411.99194, 0, 0, - 1, 0, 1, 0, 1, 0, 0)
-    			CFrameMon = CFrame.new(- 7836.75341796875, 5645.6640625, - 1790.6236572265625)
-    		elseif MyLevel == 625 or MyLevel <= 649 then
-    			NameMon, NameQuest, LevelQuest = "Galley Pirate", "FountainQuest", 1;
-    			CFrameQuest = CFrame.new(5259.81982, 37.3500175, 4050.0293, 0.087131381, 0, 0.996196866, 0, 1, 0, - 0.996196866, 0, 0.087131381)
-    			CFrameMon = CFrame.new(5551.02197265625, 78.90135192871094, 3930.412841796875)
-    		elseif MyLevel >= 650 then
-    			NameMon, NameQuest, LevelQuest = "Galley Captain", "FountainQuest", 2;
-    			CFrameQuest = CFrame.new(5259.81982, 37.3500175, 4050.0293, 0.087131381, 0, 0.996196866, 0, 1, 0, - 0.996196866, 0, 0.087131381)
-    			CFrameMon = CFrame.new(5441.95166015625, 42.50205993652344, 4950.09375)
-    		end
-    	elseif L_24_ then
-    		if MyLevel == 700 or MyLevel <= 724 then
-    			NameMon, NameQuest, LevelQuest = "Raider", "Area1Quest", 1;
-    			CFrameQuest = CFrame.new(- 429.543518, 71.7699966, 1836.18188, - 0.22495985, 0, - 0.974368095, 0, 1, 0, 0.974368095, 0, - 0.22495985)
-    			CFrameMon = CFrame.new(- 728.3267211914062, 52.779319763183594, 2345.7705078125)
-    		elseif MyLevel == 725 or MyLevel <= 774 then
-    			NameMon, NameQuest, LevelQuest = "Mercenary", "Area1Quest", 2;
-    			CFrameQuest = CFrame.new(- 429.543518, 71.7699966, 1836.18188, - 0.22495985, 0, - 0.974368095, 0, 1, 0, 0.974368095, 0, - 0.22495985)
-    			CFrameMon = CFrame.new(- 1004.3244018554688, 80.15886688232422, 1424.619384765625)
-    		elseif MyLevel == 775 or MyLevel <= 799 then
-    			NameMon, NameQuest, LevelQuest = "Swan Pirate", "Area2Quest", 1;
-    			CFrameQuest = CFrame.new(638.43811, 71.769989, 918.282898, 0.139203906, 0, 0.99026376, 0, 1, 0, - 0.99026376, 0, 0.139203906)
-    			CFrameMon = CFrame.new(1068.664306640625, 137.61428833007812, 1322.1060791015625)
-    		elseif MyLevel == 800 or MyLevel <= 874 then
-    			NameMon, NameQuest, LevelQuest = "Factory Staff", "Area2Quest", 2;
-    			CFrameQuest = CFrame.new(632.698608, 73.1055908, 918.666321, - 0.0319722369, 8.96074881e-10, - 0.999488771, 1.36326533e-10, 1, 8.92172336e-10, 0.999488771, - 1.07732087e-10, - 0.0319722369)
-    			CFrameMon = CFrame.new(73.07867431640625, 81.86344146728516, - 27.470672607421875)
-    		elseif MyLevel == 875 or MyLevel <= 899 then
-    			NameMon, NameQuest, LevelQuest = "Marine Lieutenant", "MarineQuest3", 1;
-    			CFrameQuest = CFrame.new(- 2440.79639, 71.7140732, - 3216.06812, 0.866007268, 0, 0.500031412, 0, 1, 0, - 0.500031412, 0, 0.866007268)
-    			CFrameMon = CFrame.new(- 2821.372314453125, 75.89727783203125, - 3070.089111328125)
-    		elseif MyLevel == 900 or MyLevel <= 949 then
-    			NameMon, NameQuest, LevelQuest = "Marine Captain", "MarineQuest3", 2;
-    			CFrameQuest = CFrame.new(- 2440.79639, 71.7140732, - 3216.06812, 0.866007268, 0, 0.500031412, 0, 1, 0, - 0.500031412, 0, 0.866007268)
-    			CFrameMon = CFrame.new(- 1861.2310791015625, 80.17658233642578, - 3254.697509765625)
-    		elseif MyLevel == 950 or MyLevel <= 974 then
-    			NameMon, NameQuest, LevelQuest = "Zombie", "ZombieQuest", 1;
-    			CFrameQuest = CFrame.new(- 5497.06152, 47.5923004, - 795.237061, - 0.29242146, 0, - 0.95628953, 0, 1, 0, 0.95628953, 0, - 0.29242146)
-    			CFrameMon = CFrame.new(- 5657.77685546875, 78.96973419189453, - 928.68701171875)
-    		elseif MyLevel == 975 or MyLevel <= 999 then
-    			NameMon, NameQuest, LevelQuest = "Vampire", "ZombieQuest", 2;
-    			CFrameQuest = CFrame.new(- 5497.06152, 47.5923004, - 795.237061, - 0.29242146, 0, - 0.95628953, 0, 1, 0, 0.95628953, 0, - 0.29242146)
-    			CFrameMon = CFrame.new(- 6037.66796875, 32.18463897705078, - 1340.6597900390625)
-    		elseif MyLevel == 1000 or MyLevel <= 1049 then
-    			NameMon, NameQuest, LevelQuest = "Snow Trooper", "SnowMountainQuest", 1;
-    			CFrameQuest = CFrame.new(609.858826, 400.119904, - 5372.25928, - 0.374604106, 0, 0.92718488, 0, 1, 0, - 0.92718488, 0, - 0.374604106)
-    			CFrameMon = CFrame.new(549.1473388671875, 427.3870544433594, - 5563.69873046875)
-    		elseif MyLevel == 1050 or MyLevel <= 1099 then
-    			NameMon, NameQuest, LevelQuest = "Winter Warrior", "SnowMountainQuest", 2;
-    			CFrameQuest = CFrame.new(609.858826, 400.119904, - 5372.25928, - 0.374604106, 0, 0.92718488, 0, 1, 0, - 0.92718488, 0, - 0.374604106)
-    			CFrameMon = CFrame.new(1142.7451171875, 475.6398010253906, - 5199.41650390625)
-    		elseif MyLevel == 1100 or MyLevel <= 1124 then
-    			NameMon, NameQuest, LevelQuest = "Lab Subordinate", "IceSideQuest", 1;
-    			CFrameQuest = CFrame.new(- 6064.06885, 15.2422857, - 4902.97852, 0.453972578, - 0, - 0.891015649, 0, 1, - 0, 0.891015649, 0, 0.453972578)
-    			CFrameMon = CFrame.new(- 5707.4716796875, 15.951709747314453, - 4513.39208984375)
-    		elseif MyLevel == 1125 or MyLevel <= 1174 then
-    			NameMon, NameQuest, LevelQuest = "Horned Warrior", "IceSideQuest", 2;
-    			CFrameQuest = CFrame.new(- 6064.06885, 15.2422857, - 4902.97852, 0.453972578, - 0, - 0.891015649, 0, 1, - 0, 0.891015649, 0, 0.453972578)
-    			CFrameMon = CFrame.new(- 6341.36669921875, 15.951770782470703, - 5723.162109375)
-    		elseif MyLevel == 1175 or MyLevel <= 1199 then
-    			NameMon, NameQuest, LevelQuest = "Magma Ninja", "FireSideQuest", 1;
-    			CFrameQuest = CFrame.new(- 5428.03174, 15.0622921, - 5299.43457, - 0.882952213, 0, 0.469463557, 0, 1, 0, - 0.469463557, 0, - 0.882952213)
-    			CFrameMon = CFrame.new(- 5449.6728515625, 76.65874481201172, - 5808.20068359375)
-    		elseif MyLevel == 1200 or MyLevel <= 1249 then
-    			NameMon, NameQuest, LevelQuest = "Lava Pirate", "FireSideQuest", 2;
-    			CFrameQuest = CFrame.new(- 5428.03174, 15.0622921, - 5299.43457, - 0.882952213, 0, 0.469463557, 0, 1, 0, - 0.469463557, 0, - 0.882952213)
-    			CFrameMon = CFrame.new(- 5213.33154296875, 49.73788070678711, - 4701.451171875)
-    		elseif MyLevel == 1250 or MyLevel <= 1274 then
-    			NameMon, NameQuest, LevelQuest = "Ship Deckhand", "ShipQuest1", 1;
-    			CFrameQuest = CFrame.new(1037.80127, 125.092171, 32911.6016)
-    			CFrameMon = CFrame.new(1212.0111083984375, 150.79205322265625, 33059.24609375)
-    			Entrance=Vector3.new(923.21252441406, 126.9760055542, 32852.83203125)
-    		elseif MyLevel == 1275 or MyLevel <= 1299 then
-    			NameMon, NameQuest, LevelQuest = "Ship Engineer", "ShipQuest1", 2;
-    			CFrameQuest = CFrame.new(1037.80127, 125.092171, 32911.6016)
-    			CFrameMon = CFrame.new(919.4786376953125, 43.54401397705078, 32779.96875)
-    			Entrance=Vector3.new(923.21252441406, 126.9760055542, 32852.83203125)
-    		elseif MyLevel == 1300 or MyLevel <= 1324 then
-    			NameMon, NameQuest, LevelQuest = "Ship Steward", "ShipQuest2", 1;
-    			CFrameQuest = CFrame.new(968.80957, 125.092171, 33244.125)
-    			CFrameMon = CFrame.new(919.4385375976562, 129.55599975585938, 33436.03515625)
-    			Entrance=Vector3.new(923.21252441406, 126.9760055542, 32852.83203125)
-    		elseif MyLevel == 1325 or MyLevel <= 1349 then
-    			NameMon, NameQuest, LevelQuest = "Ship Officer", "ShipQuest2", 2;
-    			CFrameQuest = CFrame.new(968.80957, 125.092171, 33244.125)
-    			CFrameMon = CFrame.new(1036.0179443359375, 181.4390411376953, 33315.7265625)
-    			Entrance=Vector3.new(923.21252441406, 126.9760055542, 32852.83203125)
-    		elseif MyLevel == 1350 or MyLevel <= 1374 then
-    			NameMon, NameQuest, LevelQuest = "Arctic Warrior", "FrostQuest", 1;
-    			CFrameQuest = CFrame.new(5667.6582, 26.7997818, - 6486.08984, - 0.933587909, 0, - 0.358349502, 0, 1, 0, 0.358349502, 0, - 0.933587909)
-    			CFrameMon = CFrame.new(5966.24609375, 62.97002029418945, - 6179.3828125)
-    			Entrance=Vector3.new(- 6508.5581054688, 5000.034996032715, - 132.83953857422)
-    		elseif MyLevel == 1375 or MyLevel <= 1424 then
-    			NameMon, NameQuest, LevelQuest = "Snow Lurker", "FrostQuest", 2;
-    			CFrameQuest = CFrame.new(5667.6582, 26.7997818, - 6486.08984, - 0.933587909, 0, - 0.358349502, 0, 1, 0, 0.358349502, 0, - 0.933587909)
-    			CFrameMon = CFrame.new(5407.07373046875, 69.19437408447266, - 6880.88037109375)
-    		elseif MyLevel == 1425 or MyLevel <= 1449 then
-    			NameMon, NameQuest, LevelQuest = "Sea Soldier", "ForgottenQuest", 1;
-    			CFrameQuest = CFrame.new(- 3054.44458, 235.544281, - 10142.8193, 0.990270376, - 0, - 0.13915664, 0, 1, - 0, 0.13915664, 0, 0.990270376)
-    			CFrameMon = CFrame.new(- 3028.2236328125, 64.67451477050781, - 9775.4267578125)
-    		elseif MyLevel >= 1450 then
-    			NameMon, NameQuest, LevelQuest = "Water Fighter", "ForgottenQuest", 2;
-    			CFrameQuest = CFrame.new(- 3054.44458, 235.544281, - 10142.8193, 0.990270376, - 0, - 0.13915664, 0, 1, - 0, 0.13915664, 0, 0.990270376)
-    			CFrameMon = CFrame.new(- 3352.9013671875, 285.01556396484375, - 10534.841796875)
-    		end
-    	elseif L_25_ then
-    		if MyLevel == 1500 or MyLevel <= 1524 then
-    			NameMon, NameQuest, LevelQuest = "Pistol Millionaire", "PiratePortQuest", 1;
-    			CFrameQuest = CFrame.new(- 290.074677, 42.9034653, 5581.58984, 0.965929627, - 0, - 0.258804798, 0, 1, - 0, 0.258804798, 0, 0.965929627)
-    			CFrameMon = CFrame.new(- 245.9963836669922, 47.30615234375, 5584.1005859375)
-    		elseif MyLevel == 1525 or MyLevel <= 1574 then
-    			NameMon, NameQuest, LevelQuest = "Pistol Billionaire", "PiratePortQuest", 2;
-    			CFrameQuest = CFrame.new(- 290.074677, 42.9034653, 5581.58984, 0.965929627, - 0, - 0.258804798, 0, 1, - 0, 0.258804798, 0, 0.965929627)
-    			CFrameMon = CFrame.new(- 187.3301544189453, 86.23987579345703, 6013.513671875)
-    		elseif MyLevel == 1575 or MyLevel <= 1599 then
-    			NameMon, NameQuest, LevelQuest = "Dragon Crew Warrior", "AmazonQuest", 1;
-    			CFrameQuest = CFrame.new(6736.32958984375, 127.4482192993164, - 712.3320922851562)
-    			CFrameMon = CFrame.new(7014.84765625, 196.3662567138672, - 1024.2913818359375)
-    		elseif MyLevel == 1600 or MyLevel <= 1624 then
-    			NameMon, NameQuest, LevelQuest = "Dragon Crew Archer", "AmazonQuest", 2;
-    			CFrameQuest = CFrame.new(6736.32958984375, 127.4482192993164, - 712.3320922851562)
-    			CFrameMon = CFrame.new(6792.60302734375, 535.4273681640625, 454.4717102050781)
-    		elseif MyLevel == 1625 or MyLevel <= 1649 then
-    			NameMon, NameQuest, LevelQuest = "Hydra Enforcer", "AmazonQuest2", 1;
-    			CFrameQuest = CFrame.new(5210.87353515625, 1004.1356811523438, 755.8411254882812)
-    			CFrameMon = CFrame.new(4704.02099609375, 1043.867431640625, 679.615966796875)
-    		elseif MyLevel == 1650 or MyLevel <= 1699 then
-    			NameMon, NameQuest, LevelQuest = "Venomous Assailant", "AmazonQuest2", 2;
-    			CFrameQuest = CFrame.new(5210.87353515625, 1004.1356811523438, 755.8411254882812)
-    			CFrameMon = CFrame.new(4731.27197265625, 1090.177978515625, 1078.1712646484375)
-    		elseif MyLevel == 1700 or MyLevel <= 1724 then
-    			NameMon, NameQuest, LevelQuest = "Marine Commodore", "MarineTreeIsland", 1;
-    			CFrameQuest = CFrame.new(2180.54126, 27.8156815, - 6741.5498, - 0.965929747, 0, 0.258804798, 0, 1, 0, - 0.258804798, 0, - 0.965929747)
-    			CFrameMon = CFrame.new(2286.0078125, 73.13391876220703, - 7159.80908203125)
-    		elseif MyLevel == 1725 or MyLevel <= 1774 then
-    			NameMon, NameQuest, LevelQuest = "Marine Rear Admiral", "MarineTreeIsland", 2;
-    			CFrameQuest = CFrame.new(2179.98828125, 28.731239318848, - 6740.0551757813)
-    			CFrameMon = CFrame.new(3656.773681640625, 160.52406311035156, - 7001.5986328125)
-    		elseif MyLevel == 1775 or MyLevel <= 1799 then
-    			NameMon, NameQuest, LevelQuest = "Fishman Raider", "DeepForestIsland3", 1;
-    			CFrameQuest = CFrame.new(- 10581.6563, 330.872955, - 8761.18652, - 0.882952213, 0, 0.469463557, 0, 1, 0, - 0.469463557, 0, - 0.882952213)
-    			CFrameMon = CFrame.new(- 10407.5263671875, 331.76263427734375, - 8368.5166015625)
-    		elseif MyLevel == 1800 or MyLevel <= 1824 then
-    			NameMon, NameQuest, LevelQuest = "Fishman Captain", "DeepForestIsland3", 2;
-    			CFrameQuest = CFrame.new(- 10581.6563, 330.872955, - 8761.18652, - 0.882952213, 0, 0.469463557, 0, 1, 0, - 0.469463557, 0, - 0.882952213)
-    			CFrameMon = CFrame.new(- 10994.701171875, 352.38140869140625, - 9002.1103515625)
-    		elseif MyLevel == 1825 or MyLevel <= 1849 then
-    			NameMon, NameQuest, LevelQuest = "Forest Pirate", "DeepForestIsland", 1;
-    			CFrameQuest = CFrame.new(- 13234.04, 331.488495, - 7625.40137, 0.707134247, - 0, - 0.707079291, 0, 1, - 0, 0.707079291, 0, 0.707134247)
-    			CFrameMon = CFrame.new(- 13274.478515625, 332.3781433105469, - 7769.58056640625)
-    		elseif MyLevel == 1850 or MyLevel <= 1899 then
-    			NameMon, NameQuest, LevelQuest = "Mythological Pirate", "DeepForestIsland", 2;
-    			CFrameQuest = CFrame.new(- 13234.04, 331.488495, - 7625.40137, 0.707134247, - 0, - 0.707079291, 0, 1, - 0, 0.707079291, 0, 0.707134247)
-    			CFrameMon = CFrame.new(- 13680.607421875, 501.08154296875, - 6991.189453125)
-    		elseif MyLevel == 1900 or MyLevel <= 1924 then
-    			NameMon, NameQuest, LevelQuest = "Jungle Pirate", "DeepForestIsland2", 1;
-    			CFrameQuest = CFrame.new(- 12680.3818, 389.971039, - 9902.01953, - 0.0871315002, 0, 0.996196866, 0, 1, 0, - 0.996196866, 0, - 0.0871315002)
-    			CFrameMon = CFrame.new(- 12256.16015625, 331.73828125, - 10485.8369140625)
-    		elseif MyLevel == 1925 or MyLevel <= 1974 then
-    			NameMon, NameQuest, LevelQuest = "Musketeer Pirate", "DeepForestIsland2", 2;
-    			CFrameQuest = CFrame.new(- 12680.3818, 389.971039, - 9902.01953, - 0.0871315002, 0, 0.996196866, 0, 1, 0, - 0.996196866, 0, - 0.0871315002)
-    			CFrameMon = CFrame.new(- 13457.904296875, 391.545654296875, - 9859.177734375)
-    		elseif MyLevel == 1975 or MyLevel <= 1999 then
-    			NameMon, NameQuest, LevelQuest = "Reborn Skeleton", "HauntedQuest1", 1;
-    			CFrameQuest = CFrame.new(- 9479.2168, 141.215088, 5566.09277, 0, 0, 1, 0, 1, - 0, - 1, 0, 0)
-    			CFrameMon = CFrame.new(- 8763.7236328125, 165.72299194335938, 6159.86181640625)
-    		elseif MyLevel == 2000 or MyLevel <= 2024 then
-    			NameMon, NameQuest, LevelQuest = "Living Zombie", "HauntedQuest1", 2;
-    			CFrameQuest = CFrame.new(- 9479.2168, 141.215088, 5566.09277, 0, 0, 1, 0, 1, - 0, - 1, 0, 0)
-    			CFrameMon = CFrame.new(- 10144.1318359375, 138.62667846679688, 5838.0888671875)
-    		elseif MyLevel == 2025 or MyLevel <= 2049 then
-    			NameMon, NameQuest, LevelQuest = "Demonic Soul", "HauntedQuest2", 1;
-    			CFrameQuest = CFrame.new(- 9516.99316, 172.017181, 6078.46533, 0, 0, - 1, 0, 1, 0, 1, 0, 0)
-    			CFrameMon = CFrame.new(- 9505.8720703125, 172.10482788085938, 6158.9931640625)
-    		elseif MyLevel == 2050 or MyLevel <= 2074 then
-    			NameMon, NameQuest, LevelQuest = "Posessed Mummy", "HauntedQuest2", 2;
-    			CFrameQuest = CFrame.new(- 9516.99316, 172.017181, 6078.46533, 0, 0, - 1, 0, 1, 0, 1, 0, 0)
-    			CFrameMon = CFrame.new(- 9582.0224609375, 6.251527309417725, 6205.478515625)
-    		elseif MyLevel == 2075 or MyLevel <= 2099 then
-    			NameMon, NameQuest, LevelQuest = "Peanut Scout", "NutsIslandQuest", 1;
-    			CFrameQuest = CFrame.new(- 2104.3908691406, 38.104167938232, - 10194.21875, 0, 0, - 1, 0, 1, 0, 1, 0, 0)
-    			CFrameMon = CFrame.new(- 2143.241943359375, 47.72198486328125, - 10029.9951171875)
-    		elseif MyLevel == 2100 or MyLevel <= 2124 then
-    			NameMon, NameQuest, LevelQuest = "Peanut President", "NutsIslandQuest", 2;
-    			CFrameQuest = CFrame.new(- 2104.3908691406, 38.104167938232, - 10194.21875, 0, 0, - 1, 0, 1, 0, 1, 0, 0)
-    			CFrameMon = CFrame.new(- 1859.35400390625, 38.10316848754883, - 10422.4296875)
-    		elseif MyLevel == 2125 or MyLevel <= 2149 then
-    			NameMon, NameQuest, LevelQuest = "Ice Cream Chef", "IceCreamIslandQuest", 1;
-    			CFrameQuest = CFrame.new(- 820.64825439453, 65.819526672363, - 10965.795898438, 0, 0, - 1, 0, 1, 0, 1, 0, 0)
-    			CFrameMon = CFrame.new(- 872.24658203125, 65.81957244873047, - 10919.95703125)
-    		elseif MyLevel == 2150 or MyLevel <= 2199 then
-    			NameMon, NameQuest, LevelQuest = "Ice Cream Commander", "IceCreamIslandQuest", 2;
-    			CFrameQuest = CFrame.new(- 820.64825439453, 65.819526672363, - 10965.795898438, 0, 0, - 1, 0, 1, 0, 1, 0, 0)
-    			CFrameMon = CFrame.new(- 558.06103515625, 112.04895782470703, - 11290.7744140625)
-    		elseif MyLevel == 2200 or MyLevel <= 2224 then
-    			NameMon, NameQuest, LevelQuest = "Cookie Crafter", "CakeQuest1", 1;
-    			CFrameQuest = CFrame.new(- 2021.32007, 37.7982254, - 12028.7295, 0.957576931, - 8.80302053e-08, 0.288177818, 6.9301187e-08, 1, 7.51931211e-08, - 0.288177818, - 5.2032135e-08, 0.957576931)
-    			CFrameMon = CFrame.new(- 2374.13671875, 37.79826354980469, - 12125.30859375)
-    		elseif MyLevel == 2225 or MyLevel <= 2249 then
-    			NameMon, NameQuest, LevelQuest = "Cake Guard", "CakeQuest1", 2;
-    			CFrameQuest = CFrame.new(- 2021.32007, 37.7982254, - 12028.7295, 0.957576931, - 8.80302053e-08, 0.288177818, 6.9301187e-08, 1, 7.51931211e-08, - 0.288177818, - 5.2032135e-08, 0.957576931)
-    			CFrameMon = CFrame.new(- 1598.3070068359375, 43.773197174072266, - 12244.5810546875)
-    		elseif MyLevel == 2250 or MyLevel <= 2274 then
-    			NameMon, NameQuest, LevelQuest = "Baking Staff", "CakeQuest2", 1;
-    			CFrameQuest = CFrame.new(- 1927.91602, 37.7981339, - 12842.5391, - 0.96804446, 4.22142143e-08, 0.250778586, 4.74911062e-08, 1, 1.49904711e-08, - 0.250778586, 2.64211941e-08, - 0.96804446)
-    			CFrameMon = CFrame.new(- 1887.8099365234375, 77.6185073852539, - 12998.3505859375)
-    		elseif MyLevel == 2275 or MyLevel <= 2299 then
-    			NameMon, NameQuest, LevelQuest = "Head Baker", "CakeQuest2", 2;
-    			CFrameQuest = CFrame.new(- 1927.91602, 37.7981339, - 12842.5391, - 0.96804446, 4.22142143e-08, 0.250778586, 4.74911062e-08, 1, 1.49904711e-08, - 0.250778586, 2.64211941e-08, - 0.96804446)
-    			CFrameMon = CFrame.new(- 2216.188232421875, 82.884521484375, - 12869.2939453125)
-    		elseif MyLevel == 2300 or MyLevel <= 2324 then
-    			NameMon, NameQuest, LevelQuest = "Cocoa Warrior", "ChocQuest1", 1;
-    			CFrameQuest = CFrame.new(233.22836303710938, 29.876001358032227, - 12201.2333984375)
-    			CFrameMon = CFrame.new(- 21.55328369140625, 80.57499694824219, - 12352.3876953125)
-    		elseif MyLevel == 2325 or MyLevel <= 2349 then
-    			NameMon, NameQuest, LevelQuest = "Chocolate Bar Battler", "ChocQuest1", 2;
-    			CFrameQuest = CFrame.new(233.22836303710938, 29.876001358032227, - 12201.2333984375)
-    			CFrameMon = CFrame.new(582.590576171875, 77.18809509277344, - 12463.162109375)
-    		elseif MyLevel == 2350 or MyLevel <= 2374 then
-    			NameMon, NameQuest, LevelQuest = "Sweet Thief", "ChocQuest2", 1;
-    			CFrameQuest = CFrame.new(150.5066375732422, 30.693693161010742, - 12774.5029296875)
-    			CFrameMon = CFrame.new(165.1884765625, 76.05885314941406, - 12600.8369140625)
-    		elseif MyLevel == 2375 or MyLevel <= 2399 then
-    			NameMon, NameQuest, LevelQuest = "Candy Rebel", "ChocQuest2", 2;
-    			CFrameQuest = CFrame.new(150.5066375732422, 30.693693161010742, - 12774.5029296875)
-    			CFrameMon = CFrame.new(134.86563110351562, 77.2476806640625, - 12876.5478515625)
-    		elseif MyLevel == 2400 or MyLevel <= 2449 then
-    			NameMon, NameQuest, LevelQuest = "Candy Pirate", "CandyQuest1", 1;
-    			CFrameQuest = CFrame.new(- 1150.0400390625, 20.378934860229492, - 14446.3349609375)
-    			CFrameMon = CFrame.new(- 1310.5003662109375, 26.016523361206055, - 14562.404296875)
-    		elseif MyLevel == 2425 or MyLevel <= 2450 then
-    			NameMon, NameQuest, LevelQuest = "Snow Demon", "CandyQuest1", 2;
-    			CFrameQuest = CFrame.new(- 1150.0400390625, 20.378934860229492, - 14446.3349609375)
-    			CFrameMon = CFrame.new(- 750.1473388671875, 15.250883102416992, - 14343.2578125)
-    		elseif MyLevel == 2450 or MyLevel <= 2475 then
-    			NameMon, NameQuest, LevelQuest = "Isle Outlaw", "TikiQuest1", 1;
-    			CFrameQuest = CFrame.new(- 16547.45703125, 56.00029754638672, - 174.1670684814453)
-    			CFrameMon = CFrame.new(- 16303.1435546875, 188.16168212890625, - 268.9233703613281)
-    		elseif MyLevel == 2475 or MyLevel <= 2525 then
-    			NameMon, NameQuest, LevelQuest = "Island Boy", "TikiQuest1", 2;
-    			CFrameQuest = CFrame.new(- 16547.45703125, 56.00029754638672, - 174.1670684814453)
-    			CFrameMon = CFrame.new(- 16303.1435546875, 188.16168212890625, - 268.9233703613281)
-    		elseif MyLevel == 2525 or MyLevel <= 2550 then
-    			NameMon, NameQuest, LevelQuest = "Isle Champion", "TikiQuest2", 2;
-    			CFrameQuest = CFrame.new(- 16523.0996, 55.9234467, 1049.65784, - 0.418787986, - 0.0126074236, 0.907996595, - 0.0160101596, 0.99985069, 0.00649857335, - 0.907942891, - 0.0118156485, - 0.418927342)
-    			CFrameMon = CFrame.new(- 16748.4609375, 94.38502502441406, 1129.7178955078125)
-    		elseif MyLevel >= 2551 and MyLevel <= 2600 then
-    			NameMon, NameQuest, LevelQuest = "Serpent Hunter", "TikiQuest3", 1;
-    			CFrameQuest = CFrame.new(- 16665.462890625, 105.3105697631836, 1577.8289794921875)
-    			CFrameMon = CFrame.new(- 16959.2734375, 110.61740112304688, 1669.6007080078125)
-    		end
-    	end
-        if not NameMon or not CFrameQuest or not CFrameMon then return nil end
-        return {Mob=NameMon, Name=NameQuest, Tier=LevelQuest, Quest=CFrameQuest, Spawn=CFrameMon, Entrance=Entrance}
-    end
-    
-    local function bossForName(selected)
-        local MsBoss, NameBoss, CFrameBoss, NameQuestBoss, LevelQuestBoss, CFrameQuestBoss
-    	if selected == "Saber Expert" then
-    		MsBoss = "Saber Expert"
-    		NameBoss = "Saber Expert"
-    		CFrameBoss = CFrame.new(- 1458.89502, 29.8870335, - 50.633564, 0.858821094, 1.13848939e-08, 0.512275636, - 4.85649254e-09, 1, - 1.40823326e-08, - 0.512275636, 9.6063415e-09, 0.858821094)
-    	elseif selected == "The Saw" then
-    		MsBoss = "The Saw"
-    		NameBoss = "The Saw"
-    		CFrameBoss = CFrame.new(- 683.519897, 13.8534927, 1610.87854, - 0.290192783, 6.88365773e-08, 0.956968188, 6.98413629e-08, 1, - 5.07531119e-08, - 0.956968188, 5.21077759e-08, - 0.290192783)
-    	elseif selected == "Greybeard" then
-    		MsBoss = "Greybeard"
-    		NameBoss = "Greybeard"
-    		CFrameBoss = CFrame.new(- 4955.72949, 80.8163834, 4305.82666, - 0.433646321, - 1.03394289e-08, 0.901083171, - 3.0443168e-08, 1, - 3.17633075e-09, - 0.901083171, - 2.88092288e-08, - 0.433646321)
-    	elseif selected == "The Gorilla King" then
-    		MsBoss = "The Gorilla King"
-    		NameBoss = "The Gorilla King"
-    		NameQuestBoss = "JungleQuest"
-    		LevelQuestBoss = 3;
-    		CFrameQuestBoss = CFrame.new(- 1604.12012, 36.8521118, 154.23732, 0.0648873374, - 4.70858913e-06, - 0.997892559, 1.41431883e-07, 1, - 4.70933674e-06, 0.997892559, 1.64442184e-07, 0.0648873374)
-    		CFrameBoss = CFrame.new(- 1223.52808, 6.27936459, - 502.292664, 0.310949147, - 5.66602516e-08, 0.950426519, - 3.37275488e-08, 1, 7.06501808e-08, - 0.950426519, - 5.40241736e-08, 0.310949147)
-    	elseif selected == "Bobby" then
-    		MsBoss = "Bobby"
-    		NameBoss = "Bobby"
-    		NameQuestBoss = "BuggyQuest1"
-    		LevelQuestBoss = 3;
-    		CFrameQuestBoss = CFrame.new(- 1139.59717, 4.75205183, 3825.16211, - 0.959730506, - 7.5857054e-09, 0.280922383, - 4.06310328e-08, 1, - 1.11807175e-07, - 0.280922383, - 1.18718916e-07, - 0.959730506)
-    		CFrameBoss = CFrame.new(- 1147.65173, 32.5966301, 4156.02588, 0.956680477, - 1.77109952e-10, - 0.29113996, 5.16530874e-10, 1, 1.08897802e-09, 0.29113996, - 1.19218679e-09, 0.956680477)
-    	elseif selected == "Yeti" then
-    		MsBoss = "Yeti"
-    		NameBoss = "Yeti"
-    		NameQuestBoss = "SnowQuest"
-    		LevelQuestBoss = 3;
-    		CFrameQuestBoss = CFrame.new(1384.90247, 87.3078308, - 1296.6825, 0.280209213, 2.72035177e-08, - 0.959938943, - 6.75690828e-08, 1, 8.6151708e-09, 0.959938943, 6.24481444e-08, 0.280209213)
-    		CFrameBoss = CFrame.new(1221.7356, 138.046906, - 1488.84082, 0.349343032, - 9.49245944e-08, 0.936994851, 6.29478194e-08, 1, 7.7838429e-08, - 0.936994851, 3.17894653e-08, 0.349343032)
-    	elseif selected == "Mob Leader" then
-    		MsBoss = "Mob Leader"
-    		NameBoss = "Mob Leader"
-    		CFrameBoss = CFrame.new(- 2848.59399, 7.4272871, 5342.44043, - 0.928248107, - 8.7248246e-08, 0.371961564, - 7.61816636e-08, 1, 4.44474857e-08, - 0.371961564, 1.29216433e-08, - 0.92824)
-    	elseif selected == "Vice Admiral" then
-    		MsBoss = "Vice Admiral"
-    		NameBoss = "Vice Admiral"
-    		NameQuestBoss = "MarineQuest2"
-    		LevelQuestBoss = 2;
-    		CFrameQuestBoss = CFrame.new(- 5035.42285, 28.6520386, 4324.50293, - 0.0611100644, - 8.08395768e-08, 0.998130739, - 1.57416586e-08, 1, 8.00271849e-08, - 0.998130739, - 1.08217701e-08, - 0.0611100644)
-    		CFrameBoss = CFrame.new(- 5078.45898, 99.6520691, 4402.1665, - 0.555574954, - 9.88630566e-11, 0.831466436, - 6.35508286e-08, 1, - 4.23449258e-08, - 0.831466436, - 7.63661632e-08, - 0.555574954)
-    	elseif selected == "Warden" then
-    		MsBoss = "Warden"
-    		NameBoss = "Warden"
-    		NameQuestBoss = "ImpelQuest"
-    		LevelQuestBoss = 1;
-    		CFrameQuestBoss = CFrame.new(4851.35059, 5.68744135, 743.251282, - 0.538484037, - 6.68303741e-08, - 0.842635691, 1.38001752e-08, 1, - 8.81300792e-08, 0.842635691, - 5.90851599e-08, - 0.538484037)
-    		CFrameBoss = CFrame.new(5232.5625, 5.26856995, 747.506897, 0.943829298, - 4.5439414e-08, 0.330433697, 3.47818627e-08, 1, 3.81658154e-08, - 0.330433697, - 2.45289105e-08, 0.943829298)
-    	elseif selected == "Chief Warden" then
-    		MsBoss = "Chief Warden"
-    		NameBoss = "Chief Warden"
-    		NameQuestBoss = "ImpelQuest"
-    		LevelQuestBoss = 2;
-    		CFrameQuestBoss = CFrame.new(4851.35059, 5.68744135, 743.251282, - 0.538484037, - 6.68303741e-08, - 0.842635691, 1.38001752e-08, 1, - 8.81300792e-08, 0.842635691, - 5.90851599e-08, - 0.538484037)
-    		CFrameBoss = CFrame.new(5232.5625, 5.26856995, 747.506897, 0.943829298, - 4.5439414e-08, 0.330433697, 3.47818627e-08, 1, 3.81658154e-08, - 0.330433697, - 2.45289105e-08, 0.943829298)
-    	elseif selected == "Swan" then
-    		MsBoss = "Swan"
-    		NameBoss = "Swan"
-    		NameQuestBoss = "ImpelQuest"
-    		LevelQuestBoss = 3;
-    		CFrameQuestBoss = CFrame.new(4851.35059, 5.68744135, 743.251282, - 0.538484037, - 6.68303741e-08, - 0.842635691, 1.38001752e-08, 1, - 8.81300792e-08, 0.842635691, - 5.90851599e-08, - 0.538484037)
-    		CFrameBoss = CFrame.new(5232.5625, 5.26856995, 747.506897, 0.943829298, - 4.5439414e-08, 0.330433697, 3.47818627e-08, 1, 3.81658154e-08, - 0.330433697, - 2.45289105e-08, 0.943829298)
-    	elseif selected == "Magma Admiral" then
-    		MsBoss = "Magma Admiral"
-    		NameBoss = "Magma Admiral"
-    		NameQuestBoss = "MagmaQuest"
-    		LevelQuestBoss = 3;
-    		CFrameQuestBoss = CFrame.new(- 5317.07666, 12.2721891, 8517.41699, 0.51175487, - 2.65508806e-08, - 0.859131515, - 3.91131572e-08, 1, - 5.42026761e-08, 0.859131515, 6.13418294e-08, 0.51175487)
-    		CFrameBoss = CFrame.new(- 5530.12646, 22.8769703, 8859.91309, 0.857838571, 2.23414389e-08, 0.513919294, 1.53689133e-08, 1, - 6.91265853e-08, - 0.513919294, 6.71978384e-08, 0.857838571)
-    	elseif selected == "Fishman Lord" then
-    		MsBoss = "Fishman Lord"
-    		NameBoss = "Fishman Lord"
-    		NameQuestBoss = "FishmanQuest"
-    		LevelQuestBoss = 3;
-    		CFrameQuestBoss = CFrame.new(61123.0859, 18.5066795, 1570.18018, 0.927145958, 1.0624845e-07, 0.374700129, - 6.98219367e-08, 1, - 1.10790765e-07, - 0.374700129, 7.65569368e-08, 0.927145958)
-    		CFrameBoss = CFrame.new(61351.7773, 31.0306778, 1113.31409, 0.999974668, 0, - 0.00714713801, 0, 1.00000012, 0, 0.00714714266, 0, 0.999974549)
-    	elseif selected == "Wysper" then
-    		MsBoss = "Wysper"
-    		NameBoss = "Wysper"
-    		NameQuestBoss = "SkyExp1Quest"
-    		LevelQuestBoss = 3;
-    		CFrameQuestBoss = CFrame.new(- 7862.94629, 5545.52832, - 379.833954, 0.462944925, 1.45838088e-08, - 0.886386991, 1.0534996e-08, 1, 2.19553424e-08, 0.886386991, - 1.95022007e-08, 0.462944925)
-    		CFrameBoss = CFrame.new(- 7925.48389, 5550.76074, - 636.178345, 0.716468513, - 1.22915289e-09, 0.697619379, 3.37381434e-09, 1, - 1.70304748e-09, - 0.697619379, 3.57381835e-09, 0.716468513)
-    	elseif selected == "Thunder God" then
-    		MsBoss = "Thunder God"
-    		NameBoss = "Thunder God"
-    		NameQuestBoss = "SkyExp2Quest"
-    		LevelQuestBoss = 3;
-    		CFrameQuestBoss = CFrame.new(- 7902.78613, 5635.99902, - 1411.98706, - 0.0361216255, - 1.16895912e-07, 0.999347389, 1.44533963e-09, 1, 1.17024491e-07, - 0.999347389, 5.6715117e-09, - 0.0361216255)
-    		CFrameBoss = CFrame.new(- 7917.53613, 5616.61377, - 2277.78564, 0.965189934, 4.80563429e-08, - 0.261550069, - 6.73089886e-08, 1, - 6.46515304e-08, 0.261550069, 8.00056768e-08, 0.965189934)
-    	elseif selected == "Cyborg" then
-    		MsBoss = "Cyborg"
-    		NameBoss = "Cyborg"
-    		NameQuestBoss = "FountainQuest"
-    		LevelQuestBoss = 3;
-    		CFrameQuestBoss = CFrame.new(5253.54834, 38.5361786, 4050.45166, - 0.0112687312, - 9.93677887e-08, - 0.999936521, 2.55291371e-10, 1, - 9.93769547e-08, 0.999936521, - 1.37512213e-09, - 0.0112687312)
-    		CFrameBoss = CFrame.new(6041.82813, 52.7112198, 3907.45142, - 0.563162148, 1.73805248e-09, - 0.826346457, - 5.94632716e-08, 1, 4.26280238e-08, 0.826346457, 7.31437524e-08, - 0.563162148)
-    	elseif selected == "Diamond" then
-    		MsBoss = "Diamond"
-    		NameBoss = "Diamond"
-    		NameQuestBoss = "Area1Quest"
-    		LevelQuestBoss = 3;
-    		CFrameQuestBoss = CFrame.new(- 424.080078, 73.0055847, 1836.91589, 0.253544956, - 1.42165932e-08, 0.967323601, - 6.00147771e-08, 1, 3.04272909e-08, - 0.967323601, - 6.5768397e-08, 0.253544956)
-    		CFrameBoss = CFrame.new(- 1736.26587, 198.627731, - 236.412857, - 0.997808516, 0, - 0.0661673471, 0, 1, 0, 0.0661673471, 0, - 0.997808516)
-    	elseif selected == "Jeremy" then
-    		MsBoss = "Jeremy"
-    		NameBoss = "Jeremy"
-    		NameQuestBoss = "Area2Quest"
-    		LevelQuestBoss = 3;
-    		CFrameQuestBoss = CFrame.new(632.698608, 73.1055908, 918.666321, - 0.0319722369, 8.96074881e-10, - 0.999488771, 1.36326533e-10, 1, 8.92172336e-10, 0.999488771, - 1.07732087e-10, - 0.0319722369)
-    		CFrameBoss = CFrame.new(2203.76953, 448.966034, 752.731079, - 0.0217453763, 0, - 0.999763548, 0, 1, 0, 0.999763548, 0, - 0.0217453763)
-    	elseif selected == "Fajita" then
-    		MsBoss = "Fajita"
-    		NameBoss = "Fajita"
-    		NameQuestBoss = "MarineQuest3"
-    		LevelQuestBoss = 3;
-    		CFrameQuestBoss = CFrame.new(- 2442.65015, 73.0511475, - 3219.11523, - 0.873540044, 4.2329841e-08, - 0.486752301, 5.64383384e-08, 1, - 1.43220786e-08, 0.486752301, - 3.99823996e-08, - 0.873540044)
-    		CFrameBoss = CFrame.new(- 2297.40332, 115.449463, - 3946.53833, 0.961227536, - 1.46645796e-09, - 0.275756449, - 2.3212845e-09, 1, - 1.34094433e-08, 0.275756449, 1.35296352e-08, 0.961227536)
-    	elseif selected == "Don Swan" then
-    		MsBoss = "Don Swan"
-    		NameBoss = "Don Swan"
-    		CFrameBoss = CFrame.new(2288.802, 15.1870775, 863.034607, 0.99974072, - 8.41247214e-08, - 0.0227668174, 8.4774733e-08, 1, 2.75850098e-08, 0.0227668174, - 2.95079072e-08, 0.99974072)
-    	elseif selected == "Smoke Admiral" then
-    		MsBoss = "Smoke Admiral"
-    		NameBoss = "Smoke Admiral"
-    		NameQuestBoss = "IceSideQuest"
-    		LevelQuestBoss = 3;
-    		CFrameQuestBoss = CFrame.new(- 6059.96191, 15.9868021, - 4904.7373, - 0.444992423, - 3.0874483e-09, 0.895534337, - 3.64098796e-08, 1, - 1.4644522e-08, - 0.895534337, - 3.91229982e-08, - 0.444992423)
-    		CFrameBoss = CFrame.new(- 5115.72754, 23.7664986, - 5338.2207, 0.251453817, 1.48345061e-08, - 0.967869282, 4.02796978e-08, 1, 2.57916977e-08, 0.967869282, - 4.54708946e-08, 0.251453817)
-    	elseif selected == "Cursed Captain" then
-    		MsBoss = "Cursed Captain"
-    		NameBoss = "Cursed Captain"
-    		CFrameBoss = CFrame.new(916.928589, 181.092773, 33422, - 0.999505103, 9.26310495e-09, 0.0314563364, 8.42916226e-09, 1, - 2.6643713e-08, - 0.0314563364, - 2.63653774e-08, - 0.999505103)
-    	elseif selected == "Darkbeard" then
-    		MsBoss = "Darkbeard"
-    		NameBoss = "Darkbeard"
-    		CFrameBoss = CFrame.new(3876.00366, 24.6882591, - 3820.21777, - 0.976951957, 4.97356325e-08, 0.213458836, 4.57335361e-08, 1, - 2.36868622e-08, - 0.213458836, - 1.33787044e-08, - 0.976951957)
-    	elseif selected == "Order" then
-    		MsBoss = "Order"
-    		NameBoss = "Order"
-    		CFrameBoss = CFrame.new(- 6221.15039, 16.2351036, - 5045.23584, - 0.380726993, 7.41463495e-08, 0.924687505, 5.85604774e-08, 1, - 5.60738549e-08, - 0.924687505, 3.28013137e-08, - 0.380726993)
-    	elseif selected == "Awakened Ice Admiral" then
-    		MsBoss = "Awakened Ice Admiral"
-    		NameBoss = "Awakened Ice Admiral"
-    		NameQuestBoss = "FrostQuest"
-    		LevelQuestBoss = 3;
-    		CFrameQuestBoss = CFrame.new(5669.33203, 28.2118053, - 6481.55908, 0.921275556, - 1.25320829e-08, 0.388910472, 4.72230788e-08, 1, - 7.96414241e-08, - 0.388910472, 9.17372489e-08, 0.921275556)
-    		CFrameBoss = CFrame.new(6407.33936, 340.223785, - 6892.521, 0.49051559, - 5.25310213e-08, - 0.871432424, - 2.76146022e-08, 1, - 7.58250565e-08, 0.871432424, 6.12576301e-08, 0.49051559)
-    	elseif selected == "Tide Keeper" then
-    		MsBoss = "Tide Keeper"
-    		NameBoss = "Tide Keeper"
-    		NameQuestBoss = "ForgottenQuest"
-    		LevelQuestBoss = 3;
-    		CFrameQuestBoss = CFrame.new(- 3053.89648, 236.881363, - 10148.2324, - 0.985987961, - 3.58504737e-09, 0.16681771, - 3.07832915e-09, 1, 3.29612559e-09, - 0.16681771, 2.73641976e-09, - 0.985987961)
-    		CFrameBoss = CFrame.new(- 3570.18652, 123.328949, - 11555.9072, 0.465199202, - 1.3857326e-08, 0.885206044, 4.0332897e-09, 1, 1.35347511e-08, - 0.885206044, - 2.72606271e-09, 0.465199202)
-    	elseif selected == "Stone" then
-    		MsBoss = "Stone"
-    		NameBoss = "Stone"
-    		NameQuestBoss = "PiratePortQuest"
-    		LevelQuestBoss = 3;
-    		CFrameQuestBoss = CFrame.new(- 290, 44, 5577)
-    		CFrameBoss = CFrame.new(- 1085, 40, 6779)
-    	elseif selected == "Hydra Leader" then
-    		MsBoss = "Hydra Leader"
-    		NameBoss = "Hydra Leader"
-    		NameQuestBoss = "AmazonQuest2"
-    		LevelQuestBoss = 3;
-    		CFrameQuestBoss = CFrame.new(5210.87353515625, 1004.1356811523438, 755.8411254882812)
-    		CFrameBoss = CFrame.new(5942.8154296875, 1019.0787353515625, - 116.86933135986328)
-    	elseif selected == "Kilo Admiral" then
-    		MsBoss = "Kilo Admiral"
-    		NameBoss = "Kilo Admiral"
-    		NameQuestBoss = "MarineTreeIsland"
-    		LevelQuestBoss = 3;
-    		CFrameQuestBoss = CFrame.new(2178, 29, - 6737)
-    		CFrameBoss = CFrame.new(2846, 433, - 7100)
-    	elseif selected == "Captain Elephant" then
-    		MsBoss = "Captain Elephant"
-    		NameBoss = "Captain Elephant"
-    		NameQuestBoss = "DeepForestIsland"
-    		LevelQuestBoss = 3;
-    		CFrameQuestBoss = CFrame.new(- 13232, 333, - 7631)
-    		CFrameBoss = CFrame.new(- 13221, 325, - 8405)
-    	elseif selected == "Beautiful Pirate" then
-    		MsBoss = "Beautiful Pirate"
-    		NameBoss = "Beautiful Pirate"
-    		NameQuestBoss = "DeepForestIsland2"
-    		LevelQuestBoss = 3;
-    		CFrameQuestBoss = CFrame.new(- 12686, 391, - 9902)
-    		CFrameBoss = CFrame.new(5182, 23, - 20)
-    	elseif selected == "Cake Queen" then
-    		MsBoss = "Cake Queen"
-    		NameBoss = "Cake Queen"
-    		NameQuestBoss = "IceCreamIslandQuest"
-    		LevelQuestBoss = 3;
-    		CFrameQuestBoss = CFrame.new(- 716, 382, - 11010)
-    		CFrameBoss = CFrame.new(- 821, 66, - 10965)
-    	elseif selected == "rip_indra True Form" then
-    		MsBoss = "rip_indra True Form"
-    		NameBoss = "rip_indra True Form"
-    		CFrameBoss = CFrame.new(- 5359, 424, - 2735)
-    	elseif selected == "Longma" then
-    		MsBoss = "Longma"
-    		NameBoss = "Longma"
-    		CFrameBoss = CFrame.new(- 10248.3936, 353.79129, - 9306.34473)
-    	elseif selected == "Soul Reaper" then
-    		MsBoss = "Soul Reaper"
-    		NameBoss = "Soul Reaper"
-    		CFrameBoss = CFrame.new(- 9515.62109, 315.925537, 6691.12012)
-    	end
-        if not CFrameBoss then return nil end
-        return {Mob=MsBoss or NameBoss, Name=NameQuestBoss, Tier=LevelQuestBoss, Quest=CFrameQuestBoss, Spawn=CFrameBoss}
-    end
-    
-    local function materialForName(selected)
-        local MMon, MPos
-    	if selected == "Radioactive Material" then
-    		MMon = "Factory Staff"
-    		MPos = CFrame.new(- 507.7895202636719, 72.99479675292969, - 126.45632934570312)
-    	elseif selected == "Mystic Droplet" then
-    		MMon = "Water Fighter"
-    		MPos = CFrame.new(- 3214.218017578125, 298.69952392578125, - 10543.685546875)
-    	elseif selected == "Magma Ore" then
-    		if sourcePlaceId() == 2753915549 then
-    			MMon = "Military Spy"
-    			MPos = CFrame.new(- 5850.2802734375, 77.28675079345703, 8848.6748046875)
-    		elseif sourcePlaceId() == 4442272183 then
-    			MMon = "Lava Pirate"
-    			MPos = CFrame.new(- 5234.60595703125, 51.953372955322266, - 4732.27880859375)
-    		end
-    	elseif selected == "Angel Wings" then
-    		MMon = "Royal Soldier"
-    		MPos = CFrame.new(- 7827.15625, 5606.912109375, - 1705.5833740234375)
-    	elseif selected == "Leather" then
-    		if sourcePlaceId() == 2753915549 then
-    			MMon = "Pirate"
-    			MPos = CFrame.new(- 1211.8792724609375, 4.787090301513672, 3916.83056640625)
-    		elseif sourcePlaceId() == 4442272183 then
-    			MMon = "Marine Captain"
-    			MPos = CFrame.new(- 2010.5059814453125, 73.00115966796875, - 3326.620849609375)
-    		elseif sourcePlaceId() == 7449423635 then
-    			MMon = "Jungle Pirate"
-    			MPos = CFrame.new(- 11975.78515625, 331.7734069824219, - 10620.0302734375)
-    		end
-    	elseif selected == "Scrap Metal" then
-    		if sourcePlaceId() == 2753915549 then
-    			MMon = "Brute"
-    			MPos = CFrame.new(- 1132.4202880859375, 14.844913482666016, 4293.30517578125)
-    		elseif sourcePlaceId() == 4442272183 then
-    			MMon = "Mercenary"
-    			MPos = CFrame.new(- 972.307373046875, 73.04473876953125, 1419.2901611328125)
-    		elseif sourcePlaceId() == 7449423635 then
-    			MMon = "Pirate Millionaire"
-    			MPos = CFrame.new(- 289.6311950683594, 43.8282470703125, 5583.66357421875)
-    		end
-    	elseif selected == "Demonic Wisp" then
-    		MMon = "Demonic Soul"
-    		MPos = CFrame.new(- 9503.388671875, 172.139892578125, 6143.0634765625)
-    	elseif selected == "Vampire Fang" then
-    		MMon = "Vampire"
-    		MPos = CFrame.new(- 5999.20458984375, 6.437741279602051, - 1290.059326171875)
-    	elseif selected == "Conjured Cocoa" then
-    		MMon = "Chocolate Bar Battler"
-    		MPos = CFrame.new(747.428466796875, 237.9543914794922, - 12700.2041015625)
-    	elseif selected == "Dragon Scale" then
-    		MMon = "Dragon Crew Warrior"
-    		MPos = CFrame.new(5824.06982421875, 51.38640213012695, - 1106.694580078125)
-    	elseif selected == "Gunpowder" then
-    		MMon = "Pistol Billionaire"
-    		MPos = CFrame.new(- 379.6134338378906, 73.84449768066406, 5928.5263671875)
-    	elseif selected == "Fish Tail" then
-    		MMon = "Fishman Captain"
-    		MPos = CFrame.new(- 10961.0126953125, 331.7977600097656, - 8914.29296875)
-    	elseif selected == "Mini Tusk" then
-    		MMon = "Mythological Pirate"
-    		MPos = CFrame.new(- 13516.0458984375, 469.8182373046875, - 6899.16064453125)
-    	end
-        if MMon and MPos then return {Mob=MMon, Spawn=MPos} end
-    end
-    
-    local materialNames = {"Radioactive Material", "Mystic Droplet", "Magma Ore", "Angel Wings", "Leather", "Scrap Metal", "Demonic Wisp", "Vampire Fang", "Conjured Cocoa", "Dragon Scale", "Gunpowder", "Fish Tail", "Mini Tusk"}
-    local bossNames = {"Saber Expert", "The Saw", "Greybeard", "The Gorilla King", "Bobby", "Yeti", "Mob Leader", "Vice Admiral", "Warden", "Chief Warden", "Swan", "Magma Admiral", "Fishman Lord", "Wysper", "Thunder God", "Cyborg", "Diamond", "Jeremy", "Fajita", "Don Swan", "Smoke Admiral", "Cursed Captain", "Darkbeard", "Order", "Awakened Ice Admiral", "Tide Keeper", "Stone", "Hydra Leader", "Kilo Admiral", "Captain Elephant", "Beautiful Pirate", "Cake Queen", "rip_indra True Form", "Longma", "Soul Reaper"}
-    local islandData = {
-        ["WindMill"] = {Target=CFrame.new(979.79895019531, 16.516613006592, 1429.0466308594), Entrance=false},
-        ["Marine"] = {Target=CFrame.new(-2566.4296875, 6.8556680679321, 2045.2561035156), Entrance=false},
-        ["Middle Town"] = {Target=CFrame.new(-690.33081054688, 15.09425163269, 1582.2380371094), Entrance=false},
-        ["Jungle"] = {Target=CFrame.new(-1612.7957763672, 36.852081298828, 149.12843322754), Entrance=false},
-        ["Pirate Village"] = {Target=CFrame.new(-1181.3093261719, 4.7514905929565, 3803.5456542969), Entrance=false},
-        ["Desert"] = {Target=CFrame.new(944.15789794922, 20.919729232788, 4373.3002929688), Entrance=false},
-        ["Snow Island"] = {Target=CFrame.new(1347.8067626953, 104.66806030273, -1319.7370605469), Entrance=false},
-        ["MarineFord"] = {Target=CFrame.new(-4914.8212890625, 50.963626861572, 4281.0278320313), Entrance=false},
-        ["Colosseum"] = {Target=CFrame.new(-1427.6203613281, 7.2881078720093, -2792.7722167969), Entrance=false},
-        ["Sky Island 1"] = {Target=CFrame.new(-4869.1025390625, 733.46051025391, -2667.0180664063), Entrance=false},
-        ["Sky Island 2"] = {Target=CFrame.new(-4607.82275, 872.54248, -1667.55688), Entrance=true},
-        ["Sky Island 3"] = {Target=CFrame.new(-7894.6176757813, 5547.1416015625, -380.29119873047), Entrance=true},
-        ["Prison"] = {Target=CFrame.new(4875.330078125, 5.6519818305969, 734.85021972656), Entrance=false},
-        ["Magma Village"] = {Target=CFrame.new(-5247.7163085938, 12.883934020996, 8504.96875), Entrance=false},
-        ["Under Water Island"] = {Target=CFrame.new(61163.8515625, 11.6796875, 1819.7841796875), Entrance=true},
-        ["Fountain City"] = {Target=CFrame.new(5127.1284179688, 59.501365661621, 4105.4458007813), Entrance=false},
-        ["Shank Room"] = {Target=CFrame.new(-1442.16553, 29.8788261, -28.3547478), Entrance=false},
-        ["Mob Island"] = {Target=CFrame.new(-2850.20068, 7.39224768, 5354.99268), Entrance=false},
-        ["The Cafe"] = {Target=CFrame.new(-380.47927856445, 77.220390319824, 255.82550048828), Entrance=false},
-        ["Frist Spot"] = {Target=CFrame.new(-11.311455726624, 29.276733398438, 2771.5224609375), Entrance=false},
-        ["Dark Area"] = {Target=CFrame.new(3780.0302734375, 22.652164459229, -3498.5859375), Entrance=false},
-        ["Flamingo Mansion"] = {Target=CFrame.new(-483.73370361328, 332.0383605957, 595.32708740234), Entrance=false},
-        ["Flamingo Room"] = {Target=CFrame.new(2284.4140625, 15.152037620544, 875.72534179688), Entrance=false},
-        ["Green Zone"] = {Target=CFrame.new(-2448.5300292969, 73.016105651855, -3210.6306152344), Entrance=false},
-        ["Factory"] = {Target=CFrame.new(424.12698364258, 211.16171264648, -427.54049682617), Entrance=false},
-        ["Colossuim"] = {Target=CFrame.new(-1503.6224365234, 219.7956237793, 1369.3101806641), Entrance=false},
-        ["Zombie Island"] = {Target=CFrame.new(-5622.033203125, 492.19604492188, -781.78552246094), Entrance=false},
-        ["Two Snow Mountain"] = {Target=CFrame.new(753.14288330078, 408.23559570313, -5274.6147460938), Entrance=false},
-        ["Punk Hazard"] = {Target=CFrame.new(-6127.654296875, 15.951762199402, -5040.2861328125), Entrance=false},
-        ["Cursed Ship"] = {Target=CFrame.new(923.40197753906, 125.05712890625, 32885.875), Entrance=false},
-        ["Ice Castle"] = {Target=CFrame.new(6148.4116210938, 294.38687133789, -6741.1166992188), Entrance=false},
-        ["Forgotten Island"] = {Target=CFrame.new(-3032.7641601563, 317.89672851563, -10075.373046875), Entrance=false},
-        ["Ussop Island"] = {Target=CFrame.new(4816.8618164063, 8.4599885940552, 2863.8195800781), Entrance=false},
-        ["Mini Sky Island"] = {Target=CFrame.new(-288.74060058594, 49326.31640625, -35248.59375), Entrance=false},
-        ["Great Tree"] = {Target=CFrame.new(2681.2736816406, 1682.8092041016, -7190.9853515625), Entrance=false},
-        ["Castle On The Sea"] = {Target=CFrame.new(-5074.45556640625, 314.5155334472656, -2991.054443359375), Entrance=false},
-        ["MiniSky"] = {Target=CFrame.new(-260.65557861328, 49325.8046875, -35253.5703125), Entrance=false},
-        ["Port Town"] = {Target=CFrame.new(-290.7376708984375, 6.729952812194824, 5343.5537109375), Entrance=false},
-        ["Hydra Island"] = {Target=CFrame.new(5255.1049, 1004.1949, 344.7700), Entrance=false},
-        ["Floating Turtle"] = {Target=CFrame.new(-13274.528320313, 531.82073974609, -7579.22265625), Entrance=false},
-        ["Mansion"] = {Target=CFrame.new(-12471.169921875, 374.94024658203, -7551.677734375), Entrance=true},
-        ["Haunted Castle"] = {Target=CFrame.new(-9515.3720703125, 164.00624084473, 5786.0610351562), Entrance=false},
-        ["Ice Cream Island"] = {Target=CFrame.new(-902.56817626953, 79.93204498291, -10988.84765625), Entrance=false},
-        ["Peanut Island"] = {Target=CFrame.new(-2062.7475585938, 50.473892211914, -10232.568359375), Entrance=false},
-        ["Cake Island"] = {Target=CFrame.new(-1884.7747802734375, 19.327526092529297, -11666.8974609375), Entrance=false},
-        ["Cocoa Island"] = {Target=CFrame.new(87.94276428222656, 73.55451202392578, -12319.46484375), Entrance=false},
-        ["Candy Island"] = {Target=CFrame.new(-1014.4241943359375, 149.11068725585938, -14555.962890625), Entrance=false},
-        ["Tiki Outpost"] = {Target=CFrame.new(-16218.6826, 9.08636189, 445.618408, -0.0610186495, 1.10512588e-09, -0.99813664, -1.83458475e-08, 1, 2.22871765e-09, 0.99813664, 1.84476558e-08, -0.0610186495), Entrance=false},
-    }
-    local shopData = {
-        {Name="Buy Geppo", Calls={{"BuyHaki","Geppo"}}},
-        {Name="Buy Buso Haki", Calls={{"BuyHaki","Buso"}}},
-        {Name="Buy Soru", Calls={{"BuyHaki","Soru"}}},
-        {Name="Buy Observation Haki", Calls={{"KenTalk","Buy"}}},
-        {Name="Buy Black Leg", Calls={{"BuyBlackLeg"}}},
-        {Name="Buy Electro", Calls={{"BuyElectro"}}},
-        {Name="Buy Water Kung Fu", Calls={{"BuyFishmanKarate"}}},
-        {Name="Buy Dragon Claw", Calls={{"BlackbeardReward","DragonClaw","1"},{"BlackbeardReward","DragonClaw","2"}}},
-        {Name="Buy Superhuman", Calls={{"BuySuperhuman"}}},
-        {Name="Buy Death Step", Calls={{"BuyDeathStep"}}},
-        {Name="Buy Sharkman Karate", Calls={{"BuySharkmanKarate",true},{"BuySharkmanKarate"}}},
-        {Name="Buy Electric Claw", Calls={{"BuyElectricClaw"}}},
-        {Name="Buy Dragon Talon", Calls={{"BuyDragonTalon"}}},
-        {Name="Buy God Human", Calls={{"BuyGodhuman"}}},
-        {Name="Buy Sanguine Art", Calls={{"BuySanguineArt", true},{"BuySanguineArt"}}},
-        {Name="Cutlass", Calls={{"BuyItem","Cutlass"}}},
-        {Name="Katana", Calls={{"BuyItem","Katana"}}},
-        {Name="Iron Mace", Calls={{"BuyItem","Iron Mace"}}},
-        {Name="Dual Katana", Calls={{"BuyItem","Dual Katana"}}},
-        {Name="Triple Katana", Calls={{"BuyItem","Triple Katana"}}},
-        {Name="Pipe", Calls={{"BuyItem","Pipe"}}},
-        {Name="Dual-Headed Blade", Calls={{"BuyItem","Dual-Headed Blade"}}},
-        {Name="Bisento", Calls={{"BuyItem","Bisento"}}},
-        {Name="Soul Cane", Calls={{"BuyItem","Soul Cane"}}},
-        {Name="Pole v.2", Calls={{"ThunderGodTalk"}}},
-        {Name="Slingshot", Calls={{"BuyItem","Slingshot"}}},
-        {Name="Musket", Calls={{"BuyItem","Musket"}}},
-        {Name="Flintlock", Calls={{"BuyItem","Flintlock"}}},
-        {Name="Refined Slingshot", Calls={{"BuyItem", "Refined Slingshot"}}},
-        {Name="Cannon", Calls={{"BuyItem","Cannon"}}},
-        {Name="Kabucha", Calls={{"BlackbeardReward","Slingshot","1"},{"BlackbeardReward","Slingshot","2"}}},
-        {Name="Reset Stats", Calls={{"BlackbeardReward","Refund","1"},{"BlackbeardReward","Refund","2"}}},
-        {Name="Random Race", Calls={{"BlackbeardReward","Reroll","1"},{"BlackbeardReward","Reroll","2"}}},
-        {Name="Refined Flintlock", Calls={{"BuyItem", "Refined Flintlock"}}},
-        {Name="Black Cape", Calls={{"BuyItem", "Black Cape"}}},
-        {Name="Swordsman Hat", Calls={{"BuyItem", "Swordsman Hat"}}},
-        {Name="Tomoe Ring", Calls={{"BuyItem", "Tomoe Ring"}}},
-        {Name="Bizarre Rifle", Calls={{"Ectoplasm", "Buy", 1}}},
-    }
-    -- Hoho preload supplies optional catalog coordinates, never combat or executable code.
-    local function initPreload()
-    -- Adapted data from acsu123/HohoV2/BloxFruit/preload; see provenance.json.
-    -- Generated by extract_hoho.py; embedded data only, no remote loaders.
-    local preloadRows={
-        [1]={
-            {LevelReq=0,Mob="Trainee",Name="MarineQuest",Tier=1,Boss=false,Quest=CFrame.new(-2655,30,2113),Spawns={CFrame.new(-2674.52368164,32.1167221069,2186.97265625),CFrame.new(-2728.64111328,32.9167175293,1966.21789551),CFrame.new(-2741.04101562,32.9167175293,1900.01794434),CFrame.new(-2748.03735352,30.3167190552,2152.703125),CFrame.new(-2788.25097656,30.687002182,2281.48095703),CFrame.new(-2710.5703125,30.687002182,2242.84570312),CFrame.new(-2667.44116211,32.9167175293,1900.01794434)}},
-            {LevelReq=10,Mob="Monkey",Name="JungleQuest",Tier=1,Boss=false,Quest=CFrame.new(-1679.76318359,48.7400054932,175.640014648),Spawns={CFrame.new(-1637.55456543,29.977350235,19.6401367188),CFrame.new(-1866.31335449,29.9336357117,21.5892028809),CFrame.new(-1450.64160156,28.9804954529,306.12121582),CFrame.new(-1610.23974609,29.165807724,399.664489746),CFrame.new(-1758.66125488,30.8861427307,-31.8153839111),CFrame.new(-1299.42724609,17.6543960571,81.4220199585),CFrame.new(-1525.55554199,27.246963501,163.957824707)}},
-            {LevelReq=15,Mob="Gorilla",Name="JungleQuest",Tier=2,Boss=false,Quest=CFrame.new(-1679.76318359,48.7400054932,175.640014648),Spawns={CFrame.new(-1401.0880127,26.4667453766,-463.957061768),CFrame.new(-1387.32824707,14.4667444229,-577.800048828),CFrame.new(-1198.41894531,17.3037509918,-689.849060059),CFrame.new(-1266.56518555,14.4667453766,-462.023651123)}},
-            {LevelReq=20,Mob="The Gorilla King",Name="JungleQuest",Tier=3,Boss=true,Quest=CFrame.new(-1679.76318359,48.7400054932,175.640014648),Spawns={CFrame.new(-1193.90661621,10.7214584351,-549.847290039)}},
-            {LevelReq=30,Mob="Pirate",Name="BuggyQuest1",Tier=1,Boss=false,Quest=CFrame.new(-1151.58642578,16.6152420044,3863.125),Spawns={CFrame.new(-980.980773926,30.4456329346,3966.83227539),CFrame.new(-1313.74499512,18.8687286377,3964.18530273),CFrame.new(-1122.78271484,19.9353103638,3965.88183594),CFrame.new(-1285.08447266,18.0345458984,3886.96728516),CFrame.new(-1176.76513672,19.7420425415,4027.27001953),CFrame.new(-963.942016602,27.6460914612,4043.71508789)}},
-            {LevelReq=40,Mob="Brute",Name="BuggyQuest1",Tier=2,Boss=false,Quest=CFrame.new(-1151.58642578,16.6152420044,3863.125),Spawns={CFrame.new(-1085.94348145,28.1044311523,4342.671875),CFrame.new(-942.354492188,29.7292480469,4387.24414062),CFrame.new(-1350.12817383,28.1044311523,4285.10888672),CFrame.new(-1436.78369141,28.1044311523,4357.19970703),CFrame.new(-1312.80505371,28.1044311523,4402.859375),CFrame.new(-1094.93334961,28.1044311523,4442.90722656)}},
-            {LevelReq=55,Mob="Chef",Name="BuggyQuest1",Tier=3,Boss=true,Quest=CFrame.new(-1151.58642578,16.6152420044,3863.125),Spawns={CFrame.new(-1120.45214844,54.7070007324,4121.15722656)}},
-            {LevelReq=60,Mob="Desert Bandit",Name="DesertQuest",Tier=1,Boss=false,Quest=CFrame.new(931.377990723,4.68400001526,4198.21289062),Spawns={CFrame.new(860.54107666,7.56500244141,4539.79736328),CFrame.new(999.850463867,7.56500244141,4490.33105469),CFrame.new(902.860229492,7.56500244141,4461.42138672),CFrame.new(931.70501709,7.56500244141,4564.53320312)}},
-            {LevelReq=75,Mob="Desert Officer",Name="DesertQuest",Tier=2,Boss=false,Quest=CFrame.new(931.377990723,4.68400001526,4198.21289062),Spawns={CFrame.new(1523.7845459,15.284995079,4095.42822266),CFrame.new(1543.99267578,14.1150026321,4240.97558594),CFrame.new(1615.49060059,14.2480010986,4187.38623047),CFrame.new(1608.39758301,14.1480007172,4112.2890625)}},
-            {LevelReq=90,Mob="Snow Bandit",Name="SnowQuest",Tier=1,Boss=false,Quest=CFrame.new(1400.56384277,77.3909988403,-1311.28503418),Spawns={CFrame.new(1519.47265625,77.9602355957,-1510.93786621),CFrame.new(1501.95739746,77.9602355957,-1402.37207031),CFrame.new(1260.2578125,77.9602355957,-1387.61035156),CFrame.new(1364.11621094,77.9602355957,-1429.65136719),CFrame.new(1431.75073242,77.9602355957,-1444.89233398)}},
-            {LevelReq=100,Mob="Snowman",Name="SnowQuest",Tier=2,Boss=false,Quest=CFrame.new(1400.56384277,77.3909988403,-1311.28503418),Spawns={CFrame.new(1121.54980469,98.1665802002,-1669.02416992),CFrame.new(1149.48852539,98.2227401733,-1540.46386719),CFrame.new(1272.36193848,98.3291625977,-1647.2545166),CFrame.new(1246.76879883,98.3291625977,-1555.6940918)}},
-            {LevelReq=105,Mob="Yeti",Name="SnowQuest",Tier=3,Boss=true,Quest=CFrame.new(1400.56384277,77.3909988403,-1311.28503418),Spawns={CFrame.new(1181.66162109,104.033042908,-1616.93188477)}},
-            {LevelReq=120,Mob="Chief Petty Officer",Name="MarineQuest2",Tier=1,Boss=false,Quest=CFrame.new(-4699.33105469,4.74101066589,4227.63916016),Spawns={CFrame.new(-4780.54248047,13.8792819977,4419.90722656),CFrame.new(-4828.58251953,13.126077652,4196.78662109),CFrame.new(-4763.67675781,13.3913078308,4288.84277344),CFrame.new(-4674.6328125,11.0316886902,4483.32568359),CFrame.new(-4836.43701172,16.3296909332,4465.78173828),CFrame.new(-4650.59033203,11.0316886902,4562.09765625),CFrame.new(-5002.20996094,11.0316886902,4004.73925781),CFrame.new(-4938.36132812,11.0316886902,3995.87109375)}},
-            {LevelReq=130,Mob="Vice Admiral",Name="MarineQuest2",Tier=2,Boss=true,Quest=CFrame.new(-4699.33105469,4.74101066589,4227.63916016),Spawns={CFrame.new(-5010.81982422,15.0615949631,4383.72753906)}},
-            {LevelReq=150,Mob="Sky Bandit",Name="SkyQuest",Tier=1,Boss=false,Quest=CFrame.new(-4750.18017578,966.066711426,-748.241455078),Spawns={CFrame.new(-4973.74316406,280.721466064,-1119.43041992),CFrame.new(-5221.64453125,280.721466064,-1068.63989258),CFrame.new(-5157.06640625,280.721466064,-916.718017578),CFrame.new(-5014.03417969,280.721466064,-972.079345703)}},
-            {LevelReq=175,Mob="Dark Master",Name="SkyQuest",Tier=2,Boss=false,Quest=CFrame.new(-4750.18017578,966.066711426,-748.241455078),Spawns={CFrame.new(-5206.77197266,504.74420166,-348.463867188),CFrame.new(-5411.25439453,504.932647705,-372.778625488),CFrame.new(-5283.16601562,505.063934326,-221.014190674),CFrame.new(-5269.00634766,504.982574463,-461.116241455)}},
-            {LevelReq=190,Mob="Prisoner",Name="PrisonerQuest",Tier=1,Boss=false,Quest=CFrame.new(5208.33837891,18.8711032867,736.586303711),Spawns={CFrame.new(5457.69091797,7.13356637955,507.47543335),CFrame.new(5057.80957031,7.13356637955,567.153991699),CFrame.new(5192.98535156,7.13356637955,414.304901123),CFrame.new(5278.59130859,7.13356637955,391.556884766),CFrame.new(5370.83837891,7.13356637955,459.186523438)}},
-            {LevelReq=210,Mob="Dangerous Prisoner",Name="PrisonerQuest",Tier=2,Boss=false,Quest=CFrame.new(5208.33837891,18.8711032867,736.586303711),Spawns={CFrame.new(5058.26269531,9.14381217957,900.918701172),CFrame.new(5295.2734375,9.14381217957,1104.78125),CFrame.new(5122.91357422,9.14381217957,969.896240234),CFrame.new(5188.85058594,9.14381217957,1058.125),CFrame.new(5456.38525391,9.14381217957,955.961364746)}},
-            {LevelReq=225,Mob="Ruthless Prisoner",Name="ImpelQuest",Tier=1,Boss=false,Quest=CFrame.new(5320.66601562,18.8855781555,856.281433105),Spawns={CFrame.new(5329.33544922,49.4212989807,819.451477051),CFrame.new(5393.91503906,16.37200737,673.581542969),CFrame.new(5272.94140625,16.37200737,673.581542969),CFrame.new(5393.91503906,16.37200737,795.263671875),CFrame.new(5271.36230469,16.37200737,799.607910156)}},
-            {LevelReq=230,Mob="Warden",Name="ImpelQuest",Tier=2,Boss=true,Quest=CFrame.new(5320.66601562,18.8855781555,856.281433105),Spawns={CFrame.new(5623.16552734,1.35667848587,733.808898926)}},
-            {LevelReq=250,Mob="Toga Warrior",Name="ColosseumQuest",Tier=1,Boss=false,Quest=CFrame.new(-1342.25549316,11.1514205933,-2928.58081055),Spawns={CFrame.new(-1819.48034668,9.21899795532,-2736.56494141),CFrame.new(-1533.140625,12.4893217087,-2781.29345703),CFrame.new(-1620.10302734,12.4893217087,-2672.29345703),CFrame.new(-1829.72351074,9.02930355072,-2661.5324707),CFrame.new(-1694.75183105,9.21899795532,-2633.26269531),CFrame.new(-1973.13171387,9.02927780151,-2744.93530273)}},
-            {LevelReq=275,Mob="Gladiator",Name="ColosseumQuest",Tier=2,Boss=false,Quest=CFrame.new(-1342.25549316,11.1514205933,-2928.58081055),Spawns={CFrame.new(-1238.91369629,11.6225595474,-3241.15893555),CFrame.new(-1212.63024902,11.6225595474,-3378.66992188),CFrame.new(-1144.47412109,11.6225595474,-3337.35913086),CFrame.new(-1118.91369629,11.6225595474,-3014.15893555),CFrame.new(-1161.91369629,11.6225595474,-3097.15893555)}},
-            {LevelReq=300,Mob="Military Soldier",Name="MagmaQuest",Tier=1,Boss=false,Quest=CFrame.new(-5308.8671875,17.0349807739,8482.69824219),Spawns={CFrame.new(-5623.79833984,17.0067863464,8314.05664062),CFrame.new(-5266.39111328,17.1308708191,8554.19335938),CFrame.new(-5694.47998047,17.0067920685,8329.20703125),CFrame.new(-5337.08789062,17.1308403015,8629.31640625),CFrame.new(-5418.47802734,18.0090122223,8421.08398438)}},
-            {LevelReq=325,Mob="Military Spy",Name="MagmaQuest",Tier=2,Boss=false,Quest=CFrame.new(-5308.8671875,17.0349807739,8482.69824219),Spawns={CFrame.new(-5952.54931641,76.9223327637,8742.40332031),CFrame.new(-5714.91845703,76.5920333862,8834.85839844),CFrame.new(-5808.98339844,77.3133239746,8791.20410156),CFrame.new(-5889.96289062,76.6140213013,8723.01074219)}},
-            {LevelReq=350,Mob="Magma Admiral",Name="MagmaQuest",Tier=3,Boss=true,Quest=CFrame.new(-5308.8671875,17.0349807739,8482.69824219),Spawns={CFrame.new(-5625.70996094,55.4438209534,8623.01171875)}},
-            {LevelReq=375,Mob="Fishman Warrior",Name="FishmanQuest",Tier=1,Boss=false,Quest=CFrame.new(61406.1953125,24.5187358856,1626.81640625),Spawns={CFrame.new(60715.9921875,25.2567386627,1284.89025879),CFrame.new(60892.2578125,23.8054046631,1500.49523926),CFrame.new(60788.3632812,23.8040161133,1484.52636719),CFrame.new(60930.921875,23.7948055267,1393.09350586),CFrame.new(60736.8125,23.7954559326,1396.33764648),CFrame.new(60859.6601562,23.7885627747,1328.19140625),CFrame.new(60626.4101562,25.2498073578,1142.828125)}},
-            {LevelReq=400,Mob="Fishman Commando",Name="FishmanQuest",Tier=2,Boss=false,Quest=CFrame.new(61406.1953125,24.5187358856,1626.81640625),Spawns={CFrame.new(61992.640625,24.549861908,1205.73803711),CFrame.new(61887.75,24.5488853455,1232.44702148),CFrame.new(62013.03125,24.5533771515,1329.94506836),CFrame.new(61808.0976562,24.5535316467,1328.58178711),CFrame.new(61994.5546875,24.5499229431,1425.44897461),CFrame.new(61872.875,24.5667133331,1464.17944336)}},
-            {LevelReq=425,Mob="Fishman Lord",Name="FishmanQuest",Tier=3,Boss=true,Quest=CFrame.new(61406.1953125,24.5187358856,1626.81640625),Spawns={CFrame.new(61352.9023438,67.1670074463,1029.11096191)}},
-            {LevelReq=450,Mob="God's Guard",Name="SkyExp1Quest",Tier=1,Boss=false,Quest=CFrame.new(-4882.89404297,926.177490234,-1031.05480957),Spawns={CFrame.new(-4364.76416016,1090.17175293,-383.479156494),CFrame.new(-4227.25097656,1087.96362305,-567.608886719),CFrame.new(-4130.80273438,1090.30334473,-291.206054688),CFrame.new(-4403.32763672,1088.21569824,-498.130004883),CFrame.new(-4234.55615234,1089.33435059,-267.375946045),CFrame.new(-4082.85107422,1087.26672363,-414.136230469)}},
-            {LevelReq=475,Mob="Shanda",Name="SkyExp1Quest",Tier=2,Boss=false,Quest=CFrame.new(-4882.89404297,926.177490234,-1031.05480957),Spawns={CFrame.new(-5890.41210938,5468.90478516,1956.18701172),CFrame.new(-5878.78808594,5470.43847656,1864.20336914),CFrame.new(-6040.20410156,5468.01318359,1734.20947266),CFrame.new(-5956.50146484,5470.09033203,1750.6015625),CFrame.new(-6026.83642578,5469.55273438,1851.04943848)}},
-            {LevelReq=500,Mob="Wysper",Name="SkyExp1Quest",Tier=3,Boss=true,Quest=CFrame.new(-4882.89404297,926.177490234,-1031.05480957),Spawns={CFrame.new(-6271.55859375,5472.77636719,1887.77050781)}},
-            {LevelReq=525,Mob="Royal Squad",Name="SkyExp2Quest",Tier=1,Boss=false,Quest=CFrame.new(-7033.10058594,5590.57421875,1353.10693359),Spawns={CFrame.new(-6706.87060547,5551.41357422,1155.43017578),CFrame.new(-6804.6875,5550.37402344,1083.56115723),CFrame.new(-6690.03955078,5551.41357422,1318.30541992),CFrame.new(-6868.93896484,5554.89013672,1319.95458984),CFrame.new(-6920.73339844,5551.41357422,1191.92456055)}},
-            {LevelReq=550,Mob="Royal Soldier",Name="SkyExp2Quest",Tier=2,Boss=false,Quest=CFrame.new(-7033.10058594,5590.57421875,1353.10693359),Spawns={CFrame.new(-7175.83544922,5541.05029297,947.144042969),CFrame.new(-6932.08789062,5541.05029297,842.444519043),CFrame.new(-7137.42773438,5541.05029297,892.987121582),CFrame.new(-7138.48193359,5541.05029297,1050.77429199),CFrame.new(-6938.38427734,5541.05029297,963.78125)}},
-            {LevelReq=575,Mob="Thunder God",Name="SkyExp2Quest",Tier=3,Boss=true,Quest=CFrame.new(-7033.10058594,5590.57421875,1353.10693359),Spawns={CFrame.new(-7125.41455078,5596.06298828,111.518699646)}},
-            {LevelReq=625,Mob="Galley Pirate",Name="FountainQuest",Tier=1,Boss=false,Quest=CFrame.new(5263.48779297,74.907989502,4087.61572266),Spawns={CFrame.new(5452.890625,78.7009429932,4112.57714844),CFrame.new(5327.61376953,76.2442779541,4014.50537109),CFrame.new(5708.22167969,80.9136810303,3928.11865234),CFrame.new(5670.65283203,79.5116882324,4074.46337891),CFrame.new(5430.41992188,77.9910812378,3953.56689453),CFrame.new(5840.02587891,76.8320617676,3975.56347656)}},
-            {LevelReq=650,Mob="Galley Captain",Name="FountainQuest",Tier=2,Boss=false,Quest=CFrame.new(5263.48779297,74.907989502,4087.61572266),Spawns={CFrame.new(5409.47851562,77.674331665,4686.9921875),CFrame.new(5782.203125,79.3242416382,4868.86425781),CFrame.new(5385.47460938,78.7068862915,4851.12109375),CFrame.new(5594.93359375,78.71144104,4751.86669922),CFrame.new(5685.41601562,77.6837005615,4742.5859375),CFrame.new(5899.57617188,76.5875778198,4809.02246094),CFrame.new(5544.03564453,76.8699951172,4899.09863281),CFrame.new(5773.7265625,77.6645431519,4703.10205078)}},
-            {LevelReq=675,Mob="Cyborg",Name="FountainQuest",Tier=3,Boss=true,Quest=CFrame.new(5263.48779297,74.907989502,4087.61572266),Spawns={CFrame.new(6252.39160156,9.31876659393,4941.38867188)}},
-        },
-        [2]={
-            {LevelReq=700,Mob="Raider",Name="Area1Quest",Tier=1,Boss=false,Quest=CFrame.new(-429.544006348,71.7700042725,1836.18200684),Spawns={CFrame.new(-917.437011719,40.0079956055,2250.43505859),CFrame.new(-612.437011719,40.0079956055,2557.43505859),CFrame.new(-607.437011719,40.0079956055,2202.43505859),CFrame.new(-904.336975098,40.0079956055,2501.43505859),CFrame.new(241.56300354,40.0079956055,2195.43505859),CFrame.new(549.562988281,40.0079956055,2190.43505859),CFrame.new(265.562988281,40.0079956055,2497.43505859),CFrame.new(475.562988281,40.0079956055,2433.43505859)}},
-            {LevelReq=725,Mob="Mercenary",Name="Area1Quest",Tier=2,Boss=false,Quest=CFrame.new(-429.544006348,71.7700042725,1836.18200684),Spawns={CFrame.new(-986.775024414,72.8760070801,1088.44702148),CFrame.new(-924.684020996,72.8760070801,1788.12402344),CFrame.new(-913.765014648,72.8760070801,1574.15100098),CFrame.new(-1085.15100098,72.8760070801,1696.39404297),CFrame.new(-1135.94396973,72.8760070801,1248.32702637),CFrame.new(-1209.20495605,72.8760070801,1073.0369873)}},
-            {LevelReq=750,Mob="Diamond",Name="Area1Quest",Tier=3,Boss=true,Quest=CFrame.new(-429.544006348,71.7700042725,1836.18200684),Spawns={CFrame.new(-1711.37097168,206.041000366,-97.0820007324)}},
-            {LevelReq=775,Mob="Swan Pirate",Name="Area2Quest",Tier=1,Boss=false,Quest=CFrame.new(638.445007324,71.7700042725,918.236022949),Spawns={CFrame.new(823.611999512,72.8079986572,1162.22094727),CFrame.new(984.630004883,72.8079986572,1401.6829834),CFrame.new(827.799987793,72.8079986572,1326.89697266),CFrame.new(1066.99401855,72.8079986572,1080.91796875),CFrame.new(967.17401123,72.9680023193,1180.75598145),CFrame.new(1063.18896484,72.8079986572,1399.76293945)}},
-            {LevelReq=800,Mob="Factory Staff",Name="Area2Quest",Tier=2,Boss=false,Quest=CFrame.new(638.445007324,71.7700042725,918.236022949),Spawns={CFrame.new(-105.88999939,72.8079986572,-670.24798584),CFrame.new(-426.890014648,72.8079986572,-367.24798584),CFrame.new(-93.8899993896,72.8079986572,-34.2279968262),CFrame.new(386.109985352,72.8079986572,91.7519989014),CFrame.new(936.109985352,72.8079986572,-71.2480010986),CFrame.new(692.109985352,72.8079986572,227.751998901)}},
-            {LevelReq=850,Mob="Jeremy",Name="Area2Quest",Tier=3,Boss=true,Quest=CFrame.new(638.445007324,71.7700042725,918.236022949),Spawns={CFrame.new(2338.00195312,451.425994873,700.106994629)}},
-            {LevelReq=875,Mob="Marine Lieutenant",Name="MarineQuest3",Tier=1,Boss=false,Quest=CFrame.new(-2440.79589844,71.7140045166,-3216.06811523),Spawns={CFrame.new(-2766.07006836,71.0140075684,-3144.74902344),CFrame.new(-2583.94506836,71.0140075684,-3039.61791992),CFrame.new(-3012.85205078,71.0140075684,-2921.83203125),CFrame.new(-3258.55004883,71.0140075684,-2990.86694336),CFrame.new(-2932.5,71.0140075684,-2604.09594727)}},
-            {LevelReq=900,Mob="Marine Captain",Name="MarineQuest3",Tier=2,Boss=false,Quest=CFrame.new(-2440.79589844,71.7140045166,-3216.06811523),Spawns={CFrame.new(-1805.36401367,73.0140075684,-3313.32495117),CFrame.new(-2030.24804688,73.0140075684,-3477.63500977),CFrame.new(-2103.93408203,73.0140075684,-3259.30297852),CFrame.new(-1928.38903809,73.0140075684,-3119.58007812),CFrame.new(-1601.3170166,73.0140075684,-3315.32495117)}},
-            {LevelReq=925,Mob="Orbitus",Name="MarineQuest3",Tier=3,Boss=true,Quest=CFrame.new(-2440.79589844,71.7140045166,-3216.06811523),Spawns={CFrame.new(-2138.48388672,75.9410095215,-4326.45507812)}},
-            {LevelReq=950,Mob="Zombie",Name="ZombieQuest",Tier=1,Boss=false,Quest=CFrame.new(-5497.06201172,47.5919952393,-795.236999512),Spawns={CFrame.new(-5595.60009766,49.3079986572,-524.24798584),CFrame.new(-5766.64892578,47.5010070801,-824.661987305),CFrame.new(-5512.23193359,49.3079986572,-847.978027344),CFrame.new(-5856.58886719,70.3509979248,-739.049987793),CFrame.new(-5761.9921875,49.3079986572,-654.937988281),CFrame.new(-5614.95996094,49.3079986572,-938.468994141)}},
-            {LevelReq=975,Mob="Vampire",Name="ZombieQuest",Tier=2,Boss=false,Quest=CFrame.new(-5497.06201172,47.5919952393,-795.236999512),Spawns={CFrame.new(-6277.26416016,9.00799560547,-1269.44897461),CFrame.new(-5776.55175781,9.00799560547,-1373.44995117),CFrame.new(-5952.99511719,9.00799560547,-1568.52905273),CFrame.new(-6132.39501953,9.00799560547,-1466.16894531),CFrame.new(-6039.68896484,9.00799560547,-1099.15905762)}},
-            {LevelReq=1000,Mob="Snow Trooper",Name="SnowMountainQuest",Tier=1,Boss=false,Quest=CFrame.new(609.859008789,400.119995117,-5372.25878906),Spawns={CFrame.new(572.692993164,400.808013916,-5605.20703125),CFrame.new(716.62701416,400.808013916,-5706.44091797),CFrame.new(642.666015625,400.808013916,-5454.48876953),CFrame.new(484.345001221,400.808013916,-5472.41601562),CFrame.new(445.944000244,442.808013916,-5553.90576172),CFrame.new(430.402008057,400.808013916,-5069.09521484),CFrame.new(392.218994141,400.808013916,-5207.68505859)}},
-            {LevelReq=1050,Mob="Winter Warrior",Name="SnowMountainQuest",Tier=2,Boss=false,Quest=CFrame.new(609.859008789,400.119995117,-5372.25878906),Spawns={CFrame.new(1205.45898438,428.808013916,-5397.35888672),CFrame.new(1226.30895996,428.808013916,-5215.97607422),CFrame.new(1142.43798828,428.808013916,-5043.05322266),CFrame.new(1446.27001953,428.808013916,-5369.21484375),CFrame.new(1043.30505371,428.808013916,-5049.78613281),CFrame.new(1371.87097168,428.808013916,-5194.703125)}},
-            {LevelReq=1100,Mob="Lab Subordinate",Name="IceSideQuest",Tier=1,Boss=false,Quest=CFrame.new(-6231.27197266,80.9337692261,-4851.32080078),Spawns={CFrame.new(-5897.82177734,81.699836731,-4554.62402344),CFrame.new(-5998.328125,90.0252456665,-4386.52246094),CFrame.new(-5766.35302734,81.699836731,-4249.66992188),CFrame.new(-5623.33300781,81.699836731,-4444.16064453),CFrame.new(-5693.31298828,81.699836731,-4628.29589844)}},
-            {LevelReq=1125,Mob="Horned Warrior",Name="IceSideQuest",Tier=2,Boss=false,Quest=CFrame.new(-6231.27197266,80.9337692261,-4851.32080078),Spawns={CFrame.new(-6182.00976562,29.2286148071,-5914.24609375),CFrame.new(-6445.95507812,31.0095653534,-5858.28808594),CFrame.new(-6539.96435547,29.2286148071,-5717.98291016),CFrame.new(-6421.203125,29.2286148071,-5591.42773438),CFrame.new(-6331.76513672,29.2286148071,-5778.94189453),CFrame.new(-6133.45117188,29.2286148071,-6049.02441406)}},
-            {LevelReq=1150,Mob="Smoke Admiral",Name="IceSideQuest",Tier=3,Boss=true,Quest=CFrame.new(-6231.27197266,80.9337692261,-4851.32080078),Spawns={CFrame.new(-4857.35839844,233.677841187,-5583.24316406)}},
-            {LevelReq=1175,Mob="Magma Ninja",Name="FireSideQuest",Tier=1,Boss=false,Quest=CFrame.new(-5403.36816406,28.2776184082,-5371.70019531),Spawns={CFrame.new(-5790.07568359,28.9154415131,-5393.24707031),CFrame.new(-5885.36865234,32.641620636,-5501.19726562),CFrame.new(-5845.98583984,50.2627563477,-5670.96972656),CFrame.new(-5811.14794922,30.0477333069,-5576.53662109),CFrame.new(-5711.41113281,47.4014968872,-5658.5234375),CFrame.new(-5657.26171875,34.2040710449,-5551.61328125)}},
-            {LevelReq=1200,Mob="Lava Pirate",Name="FireSideQuest",Tier=2,Boss=false,Quest=CFrame.new(-5403.36816406,28.2776184082,-5371.70019531),Spawns={CFrame.new(-5005.52148438,28.023431778,-4916.07714844),CFrame.new(-5005.39355469,28.4878692627,-5025.07617188),CFrame.new(-5082.35009766,28.9050598145,-4796.31738281),CFrame.new(-5111.28271484,32.1717300415,-5115.875),CFrame.new(-5218.38916016,29.7756690979,-4999.94921875)}},
-            {LevelReq=1250,Mob="Ship Deckhand",Name="ShipQuest1",Tier=1,Boss=false,Quest=CFrame.new(1040.55541992,124.943008423,32909.1054688),Spawns={CFrame.new(580.29901123,125.577011108,33124.25),CFrame.new(719.29901123,125.577011108,33032.109375),CFrame.new(1247.2989502,125.577011108,33218.109375),CFrame.new(1176.2989502,125.577011108,33119.109375),CFrame.new(1157.2989502,125.577011108,32930.109375),CFrame.new(1259.2989502,125.577011108,33032.109375),CFrame.new(580.29901123,125.577011108,32930.109375)}},
-            {LevelReq=1275,Mob="Ship Engineer",Name="ShipQuest1",Tier=2,Boss=false,Quest=CFrame.new(1040.55541992,124.943008423,32909.1054688),Spawns={CFrame.new(834.79699707,43.6930084229,32720.9257812),CFrame.new(729.229980469,43.6930084229,32950.34375),CFrame.new(1088.25195312,43.6930084229,32890.09375),CFrame.new(1016.77801514,43.6930084229,33074.1328125),CFrame.new(1025.65698242,43.6930084229,32740.8554688),CFrame.new(815.62902832,43.6930084229,33111.3398438)}},
-            {LevelReq=1300,Mob="Ship Steward",Name="ShipQuest2",Tier=1,Boss=false,Quest=CFrame.new(974.075927734,124.938667297,33253.6210938),Spawns={CFrame.new(1032.45800781,125.833999634,33512.3945312),CFrame.new(801.382995605,125.833999634,33505.1796875),CFrame.new(815.000976562,125.833999634,33376.203125),CFrame.new(986.882995605,125.833999634,33366.953125),CFrame.new(918.666992188,125.833999634,33506.5039062)}},
-            {LevelReq=1325,Mob="Ship Officer",Name="ShipQuest2",Tier=2,Boss=false,Quest=CFrame.new(974.075927734,124.938667297,33253.6210938),Spawns={CFrame.new(505.528991699,179.906005859,33263.6328125),CFrame.new(694.528991699,179.906005859,33112.6328125),CFrame.new(657.528991699,179.906005859,33460.6328125),CFrame.new(1144.52905273,179.906005859,33112.6015625),CFrame.new(1320.52905273,179.906005859,33294.6015625),CFrame.new(1162.52905273,179.906005859,33445.6015625)}},
-            {LevelReq=1350,Mob="Arctic Warrior",Name="FrostQuest",Tier=1,Boss=false,Quest=CFrame.new(5667.65820312,26.8000030518,-6486.08984375),Spawns={CFrame.new(6095.52587891,27.5599975586,-6077.94091797),CFrame.new(6271.31689453,27.5599975586,-6151.53808594),CFrame.new(5994.58886719,27.5599975586,-6324.27880859),CFrame.new(5832.19580078,27.5599975586,-6241.29003906),CFrame.new(6167.22216797,27.5599975586,-6319.22998047)}},
-            {LevelReq=1375,Mob="Snow Lurker",Name="FrostQuest",Tier=2,Boss=false,Quest=CFrame.new(5667.65820312,26.8000030518,-6486.08984375),Spawns={CFrame.new(5763.84619141,27.5599975586,-6671.04589844),CFrame.new(5443.421875,27.5599975586,-7031.28515625),CFrame.new(5567.85693359,27.5599975586,-6900.46484375),CFrame.new(5484.41796875,27.5599975586,-6733.75),CFrame.new(5524.15722656,27.5599975586,-6583.82080078)}},
-            {LevelReq=1400,Mob="Awakened Ice Admiral",Name="FrostQuest",Tier=3,Boss=true,Quest=CFrame.new(5667.65820312,26.8000030518,-6486.08984375),Spawns={CFrame.new(6551.79394531,325.295013428,-6989.89892578)}},
-            {LevelReq=1425,Mob="Sea Soldier",Name="ForgottenQuest",Tier=1,Boss=false,Quest=CFrame.new(-3054.44506836,238.343994141,-10142.8193359),Spawns={CFrame.new(-2550.92211914,28.4530029297,-9839.99707031),CFrame.new(-2840.09204102,27.4530029297,-9814.38085938),CFrame.new(-3499.34790039,16.0859985352,-9712.00585938),CFrame.new(-3293.05004883,5.90899658203,-9640.93164062),CFrame.new(-3459.69189453,25.6289978027,-9934.77246094),CFrame.new(-3240.33105469,27.4530029297,-9813.96582031)}},
-            {LevelReq=1450,Mob="Water Fighter",Name="ForgottenQuest",Tier=2,Boss=false,Quest=CFrame.new(-3054.44506836,238.343994141,-10142.8193359),Spawns={CFrame.new(-3331.70507812,239.138000488,-10553.3564453),CFrame.new(-3511.95898438,239.138000488,-10346.9287109),CFrame.new(-3396.35888672,239.138000488,-10745.1054688),CFrame.new(-3316.75390625,239.138000488,-10323.1689453),CFrame.new(-3657.94995117,239.138000488,-10591.1474609)}},
-            {LevelReq=1475,Mob="Tide Keeper",Name="ForgottenQuest",Tier=3,Boss=true,Quest=CFrame.new(-3054.44506836,238.343994141,-10142.8193359),Spawns={CFrame.new(-3760.41601562,78.3379974365,-11585.7041016)}},
-        },
-        [3]={
-            {LevelReq=1500,Mob="Pirate Millionaire",Name="PiratePortQuest",Tier=1,Boss=false,Quest=CFrame.new(-450.105010986,107.680999756,5950.72607422),Spawns={CFrame.new(-593.177001953,55.4869995117,5511.45703125),CFrame.new(-543.814025879,56.6920013428,5653.96923828),CFrame.new(-751.570007324,55.4819946289,5637.53320312),CFrame.new(-62.6029968262,55.4869995117,5803.47119141),CFrame.new(-232.919998169,57.0429992676,5757.83300781),CFrame.new(-118.809005737,55.4869995117,5649.16992188)}},
-            {LevelReq=1525,Mob="Pistol Billionaire",Name="PiratePortQuest",Tier=2,Boss=false,Quest=CFrame.new(-450.105010986,107.680999756,5950.72607422),Spawns={CFrame.new(-852.890991211,69.9970092773,6175.29589844),CFrame.new(-739.53302002,84.6340026855,5833.05712891),CFrame.new(-666.770996094,84.9440002441,6008.33789062),CFrame.new(-903.169006348,84.6340026855,5891.01123047),CFrame.new(-185.692993164,84.7089996338,6103.62695312),CFrame.new(-188.143005371,84.7089996338,6337.04101562),CFrame.new(-54.8110046387,83.7700042725,5947.84082031),CFrame.new(40.0599975586,85.2720031738,6114.29785156)}},
-            {LevelReq=1550,Mob="Stone",Name="PiratePortQuest",Tier=3,Boss=true,Quest=CFrame.new(-450.105010986,107.680999756,5950.72607422),Spawns={CFrame.new(-1109.92602539,53.3789978027,6811.72509766)}},
-            {LevelReq=1575,Mob="Dragon Crew Warrior",Name="DragonCrewQuest",Tier=1,Boss=false,Quest=CFrame.new(6735.11083984,126.990005493,-711.098022461),Spawns={CFrame.new(6709.76416016,52.3440093994,-1139.0300293),CFrame.new(7217.78710938,56.5700073242,-680.75),CFrame.new(6473.1640625,52.3440093994,-1231.7779541),CFrame.new(6919.08007812,57.7310028076,-940.838989258),CFrame.new(6615.23193359,52.3440093994,-978.935974121),CFrame.new(6998.79492188,53.7310028076,-519.408996582)}},
-            {LevelReq=1600,Mob="Dragon Crew Archer",Name="DragonCrewQuest",Tier=2,Boss=false,Quest=CFrame.new(6735.11083984,126.990005493,-711.098022461),Spawns={CFrame.new(6582.80517578,521.322998047,505.264007568),CFrame.new(6668.76220703,481.37701416,329.122009277),CFrame.new(6948.45800781,482.878997803,185.022994995),CFrame.new(6762.49707031,481.37701416,110.770004272),CFrame.new(6818.58886719,482.878997803,512.726989746)}},
-            {LevelReq=1625,Mob="Hydra Enforcer",Name="VenomCrewQuest",Tier=1,Boss=false,Quest=CFrame.new(5214.33886719,1003.46801758,759.507019043),Spawns={CFrame.new(4462.65283203,1005.10198975,551.005981445),CFrame.new(4581.51904297,1003.15197754,704.937011719),CFrame.new(4434.08007812,1005.65301514,209.520996094),CFrame.new(4671.68896484,1004.33398438,-14.5670013428),CFrame.new(4547.11523438,1003.10198975,334.195007324),CFrame.new(4456.42285156,1008.45300293,418.837005615)}},
-            {LevelReq=1650,Mob="Venomous Assailant",Name="VenomCrewQuest",Tier=2,Boss=false,Quest=CFrame.new(5214.33886719,1003.46801758,759.507019043),Spawns={CFrame.new(4448.78320312,1222.02197266,540.538024902),CFrame.new(4879.91992188,1093.68896484,1104.00805664),CFrame.new(4443.046875,1237.02404785,335.859985352),CFrame.new(4637.88378906,1078.78601074,882.41998291),CFrame.new(4674.92675781,1134.82702637,996.309020996),CFrame.new(4452.81689453,1220.82104492,698.911987305)}},
-            {LevelReq=1675,Mob="Hydra Leader",Name="VenomCrewQuest",Tier=3,Boss=true,Quest=CFrame.new(5214.33886719,1003.46801758,759.507019043),Spawns={CFrame.new(5888.77392578,1020.14898682,-117.815002441)}},
-            {LevelReq=1700,Mob="Marine Commodore",Name="MarineTreeIsland",Tier=1,Boss=false,Quest=CFrame.new(2485.73291016,73.3460083008,-6788.625),Spawns={CFrame.new(2577.25390625,75.6100006104,-7739.87207031),CFrame.new(2995.37988281,75.6100006104,-8054.45703125),CFrame.new(2367.90795898,75.6100006104,-7794.95605469),CFrame.new(2685.39990234,75.6100006104,-8066.04980469),CFrame.new(3222.41699219,75.6100006104,-7820.55712891),CFrame.new(2497.77490234,81.8470001221,-7356.93896484)}},
-            {LevelReq=1725,Mob="Marine Rear Admiral",Name="MarineTreeIsland",Tier=2,Boss=false,Quest=CFrame.new(2485.73291016,73.3460083008,-6788.625),Spawns={CFrame.new(3920.06103516,146.225997925,-7175.20605469),CFrame.new(3973.73803711,123.912002563,-6931.93701172),CFrame.new(3465.18408203,123.912002563,-7181.78417969),CFrame.new(3761.81005859,123.912002563,-6823.52197266),CFrame.new(3753.50292969,123.912002563,-7403.22021484)}},
-            {LevelReq=1750,Mob="Kilo Admiral",Name="MarineTreeIsland",Tier=3,Boss=true,Quest=CFrame.new(2485.73291016,73.3460083008,-6788.625),Spawns={CFrame.new(2998.29492188,508.794006348,-7344.32177734)}},
-            {LevelReq=1775,Mob="Fishman Raider",Name="DeepForestIsland3",Tier=1,Boss=false,Quest=CFrame.new(-10581.65625,330.87298584,-8761.18652344),Spawns={CFrame.new(-10523.7558594,332.602996826,-8597.58886719),CFrame.new(-10117.9472656,332.602996826,-8174.68603516),CFrame.new(-10223.1142578,332.602996826,-8482.54589844),CFrame.new(-10391.7382812,332.602996826,-8212.27636719),CFrame.new(-10853.8564453,332.602996826,-8425.24023438),CFrame.new(-10603.6445312,332.602996826,-8309.12597656)}},
-            {LevelReq=1800,Mob="Fishman Captain",Name="DeepForestIsland3",Tier=2,Boss=false,Quest=CFrame.new(-10581.65625,330.87298584,-8761.18652344),Spawns={CFrame.new(-11210.2685547,331.82598877,-9072.71191406),CFrame.new(-10828.1064453,331.82598877,-9049.14648438),CFrame.new(-10736.6728516,331.82598877,-8807.57910156),CFrame.new(-11107.8535156,331.82598877,-8842.91601562),CFrame.new(-11072.5996094,331.82598877,-8610.07226562),CFrame.new(-11135.2001953,331.82598877,-9240.88671875)}},
-            {LevelReq=1825,Mob="Forest Pirate",Name="DeepForestIsland",Tier=1,Boss=false,Quest=CFrame.new(-13234.0400391,331.488006592,-7625.40087891),Spawns={CFrame.new(-13345.5419922,332.226013184,-7630.7578125),CFrame.new(-13651.5429688,332.226013184,-7894.7578125),CFrame.new(-13600.5429688,332.226013184,-7741.7578125),CFrame.new(-13105.5429688,332.226013184,-7705.75683594),CFrame.new(-13513.5429688,332.226013184,-8008.7578125),CFrame.new(-13279.5429688,332.226013184,-7897.7578125)}},
-            {LevelReq=1850,Mob="Mythological Pirate",Name="DeepForestIsland",Tier=2,Boss=false,Quest=CFrame.new(-13234.0400391,331.488006592,-7625.40087891),Spawns={CFrame.new(-13732.0478516,469.433013916,-6826.96484375),CFrame.new(-13456.0498047,469.433013916,-7039.96386719),CFrame.new(-13876.0478516,469.433013916,-7009.96484375),CFrame.new(-13221.0302734,519.103027344,-6902.01806641),CFrame.new(-13221.03125,519.103027344,-6689.01611328),CFrame.new(-13320.0302734,519.103027344,-6785.01806641)}},
-            {LevelReq=1875,Mob="Captain Elephant",Name="DeepForestIsland",Tier=3,Boss=true,Quest=CFrame.new(-13234.0400391,331.488006592,-7625.40087891),Spawns={CFrame.new(-13365.5292969,321.230987549,-8484.99023438)}},
-            {LevelReq=1900,Mob="Jungle Pirate",Name="DeepForestIsland2",Tier=1,Boss=false,Quest=CFrame.new(-12680.3818359,389.971008301,-9902.01953125),Spawns={CFrame.new(-11902.2734375,331.291992188,-10432.0673828),CFrame.new(-12142.4589844,331.602996826,-10419.9111328),CFrame.new(-11708.4316406,331.875,-10700.0517578),CFrame.new(-11918.1035156,332.518005371,-10744.0898438),CFrame.new(-11612.4667969,335.821990967,-10489.4091797),CFrame.new(-12321.3115234,331.437011719,-10669.2548828),CFrame.new(-12306.3486328,331.071990967,-10352.8779297)}},
-            {LevelReq=1925,Mob="Musketeer Pirate",Name="DeepForestIsland2",Tier=2,Boss=false,Quest=CFrame.new(-12680.3818359,389.971008301,-9902.01953125),Spawns={CFrame.new(-13556.078125,391.394012451,-9735.94433594),CFrame.new(-13198.6435547,391.394012451,-9602.29589844),CFrame.new(-13075.6435547,391.394012451,-9890.29589844),CFrame.new(-13270.8818359,472.062011719,-9860.66113281),CFrame.new(-13337.8818359,472.062011719,-9698.66113281),CFrame.new(-13417.6435547,391.394012451,-9962.29589844),CFrame.new(-13514.8681641,403.403991699,-9866.51953125)}},
-            {LevelReq=1950,Mob="Beautiful Pirate",Name="DeepForestIsland2",Tier=3,Boss=true,Quest=CFrame.new(-12680.3818359,389.971008301,-9902.01953125),Spawns={CFrame.new(5367.31396484,26.3950042725,-64.7010040283)}},
-            {LevelReq=1975,Mob="Reborn Skeleton",Name="HauntedQuest1",Tier=1,Boss=false,Quest=CFrame.new(-9479.21679688,141.214996338,5566.09277344),Spawns={CFrame.new(-8762.65722656,141.611999512,6183.33984375),CFrame.new(-8710.1015625,140.95300293,6112.93017578),CFrame.new(-8682.1015625,140.95300293,5968.93017578),CFrame.new(-8868.1015625,140.95300293,6034.93017578),CFrame.new(-8646.1015625,140.95300293,5850.93017578),CFrame.new(-8826.1015625,140.95300293,6165.93017578),CFrame.new(-8811.56542969,143.104995728,5871.75292969)}},
-            {LevelReq=2000,Mob="Living Zombie",Name="HauntedQuest1",Tier=2,Boss=false,Quest=CFrame.new(-9479.21679688,141.214996338,5566.09277344),Spawns={CFrame.new(-10184.1015625,152.95300293,5741.93017578),CFrame.new(-10293.1015625,152.95300293,5960.93017578),CFrame.new(-10170.9023438,141.175003052,6159.62695312),CFrame.new(-10061.9023438,140.175003052,6038.62695312),CFrame.new(-10205.1015625,151.95300293,5861.93017578),CFrame.new(-9956.1015625,140.95300293,5966.93017578)}},
-            {LevelReq=2025,Mob="Demonic Soul",Name="HauntedQuest2",Tier=1,Boss=false,Quest=CFrame.new(-9516.99316406,172.016998291,6078.46484375),Spawns={CFrame.new(-9565.95605469,171.95300293,6235.40820312),CFrame.new(-9344.95605469,171.95300293,6201.40820312),CFrame.new(-9631.95605469,171.95300293,6053.40820312),CFrame.new(-9426.95605469,171.95300293,6048.40820312),CFrame.new(-9253.95605469,171.95300293,6050.40820312),CFrame.new(-9753.95605469,171.95300293,6166.40820312)}},
-            {LevelReq=2050,Mob="Posessed Mummy",Name="HauntedQuest2",Tier=2,Boss=false,Quest=CFrame.new(-9516.99316406,172.016998291,6078.46484375),Spawns={CFrame.new(-9609.3515625,5.95300292969,6361.97412109),CFrame.new(-9759.3515625,26.9530029297,6051.97412109),CFrame.new(-9449.3515625,5.95300292969,6342.97412109),CFrame.new(-9759.3515625,26.9530029297,6368.97412109),CFrame.new(-9399.64746094,12.1979980469,6118.81103516)}},
-            {LevelReq=2075,Mob="Peanut Scout",Name="NutsIslandQuest",Tier=1,Boss=false,Quest=CFrame.new(-2105.53198242,37.25,-10195.5087891),Spawns={CFrame.new(-2078.09106445,12.8549957275,-9997.10351562),CFrame.new(-1865.42700195,8.85499572754,-10086.2324219),CFrame.new(-2065.34790039,34.9519958496,-10066.8105469),CFrame.new(-1924.00097656,37.2720031738,-10199.6630859),CFrame.new(-2294.24804688,37.2369995117,-10176.1210938),CFrame.new(-2250.19091797,8.85499572754,-9948.83886719),CFrame.new(-2377.28295898,37.9519958496,-10308.21875)}},
-            {LevelReq=2100,Mob="Peanut President",Name="NutsIslandQuest",Tier=2,Boss=false,Quest=CFrame.new(-2105.53198242,37.25,-10195.5087891),Spawns={CFrame.new(-2311.98706055,87.3229980469,-10609.3427734),CFrame.new(-1874.36206055,37.2220001221,-10596.5761719),CFrame.new(-1996.06994629,37.2220001221,-10496.9267578),CFrame.new(-2247.47607422,87.3229980469,-10440.8681641),CFrame.new(-2395.12402344,87.3760070801,-10456.3066406),CFrame.new(-1993.40600586,37.2220001221,-10682.9052734)}},
-            {LevelReq=2125,Mob="Ice Cream Chef",Name="IceCreamIslandQuest",Tier=1,Boss=false,Quest=CFrame.new(-819.37701416,64.9260101318,-10967.2832031),Spawns={CFrame.new(-966.289001465,64.5590057373,-10973.5576172),CFrame.new(-1109.2869873,64.5590057373,-10931.265625),CFrame.new(-931.744995117,64.5590057373,-11146.7304688),CFrame.new(-797.031005859,64.5590057373,-10790.7246094),CFrame.new(-715.434020996,64.5590057373,-10920.4355469),CFrame.new(-502.410003662,64.5590057373,-10873.7949219)}},
-            {LevelReq=2150,Mob="Ice Cream Commander",Name="IceCreamIslandQuest",Tier=2,Boss=false,Quest=CFrame.new(-819.37701416,64.9260101318,-10967.2832031),Spawns={CFrame.new(-366.812988281,64.6529998779,-11094.4228516),CFrame.new(-657.549987793,129.740997314,-11215.7919922),CFrame.new(-528.749023438,65.4790039062,-11348.9228516),CFrame.new(-883.630004883,70.1410064697,-11485.5253906),CFrame.new(-770.414978027,125.61100769,-11159.8408203),CFrame.new(-675.096984863,67.6670074463,-11371.7246094)}},
-            {LevelReq=2175,Mob="Cake Queen",Name="IceCreamIslandQuest",Tier=3,Boss=true,Quest=CFrame.new(-819.37701416,64.9260101318,-10967.2832031),Spawns={CFrame.new(-678.478027344,381.856994629,-11114.3457031)}},
-            {LevelReq=2200,Mob="Cookie Crafter",Name="CakeQuest1",Tier=1,Boss=false,Quest=CFrame.new(-2022.2989502,36.9280090332,-12030.9765625),Spawns={CFrame.new(-2321.71191406,37.0050048828,-12216.7841797),CFrame.new(-2499.16894531,37.0050048828,-12165.0185547),CFrame.new(-2464.47705078,37.0050048828,-12049.9326172),CFrame.new(-2342.87304688,37.0050048828,-12009.2382812),CFrame.new(-2212.88989258,37.0050048828,-11969.2568359),CFrame.new(-2423.39892578,37.0050048828,-12265.7666016),CFrame.new(-2246.37402344,37.0050048828,-12126.9414062)}},
-            {LevelReq=2225,Mob="Cake Guard",Name="CakeQuest1",Tier=2,Boss=false,Quest=CFrame.new(-2022.2989502,36.9280090332,-12030.9765625),Spawns={CFrame.new(-1531.41101074,35.2190093994,-12132.4394531),CFrame.new(-1693.97998047,35.2190093994,-12436.84375),CFrame.new(-1736.54394531,35.2190093994,-12249.0605469),CFrame.new(-1471.12805176,35.2190093994,-12436.84375),CFrame.new(-1418.51098633,35.2190093994,-12255.71875)}},
-            {LevelReq=2250,Mob="Baking Staff",Name="CakeQuest2",Tier=1,Boss=false,Quest=CFrame.new(-1928.31799316,37.7299957275,-12840.6259766),Spawns={CFrame.new(-1720.85095215,34.6650085449,-13087.125),CFrame.new(-1828.80102539,34.6650085449,-12699.4384766),CFrame.new(-1980.43701172,34.6650085449,-12983.8408203),CFrame.new(-1774.07800293,34.6650085449,-12850.4521484),CFrame.new(-1847.17797852,34.6650085449,-13132.5039062),CFrame.new(-1759.28601074,34.6650085449,-12994.8398438)}},
-            {LevelReq=2275,Mob="Head Baker",Name="CakeQuest2",Tier=2,Boss=false,Quest=CFrame.new(-1928.31799316,37.7299957275,-12840.6259766),Spawns={CFrame.new(-2263.35400391,51.0099945068,-12711.3916016),CFrame.new(-2251.57592773,51.0099945068,-13033.3974609),CFrame.new(-2389.22900391,51.0099945068,-13018.3349609),CFrame.new(-2369.09008789,51.0099945068,-12807.921875),CFrame.new(-2151.37792969,51.0099945068,-13033.3974609),CFrame.new(-2100.70507812,51.0099945068,-12720.9658203)}},
-            {LevelReq=2300,Mob="Cocoa Warrior",Name="ChocQuest1",Tier=1,Boss=false,Quest=CFrame.new(231.75,23.8999938965,-12200.2919922),Spawns={CFrame.new(6.33200073242,26.2250061035,-12305.2089844),CFrame.new(-125.007003784,26.2250061035,-12345.8085938),CFrame.new(167.979003906,26.2250061035,-12238.8740234),CFrame.new(-128.669998169,26.2250061035,-12249.8134766),CFrame.new(34.8440093994,26.2250061035,-12169.6630859)}},
-            {LevelReq=2325,Mob="Chocolate Bar Battler",Name="ChocQuest1",Tier=2,Boss=false,Quest=CFrame.new(231.75,23.8999938965,-12200.2919922),Spawns={CFrame.new(717.515014648,25.5820007324,-12557.6708984),CFrame.new(582.828979492,25.5820007324,-12550.7041016),CFrame.new(701.312011719,25.5820007324,-12708.2148438),CFrame.new(598.833007812,25.5820007324,-12395.1210938),CFrame.new(833.197998047,25.5820007324,-12671.4042969),CFrame.new(806.958984375,25.5820007324,-12773.078125)}},
-            {LevelReq=2350,Mob="Sweet Thief",Name="ChocQuest2",Tier=1,Boss=false,Quest=CFrame.new(151.197998047,23.8910064697,-12774.6171875),Spawns={CFrame.new(-140.257995605,25.5820007324,-12652.3115234),CFrame.new(5.36599731445,25.5820007324,-12537.4257812),CFrame.new(88.4720001221,25.5820007324,-12662.2070312),CFrame.new(-77.6470031738,25.5820007324,-12765.6201172),CFrame.new(143.970001221,25.5820007324,-12531.7207031)}},
-            {LevelReq=2375,Mob="Candy Rebel",Name="ChocQuest2",Tier=2,Boss=false,Quest=CFrame.new(151.197998047,23.8910064697,-12774.6171875),Spawns={CFrame.new(166.820007324,25.5820007324,-13035.3457031),CFrame.new(47.9230041504,25.5820007324,-13029.2402344),CFrame.new(220.378005981,26.5820007324,-12913.9658203),CFrame.new(-72.1289978027,25.5820007324,-12940.3242188),CFrame.new(52.9980010986,26.5820007324,-12851.6757812)}},
-            {LevelReq=2400,Mob="Candy Pirate",Name="CandyQuest1",Tier=1,Boss=false,Quest=CFrame.new(-1164.49804688,59.2689971924,-14492.6181641),Spawns={CFrame.new(-1378.65698242,38.0240020752,-14802.8837891),CFrame.new(-1428.1529541,36.4069976807,-14637.8964844),CFrame.new(-1332.67504883,24.3430023193,-14327.3603516),CFrame.new(-1255.7989502,33.4669952393,-14507.0966797),CFrame.new(-1226.7869873,36.300994873,-14777.5878906),CFrame.new(-1440.3260498,32.4929962158,-14435.9345703)}},
-            {LevelReq=2425,Mob="Snow Demon",Name="CandyQuest1",Tier=2,Boss=false,Quest=CFrame.new(-1164.49804688,59.2689971924,-14492.6181641),Spawns={CFrame.new(-784.67199707,24.8099975586,-14631.7851562),CFrame.new(-771.226013184,14.2239990234,-14434.3037109),CFrame.new(-936.151977539,13.9960021973,-14552.4980469),CFrame.new(-813.560974121,15.3430023193,-14322.7148438),CFrame.new(-897.773010254,24.5939941406,-14733.7714844)}},
-            {LevelReq=2450,Mob="Isle Outlaw",Name="TikiQuest1",Tier=1,Boss=false,Quest=CFrame.new(-16548.8164062,55.6060028076,-172.81199646),Spawns={CFrame.new(-16433.71875,57.2210083008,-195.473007202),CFrame.new(-16351.7773438,23.4940032959,-282.45401001),CFrame.new(-16122.4052734,11.779006958,-257.354003906),CFrame.new(-16289.4882812,22.8740081787,-179.444000244),CFrame.new(-16163.4248047,11.9450073242,-99.3600006104)}},
-            {LevelReq=2475,Mob="Island Boy",Name="TikiQuest1",Tier=2,Boss=false,Quest=CFrame.new(-16548.8164062,55.6060028076,-172.81199646),Spawns={CFrame.new(-16991.7304688,12.766998291,-186.182998657),CFrame.new(-16736.21875,22.171005249,-131.720993042),CFrame.new(-16905.3046875,13.0939941406,-73.5070037842),CFrame.new(-16883.0488281,23.3470001221,-250.87399292),CFrame.new(-16661.5742188,57.3720092773,-252.962997437)}},
-            {LevelReq=2500,Mob="Sun-kissed Warrior",Name="TikiQuest2",Tier=1,Boss=false,Quest=CFrame.new(-16541.0214844,54.7709960938,1051.46105957),Spawns={CFrame.new(-16153.3652344,14.4649963379,942.447998047),CFrame.new(-16186.4208984,25.1040039062,1098.08300781),CFrame.new(-16413.5078125,56.7109985352,1054.43603516),CFrame.new(-16052.4560547,9.81799316406,1061.91296387),CFrame.new(-16357.3134766,21.0189971924,1005.65100098)}},
-            {LevelReq=2525,Mob="Isle Champion",Name="TikiQuest2",Tier=2,Boss=false,Quest=CFrame.new(-16541.0214844,54.7709960938,1051.46105957),Spawns={CFrame.new(-16940.7988281,14.1929931641,1070.8659668),CFrame.new(-16901.2304688,12.4510040283,969.968994141),CFrame.new(-16735.6757812,23.3460083008,1110.58496094),CFrame.new(-16618.7460938,58.3780059814,1099.5090332),CFrame.new(-16787.3203125,25.2050018311,992.132019043)}},
-            {LevelReq=2550,Mob="Serpent Hunter",Name="TikiQuest3",Tier=1,Boss=false,Quest=CFrame.new(-16665.1914062,104.596008301,1579.69396973),Spawns={CFrame.new(-16521.0625,106.093002319,1488.78503418),CFrame.new(-16599.7070312,71.0899963379,1757.91296387),CFrame.new(-16442.8261719,71.637008667,1693.44604492),CFrame.new(-16536.0253906,106.870010376,1347.14001465),CFrame.new(-16621.4199219,121.908004761,1290.68994141)}},
-            {LevelReq=2575,Mob="Skull Slayer",Name="TikiQuest3",Tier=2,Boss=false,Quest=CFrame.new(-16665.1914062,104.596008301,1579.69396973),Spawns={CFrame.new(-16855.0429688,122.457000732,1478.1529541),CFrame.new(-16812.8828125,72.1430053711,1757.16601562),CFrame.new(-16829.421875,193.199996948,1753.42199707),CFrame.new(-16948.578125,193.132003784,1643.61303711),CFrame.new(-16811.5625,86.125,1542.22900391),CFrame.new(-16985.7265625,59.2689971924,1632.82202148)}},
-            {LevelReq=2600,Mob="Reef Bandit",Name="SubmergedQuest1",Tier=1,Boss=false,Quest=CFrame.new(10780.6396484,-2088.4140625,9260.453125),Spawns={CFrame.new(10899.859375,-2145.23486328,9279.29394531),CFrame.new(11039.6269531,-2156.10327148,9279.11230469),CFrame.new(11085.1894531,-2160.54052734,9129.76367188),CFrame.new(10883.5478516,-2160.20458984,9075.48339844),CFrame.new(10980.5322266,-2160.41455078,9051.94921875)}},
-            {LevelReq=2625,Mob="Coral Pirate",Name="SubmergedQuest1",Tier=2,Boss=false,Quest=CFrame.new(10780.6396484,-2088.4140625,9260.453125),Spawns={CFrame.new(10703.7099609,-2087.29663086,9255.38183594),CFrame.new(10646.8447266,-2087.30175781,9304.16894531),CFrame.new(10839.4765625,-2087.29907227,9486.078125),CFrame.new(10733.1787109,-2087.29711914,9411.109375),CFrame.new(10824.5439453,-2087.29467773,9357.23144531)}},
-            {LevelReq=2650,Mob="Sea Chanter",Name="SubmergedQuest2",Tier=1,Boss=false,Quest=CFrame.new(10883.5986328,-2086.88891602,10034.0195312),Spawns={CFrame.new(10625.5058594,-2087.37304688,10191.6953125),CFrame.new(10786.3867188,-2087.37304688,10105.2617188),CFrame.new(10680.0761719,-2056.67480469,9933.88964844),CFrame.new(10581.5078125,-2071.7487793,10020.6503906),CFrame.new(10466.3046875,-2087.37304688,10106.8476562)}},
-            {LevelReq=2675,Mob="High Disciple",Name="SubmergedQuest3",Tier=1,Boss=false,Quest=CFrame.new(9637.29394531,-1993.13513184,9616.30175781),Spawns={CFrame.new(9854.43554688,-1995.0880127,9963.9375),CFrame.new(9835.43554688,-1995.0880127,9533.9375),CFrame.new(9778.43554688,-1995.0880127,9876.9375),CFrame.new(9778.43554688,-1995.0880127,9720.9375),CFrame.new(9886.43554688,-1995.0880127,9629.9375)}},
-            {LevelReq=2675,Mob="Ocean Prophet",Name="SubmergedQuest2",Tier=2,Boss=false,Quest=CFrame.new(9637.29394531,-1993.13513184,9616.30175781),Spawns={CFrame.new(10861.9707031,-2006.61682129,10245.2148438),CFrame.new(10924.234375,-1998.92248535,10121.0537109),CFrame.new(11003.3261719,-2007.02575684,10225.0625),CFrame.new(11111.5507812,-2007.3404541,10201.5078125),CFrame.new(11129.7890625,-2007.7989502,10051.4726562)}},
-            {LevelReq=2700,Mob="Grand Devotee",Name="SubmergedQuest3",Tier=2,Boss=false,Quest=CFrame.new(9637.29394531,-1993.13513184,9616.30175781),Spawns={CFrame.new(9620.51171875,-1994.39746094,9871.70898438),CFrame.new(9608.92773438,-1994.39758301,9956.375),CFrame.new(9719.8828125,-1989.86169434,10134.2207031),CFrame.new(9561.1796875,-1989.8638916,10090.4003906),CFrame.new(9559.19433594,-1994.39746094,9798.66503906),CFrame.new(9589.19726562,-1994.19165039,9704.75976562)}},
-        },
-    }
-    
-        local function rows() return preloadRows[seaIndex()] or {} end
-        local function nearestPoint(points)
-            local _,_,root=character()
-            local best,metric=nil,math.huge
-            for _,point in ipairs(points) do
-                local d=root and (root.Position-point.Position).Magnitude or 0
-                if d<metric then best,metric=point,d end
-            end
-            return best
+-- Adapted static quest/boss/island/shop data from the two supplied sources.
+local function questForLevel()
+    local MyLevel, CFrameQuest, CFrameMon, Mon, NameMon, NameQuest, LevelQuest, Entrance
+    local data = LocalPlayer:FindFirstChild("Data")
+    local level = data and data:FindFirstChild("Level")
+    if not level or level.Value > 2600 then return nil end
+    local L_23_, L_24_, L_25_ = sourcePlaceId() == 2753915549, sourcePlaceId() == 4442272183, sourcePlaceId() == 7449423635
+	MyLevel = game:GetService('Players').LocalPlayer.Data.Level.Value;
+	if L_23_ then
+		if MyLevel == 1 or MyLevel <= 9 then
+			Mon, NameMon, NameQuest, LevelQuest = "Bandit", "Bandit", "BanditQuest1", 1;
+			CFrameQuest = CFrame.new(1059.37195, 15.4495068, 1550.4231, 0.939700544, - 0, - 0.341998369, 0, 1, - 0, 0.341998369, 0, 0.939700544)
+			CFrameMon = CFrame.new(1045.962646484375, 27.00250816345215, 1560.8203125)
+		elseif MyLevel == 10 or MyLevel <= 14 then
+			Mon, NameMon, NameQuest, LevelQuest = "Monkey", "Monkey", "JungleQuest", 1;
+			CFrameQuest = CFrame.new(- 1598.08911, 35.5501175, 153.377838, 0, 0, 1, 0, 1, - 0, - 1, 0, 0)
+			CFrameMon = CFrame.new(- 1448.51806640625, 67.85301208496094, 11.46579647064209)
+		elseif MyLevel == 15 or MyLevel <= 29 then
+			Mon, NameMon, NameQuest, LevelQuest = "Gorilla", "Gorilla", "JungleQuest", 2;
+			CFrameQuest = CFrame.new(- 1598.08911, 35.5501175, 153.377838, 0, 0, 1, 0, 1, - 0, - 1, 0, 0)
+			CFrameMon = CFrame.new(- 1129.8836669921875, 40.46354675292969, - 525.4237060546875)
+		elseif MyLevel == 30 or MyLevel <= 39 then
+			Mon, NameMon, NameQuest, LevelQuest = "Pirate", "Pirate", "BuggyQuest1", 1;
+			CFrameQuest = CFrame.new(- 1141.07483, 4.10001802, 3831.5498, 0.965929627, - 0, - 0.258804798, 0, 1, - 0, 0.258804798, 0, 0.965929627)
+			CFrameMon = CFrame.new(- 1103.513427734375, 13.752052307128906, 3896.091064453125)
+		elseif MyLevel == 40 or MyLevel <= 59 then
+			Mon, NameMon, NameQuest, LevelQuest = "Brute", "Brute", "BuggyQuest1", 2;
+			CFrameQuest = CFrame.new(- 1141.07483, 4.10001802, 3831.5498, 0.965929627, - 0, - 0.258804798, 0, 1, - 0, 0.258804798, 0, 0.965929627)
+			CFrameMon = CFrame.new(- 1140.083740234375, 14.809885025024414, 4322.92138671875)
+		elseif MyLevel == 60 or MyLevel <= 74 then
+			Mon, NameMon, NameQuest, LevelQuest = "Desert Bandit", "Desert Bandit", "DesertQuest", 1;
+			CFrameQuest = CFrame.new(894.488647, 5.14000702, 4392.43359, 0.819155693, - 0, - 0.573571265, 0, 1, - 0, 0.573571265, 0, 0.819155693)
+			CFrameMon = CFrame.new(924.7998046875, 6.44867467880249, 4481.5859375)
+		elseif MyLevel == 75 or MyLevel <= 89 then
+			NameMon, NameQuest, LevelQuest = "Desert Officer", "DesertQuest", 2;
+			CFrameQuest = CFrame.new(894.488647, 5.14000702, 4392.43359, 0.819155693, - 0, - 0.573571265, 0, 1, - 0, 0.573571265, 0, 0.819155693)
+			CFrameMon = CFrame.new(1608.2822265625, 8.614224433898926, 4371.00732421875)
+		elseif MyLevel == 90 or MyLevel <= 99 then
+			NameMon, NameQuest, LevelQuest = "Snow Bandit", "SnowQuest", 1;
+			CFrameQuest = CFrame.new(1389.74451, 88.1519318, - 1298.90796, - 0.342042685, 0, 0.939684391, 0, 1, 0, - 0.939684391, 0, - 0.342042685)
+			CFrameMon = CFrame.new(1354.347900390625, 87.27277374267578, - 1393.946533203125)
+		elseif MyLevel == 100 or MyLevel <= 119 then
+			NameMon, NameQuest, LevelQuest = "Snowman", "SnowQuest", 2;
+			CFrameQuest = CFrame.new(1389.74451, 88.1519318, - 1298.90796, - 0.342042685, 0, 0.939684391, 0, 1, 0, - 0.939684391, 0, - 0.342042685)
+			CFrameMon = CFrame.new(1201.6412353515625, 144.57958984375, - 1550.0670166015625)
+		elseif MyLevel == 120 or MyLevel <= 149 then
+			NameMon, NameQuest, LevelQuest = "Chief Petty Officer", "MarineQuest2", 1;
+			CFrameQuest = CFrame.new(- 5039.58643, 27.3500385, 4324.68018, 0, 0, - 1, 0, 1, 0, 1, 0, 0)
+			CFrameMon = CFrame.new(- 4881.23095703125, 22.65204429626465, 4273.75244140625)
+		elseif MyLevel == 150 or MyLevel <= 174 then
+			NameMon, NameQuest, LevelQuest = "Sky Bandit", "SkyQuest", 1;
+			CFrameQuest = CFrame.new(- 4839.53027, 716.368591, - 2619.44165, 0.866007268, 0, 0.500031412, 0, 1, 0, - 0.500031412, 0, 0.866007268)
+			CFrameMon = CFrame.new(- 4953.20703125, 295.74420166015625, - 2899.22900390625)
+		elseif MyLevel == 175 or MyLevel <= 189 then
+			NameMon, NameQuest, LevelQuest = "Dark Master", "SkyQuest", 2;
+			CFrameQuest = CFrame.new(- 4839.53027, 716.368591, - 2619.44165, 0.866007268, 0, 0.500031412, 0, 1, 0, - 0.500031412, 0, 0.866007268)
+			CFrameMon = CFrame.new(- 5259.8447265625, 391.3976745605469, - 2229.035400390625)
+		elseif MyLevel == 190 or MyLevel <= 209 then
+			NameMon, NameQuest, LevelQuest = "Prisoner", "PrisonerQuest", 1;
+			CFrameQuest = CFrame.new(5308.93115, 1.65517521, 475.120514, - 0.0894274712, - 5.00292918e-09, - 0.995993316, 1.60817859e-09, 1, - 5.16744869e-09, 0.995993316, - 2.06384709e-09, - 0.0894274712)
+			CFrameMon = CFrame.new(5098.9736328125, - 0.3204058110713959, 474.2373352050781)
+		elseif MyLevel == 210 or MyLevel <= 249 then
+			NameMon, NameQuest, LevelQuest = "Dangerous Prisoner", "PrisonerQuest", 2;
+			CFrameQuest = CFrame.new(5308.93115, 1.65517521, 475.120514, - 0.0894274712, - 5.00292918e-09, - 0.995993316, 1.60817859e-09, 1, - 5.16744869e-09, 0.995993316, - 2.06384709e-09, - 0.0894274712)
+			CFrameMon = CFrame.new(5654.5634765625, 15.633401870727539, 866.2991943359375)
+		elseif MyLevel == 250 or MyLevel <= 274 then
+			NameMon, NameQuest, LevelQuest = "Toga Warrior", "ColosseumQuest", 1;
+			CFrameQuest = CFrame.new(- 1580.04663, 6.35000277, - 2986.47534, - 0.515037298, 0, - 0.857167721, 0, 1, 0, 0.857167721, 0, - 0.515037298)
+			CFrameMon = CFrame.new(- 1820.21484375, 51.68385696411133, - 2740.6650390625)
+		elseif MyLevel == 275 or MyLevel <= 299 then
+			NameMon, NameQuest, LevelQuest = "Gladiator", "ColosseumQuest", 2;
+			CFrameQuest = CFrame.new(- 1580.04663, 6.35000277, - 2986.47534, - 0.515037298, 0, - 0.857167721, 0, 1, 0, 0.857167721, 0, - 0.515037298)
+			CFrameMon = CFrame.new(- 1292.838134765625, 56.380882263183594, - 3339.031494140625)
+		elseif MyLevel == 300 or MyLevel <= 324 then
+			NameMon, NameQuest, LevelQuest = "Military Soldier", "MagmaQuest", 1;
+			CFrameQuest = CFrame.new(- 5313.37012, 10.9500084, 8515.29395, - 0.499959469, 0, 0.866048813, 0, 1, 0, - 0.866048813, 0, - 0.499959469)
+			CFrameMon = CFrame.new(- 5411.16455078125, 11.081554412841797, 8454.29296875)
+		elseif MyLevel == 325 or MyLevel <= 374 then
+			NameMon, NameQuest, LevelQuest = "Military Spy", "MagmaQuest", 2;
+			CFrameQuest = CFrame.new(- 5313.37012, 10.9500084, 8515.29395, - 0.499959469, 0, 0.866048813, 0, 1, 0, - 0.866048813, 0, - 0.499959469)
+			CFrameMon = CFrame.new(- 5802.8681640625, 86.26241302490234, 8828.859375)
+		elseif MyLevel == 375 or MyLevel <= 399 then
+			NameMon, NameQuest, LevelQuest = "Fishman Warrior", "FishmanQuest", 1;
+			CFrameQuest = CFrame.new(61122.65234375, 18.497442245483, 1569.3997802734)
+			CFrameMon = CFrame.new(60878.30078125, 18.482830047607422, 1543.7574462890625)
+			Entrance=Vector3.new(61163.8515625, 11.6796875, 1819.7841796875)
+		elseif MyLevel == 400 or MyLevel <= 449 then
+			NameMon, NameQuest, LevelQuest = "Fishman Commando", "FishmanQuest", 2;
+			CFrameQuest = CFrame.new(61122.65234375, 18.497442245483, 1569.3997802734)
+			CFrameMon = CFrame.new(61922.6328125, 18.482830047607422, 1493.934326171875)
+			Entrance=Vector3.new(61163.8515625, 11.6796875, 1819.7841796875)
+		elseif MyLevel == 450 or MyLevel <= 474 then
+			NameMon, NameQuest, LevelQuest = "God's Guard", "SkyExp1Quest", 1;
+			CFrameQuest = CFrame.new(- 4721.88867, 843.874695, - 1949.96643, 0.996191859, - 0, - 0.0871884301, 0, 1, - 0, 0.0871884301, 0, 0.996191859)
+			CFrameMon = CFrame.new(- 4710.04296875, 845.2769775390625, - 1927.3079833984375)
+			Entrance=Vector3.new(- 4607.82275, 872.54248, - 1667.55688)
+		elseif MyLevel == 475 or MyLevel <= 524 then
+			NameMon, NameQuest, LevelQuest = "Shanda", "SkyExp1Quest", 2;
+			CFrameQuest = CFrame.new(- 7859.09814, 5544.19043, - 381.476196, - 0.422592998, 0, 0.906319618, 0, 1, 0, - 0.906319618, 0, - 0.422592998)
+			CFrameMon = CFrame.new(- 7678.48974609375, 5566.40380859375, - 497.2156066894531)
+			Entrance=Vector3.new(- 7894.6176757813, 5547.1416015625, - 380.29119873047)
+		elseif MyLevel == 525 or MyLevel <= 549 then
+			NameMon, NameQuest, LevelQuest = "Royal Squad", "SkyExp2Quest", 1;
+			CFrameQuest = CFrame.new(- 7906.81592, 5634.6626, - 1411.99194, 0, 0, - 1, 0, 1, 0, 1, 0, 0)
+			CFrameMon = CFrame.new(- 7624.25244140625, 5658.13330078125, - 1467.354248046875)
+		elseif MyLevel == 550 or MyLevel <= 624 then
+			NameMon, NameQuest, LevelQuest = "Royal Soldier", "SkyExp2Quest", 2;
+			CFrameQuest = CFrame.new(- 7906.81592, 5634.6626, - 1411.99194, 0, 0, - 1, 0, 1, 0, 1, 0, 0)
+			CFrameMon = CFrame.new(- 7836.75341796875, 5645.6640625, - 1790.6236572265625)
+		elseif MyLevel == 625 or MyLevel <= 649 then
+			NameMon, NameQuest, LevelQuest = "Galley Pirate", "FountainQuest", 1;
+			CFrameQuest = CFrame.new(5259.81982, 37.3500175, 4050.0293, 0.087131381, 0, 0.996196866, 0, 1, 0, - 0.996196866, 0, 0.087131381)
+			CFrameMon = CFrame.new(5551.02197265625, 78.90135192871094, 3930.412841796875)
+		elseif MyLevel >= 650 then
+			NameMon, NameQuest, LevelQuest = "Galley Captain", "FountainQuest", 2;
+			CFrameQuest = CFrame.new(5259.81982, 37.3500175, 4050.0293, 0.087131381, 0, 0.996196866, 0, 1, 0, - 0.996196866, 0, 0.087131381)
+			CFrameMon = CFrame.new(5441.95166015625, 42.50205993652344, 4950.09375)
+		end
+	elseif L_24_ then
+		if MyLevel == 700 or MyLevel <= 724 then
+			NameMon, NameQuest, LevelQuest = "Raider", "Area1Quest", 1;
+			CFrameQuest = CFrame.new(- 429.543518, 71.7699966, 1836.18188, - 0.22495985, 0, - 0.974368095, 0, 1, 0, 0.974368095, 0, - 0.22495985)
+			CFrameMon = CFrame.new(- 728.3267211914062, 52.779319763183594, 2345.7705078125)
+		elseif MyLevel == 725 or MyLevel <= 774 then
+			NameMon, NameQuest, LevelQuest = "Mercenary", "Area1Quest", 2;
+			CFrameQuest = CFrame.new(- 429.543518, 71.7699966, 1836.18188, - 0.22495985, 0, - 0.974368095, 0, 1, 0, 0.974368095, 0, - 0.22495985)
+			CFrameMon = CFrame.new(- 1004.3244018554688, 80.15886688232422, 1424.619384765625)
+		elseif MyLevel == 775 or MyLevel <= 799 then
+			NameMon, NameQuest, LevelQuest = "Swan Pirate", "Area2Quest", 1;
+			CFrameQuest = CFrame.new(638.43811, 71.769989, 918.282898, 0.139203906, 0, 0.99026376, 0, 1, 0, - 0.99026376, 0, 0.139203906)
+			CFrameMon = CFrame.new(1068.664306640625, 137.61428833007812, 1322.1060791015625)
+		elseif MyLevel == 800 or MyLevel <= 874 then
+			NameMon, NameQuest, LevelQuest = "Factory Staff", "Area2Quest", 2;
+			CFrameQuest = CFrame.new(632.698608, 73.1055908, 918.666321, - 0.0319722369, 8.96074881e-10, - 0.999488771, 1.36326533e-10, 1, 8.92172336e-10, 0.999488771, - 1.07732087e-10, - 0.0319722369)
+			CFrameMon = CFrame.new(73.07867431640625, 81.86344146728516, - 27.470672607421875)
+		elseif MyLevel == 875 or MyLevel <= 899 then
+			NameMon, NameQuest, LevelQuest = "Marine Lieutenant", "MarineQuest3", 1;
+			CFrameQuest = CFrame.new(- 2440.79639, 71.7140732, - 3216.06812, 0.866007268, 0, 0.500031412, 0, 1, 0, - 0.500031412, 0, 0.866007268)
+			CFrameMon = CFrame.new(- 2821.372314453125, 75.89727783203125, - 3070.089111328125)
+		elseif MyLevel == 900 or MyLevel <= 949 then
+			NameMon, NameQuest, LevelQuest = "Marine Captain", "MarineQuest3", 2;
+			CFrameQuest = CFrame.new(- 2440.79639, 71.7140732, - 3216.06812, 0.866007268, 0, 0.500031412, 0, 1, 0, - 0.500031412, 0, 0.866007268)
+			CFrameMon = CFrame.new(- 1861.2310791015625, 80.17658233642578, - 3254.697509765625)
+		elseif MyLevel == 950 or MyLevel <= 974 then
+			NameMon, NameQuest, LevelQuest = "Zombie", "ZombieQuest", 1;
+			CFrameQuest = CFrame.new(- 5497.06152, 47.5923004, - 795.237061, - 0.29242146, 0, - 0.95628953, 0, 1, 0, 0.95628953, 0, - 0.29242146)
+			CFrameMon = CFrame.new(- 5657.77685546875, 78.96973419189453, - 928.68701171875)
+		elseif MyLevel == 975 or MyLevel <= 999 then
+			NameMon, NameQuest, LevelQuest = "Vampire", "ZombieQuest", 2;
+			CFrameQuest = CFrame.new(- 5497.06152, 47.5923004, - 795.237061, - 0.29242146, 0, - 0.95628953, 0, 1, 0, 0.95628953, 0, - 0.29242146)
+			CFrameMon = CFrame.new(- 6037.66796875, 32.18463897705078, - 1340.6597900390625)
+		elseif MyLevel == 1000 or MyLevel <= 1049 then
+			NameMon, NameQuest, LevelQuest = "Snow Trooper", "SnowMountainQuest", 1;
+			CFrameQuest = CFrame.new(609.858826, 400.119904, - 5372.25928, - 0.374604106, 0, 0.92718488, 0, 1, 0, - 0.92718488, 0, - 0.374604106)
+			CFrameMon = CFrame.new(549.1473388671875, 427.3870544433594, - 5563.69873046875)
+		elseif MyLevel == 1050 or MyLevel <= 1099 then
+			NameMon, NameQuest, LevelQuest = "Winter Warrior", "SnowMountainQuest", 2;
+			CFrameQuest = CFrame.new(609.858826, 400.119904, - 5372.25928, - 0.374604106, 0, 0.92718488, 0, 1, 0, - 0.92718488, 0, - 0.374604106)
+			CFrameMon = CFrame.new(1142.7451171875, 475.6398010253906, - 5199.41650390625)
+		elseif MyLevel == 1100 or MyLevel <= 1124 then
+			NameMon, NameQuest, LevelQuest = "Lab Subordinate", "IceSideQuest", 1;
+			CFrameQuest = CFrame.new(- 6064.06885, 15.2422857, - 4902.97852, 0.453972578, - 0, - 0.891015649, 0, 1, - 0, 0.891015649, 0, 0.453972578)
+			CFrameMon = CFrame.new(- 5707.4716796875, 15.951709747314453, - 4513.39208984375)
+		elseif MyLevel == 1125 or MyLevel <= 1174 then
+			NameMon, NameQuest, LevelQuest = "Horned Warrior", "IceSideQuest", 2;
+			CFrameQuest = CFrame.new(- 6064.06885, 15.2422857, - 4902.97852, 0.453972578, - 0, - 0.891015649, 0, 1, - 0, 0.891015649, 0, 0.453972578)
+			CFrameMon = CFrame.new(- 6341.36669921875, 15.951770782470703, - 5723.162109375)
+		elseif MyLevel == 1175 or MyLevel <= 1199 then
+			NameMon, NameQuest, LevelQuest = "Magma Ninja", "FireSideQuest", 1;
+			CFrameQuest = CFrame.new(- 5428.03174, 15.0622921, - 5299.43457, - 0.882952213, 0, 0.469463557, 0, 1, 0, - 0.469463557, 0, - 0.882952213)
+			CFrameMon = CFrame.new(- 5449.6728515625, 76.65874481201172, - 5808.20068359375)
+		elseif MyLevel == 1200 or MyLevel <= 1249 then
+			NameMon, NameQuest, LevelQuest = "Lava Pirate", "FireSideQuest", 2;
+			CFrameQuest = CFrame.new(- 5428.03174, 15.0622921, - 5299.43457, - 0.882952213, 0, 0.469463557, 0, 1, 0, - 0.469463557, 0, - 0.882952213)
+			CFrameMon = CFrame.new(- 5213.33154296875, 49.73788070678711, - 4701.451171875)
+		elseif MyLevel == 1250 or MyLevel <= 1274 then
+			NameMon, NameQuest, LevelQuest = "Ship Deckhand", "ShipQuest1", 1;
+			CFrameQuest = CFrame.new(1037.80127, 125.092171, 32911.6016)
+			CFrameMon = CFrame.new(1212.0111083984375, 150.79205322265625, 33059.24609375)
+			Entrance=Vector3.new(923.21252441406, 126.9760055542, 32852.83203125)
+		elseif MyLevel == 1275 or MyLevel <= 1299 then
+			NameMon, NameQuest, LevelQuest = "Ship Engineer", "ShipQuest1", 2;
+			CFrameQuest = CFrame.new(1037.80127, 125.092171, 32911.6016)
+			CFrameMon = CFrame.new(919.4786376953125, 43.54401397705078, 32779.96875)
+			Entrance=Vector3.new(923.21252441406, 126.9760055542, 32852.83203125)
+		elseif MyLevel == 1300 or MyLevel <= 1324 then
+			NameMon, NameQuest, LevelQuest = "Ship Steward", "ShipQuest2", 1;
+			CFrameQuest = CFrame.new(968.80957, 125.092171, 33244.125)
+			CFrameMon = CFrame.new(919.4385375976562, 129.55599975585938, 33436.03515625)
+			Entrance=Vector3.new(923.21252441406, 126.9760055542, 32852.83203125)
+		elseif MyLevel == 1325 or MyLevel <= 1349 then
+			NameMon, NameQuest, LevelQuest = "Ship Officer", "ShipQuest2", 2;
+			CFrameQuest = CFrame.new(968.80957, 125.092171, 33244.125)
+			CFrameMon = CFrame.new(1036.0179443359375, 181.4390411376953, 33315.7265625)
+			Entrance=Vector3.new(923.21252441406, 126.9760055542, 32852.83203125)
+		elseif MyLevel == 1350 or MyLevel <= 1374 then
+			NameMon, NameQuest, LevelQuest = "Arctic Warrior", "FrostQuest", 1;
+			CFrameQuest = CFrame.new(5667.6582, 26.7997818, - 6486.08984, - 0.933587909, 0, - 0.358349502, 0, 1, 0, 0.358349502, 0, - 0.933587909)
+			CFrameMon = CFrame.new(5966.24609375, 62.97002029418945, - 6179.3828125)
+			Entrance=Vector3.new(- 6508.5581054688, 5000.034996032715, - 132.83953857422)
+		elseif MyLevel == 1375 or MyLevel <= 1424 then
+			NameMon, NameQuest, LevelQuest = "Snow Lurker", "FrostQuest", 2;
+			CFrameQuest = CFrame.new(5667.6582, 26.7997818, - 6486.08984, - 0.933587909, 0, - 0.358349502, 0, 1, 0, 0.358349502, 0, - 0.933587909)
+			CFrameMon = CFrame.new(5407.07373046875, 69.19437408447266, - 6880.88037109375)
+		elseif MyLevel == 1425 or MyLevel <= 1449 then
+			NameMon, NameQuest, LevelQuest = "Sea Soldier", "ForgottenQuest", 1;
+			CFrameQuest = CFrame.new(- 3054.44458, 235.544281, - 10142.8193, 0.990270376, - 0, - 0.13915664, 0, 1, - 0, 0.13915664, 0, 0.990270376)
+			CFrameMon = CFrame.new(- 3028.2236328125, 64.67451477050781, - 9775.4267578125)
+		elseif MyLevel >= 1450 then
+			NameMon, NameQuest, LevelQuest = "Water Fighter", "ForgottenQuest", 2;
+			CFrameQuest = CFrame.new(- 3054.44458, 235.544281, - 10142.8193, 0.990270376, - 0, - 0.13915664, 0, 1, - 0, 0.13915664, 0, 0.990270376)
+			CFrameMon = CFrame.new(- 3352.9013671875, 285.01556396484375, - 10534.841796875)
+		end
+	elseif L_25_ then
+		if MyLevel == 1500 or MyLevel <= 1524 then
+			NameMon, NameQuest, LevelQuest = "Pistol Millionaire", "PiratePortQuest", 1;
+			CFrameQuest = CFrame.new(- 290.074677, 42.9034653, 5581.58984, 0.965929627, - 0, - 0.258804798, 0, 1, - 0, 0.258804798, 0, 0.965929627)
+			CFrameMon = CFrame.new(- 245.9963836669922, 47.30615234375, 5584.1005859375)
+		elseif MyLevel == 1525 or MyLevel <= 1574 then
+			NameMon, NameQuest, LevelQuest = "Pistol Billionaire", "PiratePortQuest", 2;
+			CFrameQuest = CFrame.new(- 290.074677, 42.9034653, 5581.58984, 0.965929627, - 0, - 0.258804798, 0, 1, - 0, 0.258804798, 0, 0.965929627)
+			CFrameMon = CFrame.new(- 187.3301544189453, 86.23987579345703, 6013.513671875)
+		elseif MyLevel == 1575 or MyLevel <= 1599 then
+			NameMon, NameQuest, LevelQuest = "Dragon Crew Warrior", "AmazonQuest", 1;
+			CFrameQuest = CFrame.new(6736.32958984375, 127.4482192993164, - 712.3320922851562)
+			CFrameMon = CFrame.new(7014.84765625, 196.3662567138672, - 1024.2913818359375)
+		elseif MyLevel == 1600 or MyLevel <= 1624 then
+			NameMon, NameQuest, LevelQuest = "Dragon Crew Archer", "AmazonQuest", 2;
+			CFrameQuest = CFrame.new(6736.32958984375, 127.4482192993164, - 712.3320922851562)
+			CFrameMon = CFrame.new(6792.60302734375, 535.4273681640625, 454.4717102050781)
+		elseif MyLevel == 1625 or MyLevel <= 1649 then
+			NameMon, NameQuest, LevelQuest = "Hydra Enforcer", "AmazonQuest2", 1;
+			CFrameQuest = CFrame.new(5210.87353515625, 1004.1356811523438, 755.8411254882812)
+			CFrameMon = CFrame.new(4704.02099609375, 1043.867431640625, 679.615966796875)
+		elseif MyLevel == 1650 or MyLevel <= 1699 then
+			NameMon, NameQuest, LevelQuest = "Venomous Assailant", "AmazonQuest2", 2;
+			CFrameQuest = CFrame.new(5210.87353515625, 1004.1356811523438, 755.8411254882812)
+			CFrameMon = CFrame.new(4731.27197265625, 1090.177978515625, 1078.1712646484375)
+		elseif MyLevel == 1700 or MyLevel <= 1724 then
+			NameMon, NameQuest, LevelQuest = "Marine Commodore", "MarineTreeIsland", 1;
+			CFrameQuest = CFrame.new(2180.54126, 27.8156815, - 6741.5498, - 0.965929747, 0, 0.258804798, 0, 1, 0, - 0.258804798, 0, - 0.965929747)
+			CFrameMon = CFrame.new(2286.0078125, 73.13391876220703, - 7159.80908203125)
+		elseif MyLevel == 1725 or MyLevel <= 1774 then
+			NameMon, NameQuest, LevelQuest = "Marine Rear Admiral", "MarineTreeIsland", 2;
+			CFrameQuest = CFrame.new(2179.98828125, 28.731239318848, - 6740.0551757813)
+			CFrameMon = CFrame.new(3656.773681640625, 160.52406311035156, - 7001.5986328125)
+		elseif MyLevel == 1775 or MyLevel <= 1799 then
+			NameMon, NameQuest, LevelQuest = "Fishman Raider", "DeepForestIsland3", 1;
+			CFrameQuest = CFrame.new(- 10581.6563, 330.872955, - 8761.18652, - 0.882952213, 0, 0.469463557, 0, 1, 0, - 0.469463557, 0, - 0.882952213)
+			CFrameMon = CFrame.new(- 10407.5263671875, 331.76263427734375, - 8368.5166015625)
+		elseif MyLevel == 1800 or MyLevel <= 1824 then
+			NameMon, NameQuest, LevelQuest = "Fishman Captain", "DeepForestIsland3", 2;
+			CFrameQuest = CFrame.new(- 10581.6563, 330.872955, - 8761.18652, - 0.882952213, 0, 0.469463557, 0, 1, 0, - 0.469463557, 0, - 0.882952213)
+			CFrameMon = CFrame.new(- 10994.701171875, 352.38140869140625, - 9002.1103515625)
+		elseif MyLevel == 1825 or MyLevel <= 1849 then
+			NameMon, NameQuest, LevelQuest = "Forest Pirate", "DeepForestIsland", 1;
+			CFrameQuest = CFrame.new(- 13234.04, 331.488495, - 7625.40137, 0.707134247, - 0, - 0.707079291, 0, 1, - 0, 0.707079291, 0, 0.707134247)
+			CFrameMon = CFrame.new(- 13274.478515625, 332.3781433105469, - 7769.58056640625)
+		elseif MyLevel == 1850 or MyLevel <= 1899 then
+			NameMon, NameQuest, LevelQuest = "Mythological Pirate", "DeepForestIsland", 2;
+			CFrameQuest = CFrame.new(- 13234.04, 331.488495, - 7625.40137, 0.707134247, - 0, - 0.707079291, 0, 1, - 0, 0.707079291, 0, 0.707134247)
+			CFrameMon = CFrame.new(- 13680.607421875, 501.08154296875, - 6991.189453125)
+		elseif MyLevel == 1900 or MyLevel <= 1924 then
+			NameMon, NameQuest, LevelQuest = "Jungle Pirate", "DeepForestIsland2", 1;
+			CFrameQuest = CFrame.new(- 12680.3818, 389.971039, - 9902.01953, - 0.0871315002, 0, 0.996196866, 0, 1, 0, - 0.996196866, 0, - 0.0871315002)
+			CFrameMon = CFrame.new(- 12256.16015625, 331.73828125, - 10485.8369140625)
+		elseif MyLevel == 1925 or MyLevel <= 1974 then
+			NameMon, NameQuest, LevelQuest = "Musketeer Pirate", "DeepForestIsland2", 2;
+			CFrameQuest = CFrame.new(- 12680.3818, 389.971039, - 9902.01953, - 0.0871315002, 0, 0.996196866, 0, 1, 0, - 0.996196866, 0, - 0.0871315002)
+			CFrameMon = CFrame.new(- 13457.904296875, 391.545654296875, - 9859.177734375)
+		elseif MyLevel == 1975 or MyLevel <= 1999 then
+			NameMon, NameQuest, LevelQuest = "Reborn Skeleton", "HauntedQuest1", 1;
+			CFrameQuest = CFrame.new(- 9479.2168, 141.215088, 5566.09277, 0, 0, 1, 0, 1, - 0, - 1, 0, 0)
+			CFrameMon = CFrame.new(- 8763.7236328125, 165.72299194335938, 6159.86181640625)
+		elseif MyLevel == 2000 or MyLevel <= 2024 then
+			NameMon, NameQuest, LevelQuest = "Living Zombie", "HauntedQuest1", 2;
+			CFrameQuest = CFrame.new(- 9479.2168, 141.215088, 5566.09277, 0, 0, 1, 0, 1, - 0, - 1, 0, 0)
+			CFrameMon = CFrame.new(- 10144.1318359375, 138.62667846679688, 5838.0888671875)
+		elseif MyLevel == 2025 or MyLevel <= 2049 then
+			NameMon, NameQuest, LevelQuest = "Demonic Soul", "HauntedQuest2", 1;
+			CFrameQuest = CFrame.new(- 9516.99316, 172.017181, 6078.46533, 0, 0, - 1, 0, 1, 0, 1, 0, 0)
+			CFrameMon = CFrame.new(- 9505.8720703125, 172.10482788085938, 6158.9931640625)
+		elseif MyLevel == 2050 or MyLevel <= 2074 then
+			NameMon, NameQuest, LevelQuest = "Posessed Mummy", "HauntedQuest2", 2;
+			CFrameQuest = CFrame.new(- 9516.99316, 172.017181, 6078.46533, 0, 0, - 1, 0, 1, 0, 1, 0, 0)
+			CFrameMon = CFrame.new(- 9582.0224609375, 6.251527309417725, 6205.478515625)
+		elseif MyLevel == 2075 or MyLevel <= 2099 then
+			NameMon, NameQuest, LevelQuest = "Peanut Scout", "NutsIslandQuest", 1;
+			CFrameQuest = CFrame.new(- 2104.3908691406, 38.104167938232, - 10194.21875, 0, 0, - 1, 0, 1, 0, 1, 0, 0)
+			CFrameMon = CFrame.new(- 2143.241943359375, 47.72198486328125, - 10029.9951171875)
+		elseif MyLevel == 2100 or MyLevel <= 2124 then
+			NameMon, NameQuest, LevelQuest = "Peanut President", "NutsIslandQuest", 2;
+			CFrameQuest = CFrame.new(- 2104.3908691406, 38.104167938232, - 10194.21875, 0, 0, - 1, 0, 1, 0, 1, 0, 0)
+			CFrameMon = CFrame.new(- 1859.35400390625, 38.10316848754883, - 10422.4296875)
+		elseif MyLevel == 2125 or MyLevel <= 2149 then
+			NameMon, NameQuest, LevelQuest = "Ice Cream Chef", "IceCreamIslandQuest", 1;
+			CFrameQuest = CFrame.new(- 820.64825439453, 65.819526672363, - 10965.795898438, 0, 0, - 1, 0, 1, 0, 1, 0, 0)
+			CFrameMon = CFrame.new(- 872.24658203125, 65.81957244873047, - 10919.95703125)
+		elseif MyLevel == 2150 or MyLevel <= 2199 then
+			NameMon, NameQuest, LevelQuest = "Ice Cream Commander", "IceCreamIslandQuest", 2;
+			CFrameQuest = CFrame.new(- 820.64825439453, 65.819526672363, - 10965.795898438, 0, 0, - 1, 0, 1, 0, 1, 0, 0)
+			CFrameMon = CFrame.new(- 558.06103515625, 112.04895782470703, - 11290.7744140625)
+		elseif MyLevel == 2200 or MyLevel <= 2224 then
+			NameMon, NameQuest, LevelQuest = "Cookie Crafter", "CakeQuest1", 1;
+			CFrameQuest = CFrame.new(- 2021.32007, 37.7982254, - 12028.7295, 0.957576931, - 8.80302053e-08, 0.288177818, 6.9301187e-08, 1, 7.51931211e-08, - 0.288177818, - 5.2032135e-08, 0.957576931)
+			CFrameMon = CFrame.new(- 2374.13671875, 37.79826354980469, - 12125.30859375)
+		elseif MyLevel == 2225 or MyLevel <= 2249 then
+			NameMon, NameQuest, LevelQuest = "Cake Guard", "CakeQuest1", 2;
+			CFrameQuest = CFrame.new(- 2021.32007, 37.7982254, - 12028.7295, 0.957576931, - 8.80302053e-08, 0.288177818, 6.9301187e-08, 1, 7.51931211e-08, - 0.288177818, - 5.2032135e-08, 0.957576931)
+			CFrameMon = CFrame.new(- 1598.3070068359375, 43.773197174072266, - 12244.5810546875)
+		elseif MyLevel == 2250 or MyLevel <= 2274 then
+			NameMon, NameQuest, LevelQuest = "Baking Staff", "CakeQuest2", 1;
+			CFrameQuest = CFrame.new(- 1927.91602, 37.7981339, - 12842.5391, - 0.96804446, 4.22142143e-08, 0.250778586, 4.74911062e-08, 1, 1.49904711e-08, - 0.250778586, 2.64211941e-08, - 0.96804446)
+			CFrameMon = CFrame.new(- 1887.8099365234375, 77.6185073852539, - 12998.3505859375)
+		elseif MyLevel == 2275 or MyLevel <= 2299 then
+			NameMon, NameQuest, LevelQuest = "Head Baker", "CakeQuest2", 2;
+			CFrameQuest = CFrame.new(- 1927.91602, 37.7981339, - 12842.5391, - 0.96804446, 4.22142143e-08, 0.250778586, 4.74911062e-08, 1, 1.49904711e-08, - 0.250778586, 2.64211941e-08, - 0.96804446)
+			CFrameMon = CFrame.new(- 2216.188232421875, 82.884521484375, - 12869.2939453125)
+		elseif MyLevel == 2300 or MyLevel <= 2324 then
+			NameMon, NameQuest, LevelQuest = "Cocoa Warrior", "ChocQuest1", 1;
+			CFrameQuest = CFrame.new(233.22836303710938, 29.876001358032227, - 12201.2333984375)
+			CFrameMon = CFrame.new(- 21.55328369140625, 80.57499694824219, - 12352.3876953125)
+		elseif MyLevel == 2325 or MyLevel <= 2349 then
+			NameMon, NameQuest, LevelQuest = "Chocolate Bar Battler", "ChocQuest1", 2;
+			CFrameQuest = CFrame.new(233.22836303710938, 29.876001358032227, - 12201.2333984375)
+			CFrameMon = CFrame.new(582.590576171875, 77.18809509277344, - 12463.162109375)
+		elseif MyLevel == 2350 or MyLevel <= 2374 then
+			NameMon, NameQuest, LevelQuest = "Sweet Thief", "ChocQuest2", 1;
+			CFrameQuest = CFrame.new(150.5066375732422, 30.693693161010742, - 12774.5029296875)
+			CFrameMon = CFrame.new(165.1884765625, 76.05885314941406, - 12600.8369140625)
+		elseif MyLevel == 2375 or MyLevel <= 2399 then
+			NameMon, NameQuest, LevelQuest = "Candy Rebel", "ChocQuest2", 2;
+			CFrameQuest = CFrame.new(150.5066375732422, 30.693693161010742, - 12774.5029296875)
+			CFrameMon = CFrame.new(134.86563110351562, 77.2476806640625, - 12876.5478515625)
+		elseif MyLevel == 2400 or MyLevel <= 2449 then
+			NameMon, NameQuest, LevelQuest = "Candy Pirate", "CandyQuest1", 1;
+			CFrameQuest = CFrame.new(- 1150.0400390625, 20.378934860229492, - 14446.3349609375)
+			CFrameMon = CFrame.new(- 1310.5003662109375, 26.016523361206055, - 14562.404296875)
+		elseif MyLevel == 2425 or MyLevel <= 2450 then
+			NameMon, NameQuest, LevelQuest = "Snow Demon", "CandyQuest1", 2;
+			CFrameQuest = CFrame.new(- 1150.0400390625, 20.378934860229492, - 14446.3349609375)
+			CFrameMon = CFrame.new(- 750.1473388671875, 15.250883102416992, - 14343.2578125)
+		elseif MyLevel == 2450 or MyLevel <= 2475 then
+			NameMon, NameQuest, LevelQuest = "Isle Outlaw", "TikiQuest1", 1;
+			CFrameQuest = CFrame.new(- 16547.45703125, 56.00029754638672, - 174.1670684814453)
+			CFrameMon = CFrame.new(- 16303.1435546875, 188.16168212890625, - 268.9233703613281)
+		elseif MyLevel == 2475 or MyLevel <= 2525 then
+			NameMon, NameQuest, LevelQuest = "Island Boy", "TikiQuest1", 2;
+			CFrameQuest = CFrame.new(- 16547.45703125, 56.00029754638672, - 174.1670684814453)
+			CFrameMon = CFrame.new(- 16303.1435546875, 188.16168212890625, - 268.9233703613281)
+		elseif MyLevel == 2525 or MyLevel <= 2550 then
+			NameMon, NameQuest, LevelQuest = "Isle Champion", "TikiQuest2", 2;
+			CFrameQuest = CFrame.new(- 16523.0996, 55.9234467, 1049.65784, - 0.418787986, - 0.0126074236, 0.907996595, - 0.0160101596, 0.99985069, 0.00649857335, - 0.907942891, - 0.0118156485, - 0.418927342)
+			CFrameMon = CFrame.new(- 16748.4609375, 94.38502502441406, 1129.7178955078125)
+		elseif MyLevel >= 2551 and MyLevel <= 2600 then
+			NameMon, NameQuest, LevelQuest = "Serpent Hunter", "TikiQuest3", 1;
+			CFrameQuest = CFrame.new(- 16665.462890625, 105.3105697631836, 1577.8289794921875)
+			CFrameMon = CFrame.new(- 16959.2734375, 110.61740112304688, 1669.6007080078125)
+		end
+	end
+    if not NameMon or not CFrameQuest or not CFrameMon then return nil end
+    return {Mob=NameMon, Name=NameQuest, Tier=LevelQuest, Quest=CFrameQuest, Spawn=CFrameMon, Entrance=Entrance}
+end
+
+local function bossForName(selected)
+    local MsBoss, NameBoss, CFrameBoss, NameQuestBoss, LevelQuestBoss, CFrameQuestBoss
+	if selected == "Saber Expert" then
+		MsBoss = "Saber Expert"
+		NameBoss = "Saber Expert"
+		CFrameBoss = CFrame.new(- 1458.89502, 29.8870335, - 50.633564, 0.858821094, 1.13848939e-08, 0.512275636, - 4.85649254e-09, 1, - 1.40823326e-08, - 0.512275636, 9.6063415e-09, 0.858821094)
+	elseif selected == "The Saw" then
+		MsBoss = "The Saw"
+		NameBoss = "The Saw"
+		CFrameBoss = CFrame.new(- 683.519897, 13.8534927, 1610.87854, - 0.290192783, 6.88365773e-08, 0.956968188, 6.98413629e-08, 1, - 5.07531119e-08, - 0.956968188, 5.21077759e-08, - 0.290192783)
+	elseif selected == "Greybeard" then
+		MsBoss = "Greybeard"
+		NameBoss = "Greybeard"
+		CFrameBoss = CFrame.new(- 4955.72949, 80.8163834, 4305.82666, - 0.433646321, - 1.03394289e-08, 0.901083171, - 3.0443168e-08, 1, - 3.17633075e-09, - 0.901083171, - 2.88092288e-08, - 0.433646321)
+	elseif selected == "The Gorilla King" then
+		MsBoss = "The Gorilla King"
+		NameBoss = "The Gorilla King"
+		NameQuestBoss = "JungleQuest"
+		LevelQuestBoss = 3;
+		CFrameQuestBoss = CFrame.new(- 1604.12012, 36.8521118, 154.23732, 0.0648873374, - 4.70858913e-06, - 0.997892559, 1.41431883e-07, 1, - 4.70933674e-06, 0.997892559, 1.64442184e-07, 0.0648873374)
+		CFrameBoss = CFrame.new(- 1223.52808, 6.27936459, - 502.292664, 0.310949147, - 5.66602516e-08, 0.950426519, - 3.37275488e-08, 1, 7.06501808e-08, - 0.950426519, - 5.40241736e-08, 0.310949147)
+	elseif selected == "Bobby" then
+		MsBoss = "Bobby"
+		NameBoss = "Bobby"
+		NameQuestBoss = "BuggyQuest1"
+		LevelQuestBoss = 3;
+		CFrameQuestBoss = CFrame.new(- 1139.59717, 4.75205183, 3825.16211, - 0.959730506, - 7.5857054e-09, 0.280922383, - 4.06310328e-08, 1, - 1.11807175e-07, - 0.280922383, - 1.18718916e-07, - 0.959730506)
+		CFrameBoss = CFrame.new(- 1147.65173, 32.5966301, 4156.02588, 0.956680477, - 1.77109952e-10, - 0.29113996, 5.16530874e-10, 1, 1.08897802e-09, 0.29113996, - 1.19218679e-09, 0.956680477)
+	elseif selected == "Yeti" then
+		MsBoss = "Yeti"
+		NameBoss = "Yeti"
+		NameQuestBoss = "SnowQuest"
+		LevelQuestBoss = 3;
+		CFrameQuestBoss = CFrame.new(1384.90247, 87.3078308, - 1296.6825, 0.280209213, 2.72035177e-08, - 0.959938943, - 6.75690828e-08, 1, 8.6151708e-09, 0.959938943, 6.24481444e-08, 0.280209213)
+		CFrameBoss = CFrame.new(1221.7356, 138.046906, - 1488.84082, 0.349343032, - 9.49245944e-08, 0.936994851, 6.29478194e-08, 1, 7.7838429e-08, - 0.936994851, 3.17894653e-08, 0.349343032)
+	elseif selected == "Mob Leader" then
+		MsBoss = "Mob Leader"
+		NameBoss = "Mob Leader"
+		CFrameBoss = CFrame.new(- 2848.59399, 7.4272871, 5342.44043, - 0.928248107, - 8.7248246e-08, 0.371961564, - 7.61816636e-08, 1, 4.44474857e-08, - 0.371961564, 1.29216433e-08, - 0.92824)
+	elseif selected == "Vice Admiral" then
+		MsBoss = "Vice Admiral"
+		NameBoss = "Vice Admiral"
+		NameQuestBoss = "MarineQuest2"
+		LevelQuestBoss = 2;
+		CFrameQuestBoss = CFrame.new(- 5035.42285, 28.6520386, 4324.50293, - 0.0611100644, - 8.08395768e-08, 0.998130739, - 1.57416586e-08, 1, 8.00271849e-08, - 0.998130739, - 1.08217701e-08, - 0.0611100644)
+		CFrameBoss = CFrame.new(- 5078.45898, 99.6520691, 4402.1665, - 0.555574954, - 9.88630566e-11, 0.831466436, - 6.35508286e-08, 1, - 4.23449258e-08, - 0.831466436, - 7.63661632e-08, - 0.555574954)
+	elseif selected == "Warden" then
+		MsBoss = "Warden"
+		NameBoss = "Warden"
+		NameQuestBoss = "ImpelQuest"
+		LevelQuestBoss = 1;
+		CFrameQuestBoss = CFrame.new(4851.35059, 5.68744135, 743.251282, - 0.538484037, - 6.68303741e-08, - 0.842635691, 1.38001752e-08, 1, - 8.81300792e-08, 0.842635691, - 5.90851599e-08, - 0.538484037)
+		CFrameBoss = CFrame.new(5232.5625, 5.26856995, 747.506897, 0.943829298, - 4.5439414e-08, 0.330433697, 3.47818627e-08, 1, 3.81658154e-08, - 0.330433697, - 2.45289105e-08, 0.943829298)
+	elseif selected == "Chief Warden" then
+		MsBoss = "Chief Warden"
+		NameBoss = "Chief Warden"
+		NameQuestBoss = "ImpelQuest"
+		LevelQuestBoss = 2;
+		CFrameQuestBoss = CFrame.new(4851.35059, 5.68744135, 743.251282, - 0.538484037, - 6.68303741e-08, - 0.842635691, 1.38001752e-08, 1, - 8.81300792e-08, 0.842635691, - 5.90851599e-08, - 0.538484037)
+		CFrameBoss = CFrame.new(5232.5625, 5.26856995, 747.506897, 0.943829298, - 4.5439414e-08, 0.330433697, 3.47818627e-08, 1, 3.81658154e-08, - 0.330433697, - 2.45289105e-08, 0.943829298)
+	elseif selected == "Swan" then
+		MsBoss = "Swan"
+		NameBoss = "Swan"
+		NameQuestBoss = "ImpelQuest"
+		LevelQuestBoss = 3;
+		CFrameQuestBoss = CFrame.new(4851.35059, 5.68744135, 743.251282, - 0.538484037, - 6.68303741e-08, - 0.842635691, 1.38001752e-08, 1, - 8.81300792e-08, 0.842635691, - 5.90851599e-08, - 0.538484037)
+		CFrameBoss = CFrame.new(5232.5625, 5.26856995, 747.506897, 0.943829298, - 4.5439414e-08, 0.330433697, 3.47818627e-08, 1, 3.81658154e-08, - 0.330433697, - 2.45289105e-08, 0.943829298)
+	elseif selected == "Magma Admiral" then
+		MsBoss = "Magma Admiral"
+		NameBoss = "Magma Admiral"
+		NameQuestBoss = "MagmaQuest"
+		LevelQuestBoss = 3;
+		CFrameQuestBoss = CFrame.new(- 5317.07666, 12.2721891, 8517.41699, 0.51175487, - 2.65508806e-08, - 0.859131515, - 3.91131572e-08, 1, - 5.42026761e-08, 0.859131515, 6.13418294e-08, 0.51175487)
+		CFrameBoss = CFrame.new(- 5530.12646, 22.8769703, 8859.91309, 0.857838571, 2.23414389e-08, 0.513919294, 1.53689133e-08, 1, - 6.91265853e-08, - 0.513919294, 6.71978384e-08, 0.857838571)
+	elseif selected == "Fishman Lord" then
+		MsBoss = "Fishman Lord"
+		NameBoss = "Fishman Lord"
+		NameQuestBoss = "FishmanQuest"
+		LevelQuestBoss = 3;
+		CFrameQuestBoss = CFrame.new(61123.0859, 18.5066795, 1570.18018, 0.927145958, 1.0624845e-07, 0.374700129, - 6.98219367e-08, 1, - 1.10790765e-07, - 0.374700129, 7.65569368e-08, 0.927145958)
+		CFrameBoss = CFrame.new(61351.7773, 31.0306778, 1113.31409, 0.999974668, 0, - 0.00714713801, 0, 1.00000012, 0, 0.00714714266, 0, 0.999974549)
+	elseif selected == "Wysper" then
+		MsBoss = "Wysper"
+		NameBoss = "Wysper"
+		NameQuestBoss = "SkyExp1Quest"
+		LevelQuestBoss = 3;
+		CFrameQuestBoss = CFrame.new(- 7862.94629, 5545.52832, - 379.833954, 0.462944925, 1.45838088e-08, - 0.886386991, 1.0534996e-08, 1, 2.19553424e-08, 0.886386991, - 1.95022007e-08, 0.462944925)
+		CFrameBoss = CFrame.new(- 7925.48389, 5550.76074, - 636.178345, 0.716468513, - 1.22915289e-09, 0.697619379, 3.37381434e-09, 1, - 1.70304748e-09, - 0.697619379, 3.57381835e-09, 0.716468513)
+	elseif selected == "Thunder God" then
+		MsBoss = "Thunder God"
+		NameBoss = "Thunder God"
+		NameQuestBoss = "SkyExp2Quest"
+		LevelQuestBoss = 3;
+		CFrameQuestBoss = CFrame.new(- 7902.78613, 5635.99902, - 1411.98706, - 0.0361216255, - 1.16895912e-07, 0.999347389, 1.44533963e-09, 1, 1.17024491e-07, - 0.999347389, 5.6715117e-09, - 0.0361216255)
+		CFrameBoss = CFrame.new(- 7917.53613, 5616.61377, - 2277.78564, 0.965189934, 4.80563429e-08, - 0.261550069, - 6.73089886e-08, 1, - 6.46515304e-08, 0.261550069, 8.00056768e-08, 0.965189934)
+	elseif selected == "Cyborg" then
+		MsBoss = "Cyborg"
+		NameBoss = "Cyborg"
+		NameQuestBoss = "FountainQuest"
+		LevelQuestBoss = 3;
+		CFrameQuestBoss = CFrame.new(5253.54834, 38.5361786, 4050.45166, - 0.0112687312, - 9.93677887e-08, - 0.999936521, 2.55291371e-10, 1, - 9.93769547e-08, 0.999936521, - 1.37512213e-09, - 0.0112687312)
+		CFrameBoss = CFrame.new(6041.82813, 52.7112198, 3907.45142, - 0.563162148, 1.73805248e-09, - 0.826346457, - 5.94632716e-08, 1, 4.26280238e-08, 0.826346457, 7.31437524e-08, - 0.563162148)
+	elseif selected == "Diamond" then
+		MsBoss = "Diamond"
+		NameBoss = "Diamond"
+		NameQuestBoss = "Area1Quest"
+		LevelQuestBoss = 3;
+		CFrameQuestBoss = CFrame.new(- 424.080078, 73.0055847, 1836.91589, 0.253544956, - 1.42165932e-08, 0.967323601, - 6.00147771e-08, 1, 3.04272909e-08, - 0.967323601, - 6.5768397e-08, 0.253544956)
+		CFrameBoss = CFrame.new(- 1736.26587, 198.627731, - 236.412857, - 0.997808516, 0, - 0.0661673471, 0, 1, 0, 0.0661673471, 0, - 0.997808516)
+	elseif selected == "Jeremy" then
+		MsBoss = "Jeremy"
+		NameBoss = "Jeremy"
+		NameQuestBoss = "Area2Quest"
+		LevelQuestBoss = 3;
+		CFrameQuestBoss = CFrame.new(632.698608, 73.1055908, 918.666321, - 0.0319722369, 8.96074881e-10, - 0.999488771, 1.36326533e-10, 1, 8.92172336e-10, 0.999488771, - 1.07732087e-10, - 0.0319722369)
+		CFrameBoss = CFrame.new(2203.76953, 448.966034, 752.731079, - 0.0217453763, 0, - 0.999763548, 0, 1, 0, 0.999763548, 0, - 0.0217453763)
+	elseif selected == "Fajita" then
+		MsBoss = "Fajita"
+		NameBoss = "Fajita"
+		NameQuestBoss = "MarineQuest3"
+		LevelQuestBoss = 3;
+		CFrameQuestBoss = CFrame.new(- 2442.65015, 73.0511475, - 3219.11523, - 0.873540044, 4.2329841e-08, - 0.486752301, 5.64383384e-08, 1, - 1.43220786e-08, 0.486752301, - 3.99823996e-08, - 0.873540044)
+		CFrameBoss = CFrame.new(- 2297.40332, 115.449463, - 3946.53833, 0.961227536, - 1.46645796e-09, - 0.275756449, - 2.3212845e-09, 1, - 1.34094433e-08, 0.275756449, 1.35296352e-08, 0.961227536)
+	elseif selected == "Don Swan" then
+		MsBoss = "Don Swan"
+		NameBoss = "Don Swan"
+		CFrameBoss = CFrame.new(2288.802, 15.1870775, 863.034607, 0.99974072, - 8.41247214e-08, - 0.0227668174, 8.4774733e-08, 1, 2.75850098e-08, 0.0227668174, - 2.95079072e-08, 0.99974072)
+	elseif selected == "Smoke Admiral" then
+		MsBoss = "Smoke Admiral"
+		NameBoss = "Smoke Admiral"
+		NameQuestBoss = "IceSideQuest"
+		LevelQuestBoss = 3;
+		CFrameQuestBoss = CFrame.new(- 6059.96191, 15.9868021, - 4904.7373, - 0.444992423, - 3.0874483e-09, 0.895534337, - 3.64098796e-08, 1, - 1.4644522e-08, - 0.895534337, - 3.91229982e-08, - 0.444992423)
+		CFrameBoss = CFrame.new(- 5115.72754, 23.7664986, - 5338.2207, 0.251453817, 1.48345061e-08, - 0.967869282, 4.02796978e-08, 1, 2.57916977e-08, 0.967869282, - 4.54708946e-08, 0.251453817)
+	elseif selected == "Cursed Captain" then
+		MsBoss = "Cursed Captain"
+		NameBoss = "Cursed Captain"
+		CFrameBoss = CFrame.new(916.928589, 181.092773, 33422, - 0.999505103, 9.26310495e-09, 0.0314563364, 8.42916226e-09, 1, - 2.6643713e-08, - 0.0314563364, - 2.63653774e-08, - 0.999505103)
+	elseif selected == "Darkbeard" then
+		MsBoss = "Darkbeard"
+		NameBoss = "Darkbeard"
+		CFrameBoss = CFrame.new(3876.00366, 24.6882591, - 3820.21777, - 0.976951957, 4.97356325e-08, 0.213458836, 4.57335361e-08, 1, - 2.36868622e-08, - 0.213458836, - 1.33787044e-08, - 0.976951957)
+	elseif selected == "Order" then
+		MsBoss = "Order"
+		NameBoss = "Order"
+		CFrameBoss = CFrame.new(- 6221.15039, 16.2351036, - 5045.23584, - 0.380726993, 7.41463495e-08, 0.924687505, 5.85604774e-08, 1, - 5.60738549e-08, - 0.924687505, 3.28013137e-08, - 0.380726993)
+	elseif selected == "Awakened Ice Admiral" then
+		MsBoss = "Awakened Ice Admiral"
+		NameBoss = "Awakened Ice Admiral"
+		NameQuestBoss = "FrostQuest"
+		LevelQuestBoss = 3;
+		CFrameQuestBoss = CFrame.new(5669.33203, 28.2118053, - 6481.55908, 0.921275556, - 1.25320829e-08, 0.388910472, 4.72230788e-08, 1, - 7.96414241e-08, - 0.388910472, 9.17372489e-08, 0.921275556)
+		CFrameBoss = CFrame.new(6407.33936, 340.223785, - 6892.521, 0.49051559, - 5.25310213e-08, - 0.871432424, - 2.76146022e-08, 1, - 7.58250565e-08, 0.871432424, 6.12576301e-08, 0.49051559)
+	elseif selected == "Tide Keeper" then
+		MsBoss = "Tide Keeper"
+		NameBoss = "Tide Keeper"
+		NameQuestBoss = "ForgottenQuest"
+		LevelQuestBoss = 3;
+		CFrameQuestBoss = CFrame.new(- 3053.89648, 236.881363, - 10148.2324, - 0.985987961, - 3.58504737e-09, 0.16681771, - 3.07832915e-09, 1, 3.29612559e-09, - 0.16681771, 2.73641976e-09, - 0.985987961)
+		CFrameBoss = CFrame.new(- 3570.18652, 123.328949, - 11555.9072, 0.465199202, - 1.3857326e-08, 0.885206044, 4.0332897e-09, 1, 1.35347511e-08, - 0.885206044, - 2.72606271e-09, 0.465199202)
+	elseif selected == "Stone" then
+		MsBoss = "Stone"
+		NameBoss = "Stone"
+		NameQuestBoss = "PiratePortQuest"
+		LevelQuestBoss = 3;
+		CFrameQuestBoss = CFrame.new(- 290, 44, 5577)
+		CFrameBoss = CFrame.new(- 1085, 40, 6779)
+	elseif selected == "Hydra Leader" then
+		MsBoss = "Hydra Leader"
+		NameBoss = "Hydra Leader"
+		NameQuestBoss = "AmazonQuest2"
+		LevelQuestBoss = 3;
+		CFrameQuestBoss = CFrame.new(5210.87353515625, 1004.1356811523438, 755.8411254882812)
+		CFrameBoss = CFrame.new(5942.8154296875, 1019.0787353515625, - 116.86933135986328)
+	elseif selected == "Kilo Admiral" then
+		MsBoss = "Kilo Admiral"
+		NameBoss = "Kilo Admiral"
+		NameQuestBoss = "MarineTreeIsland"
+		LevelQuestBoss = 3;
+		CFrameQuestBoss = CFrame.new(2178, 29, - 6737)
+		CFrameBoss = CFrame.new(2846, 433, - 7100)
+	elseif selected == "Captain Elephant" then
+		MsBoss = "Captain Elephant"
+		NameBoss = "Captain Elephant"
+		NameQuestBoss = "DeepForestIsland"
+		LevelQuestBoss = 3;
+		CFrameQuestBoss = CFrame.new(- 13232, 333, - 7631)
+		CFrameBoss = CFrame.new(- 13221, 325, - 8405)
+	elseif selected == "Beautiful Pirate" then
+		MsBoss = "Beautiful Pirate"
+		NameBoss = "Beautiful Pirate"
+		NameQuestBoss = "DeepForestIsland2"
+		LevelQuestBoss = 3;
+		CFrameQuestBoss = CFrame.new(- 12686, 391, - 9902)
+		CFrameBoss = CFrame.new(5182, 23, - 20)
+	elseif selected == "Cake Queen" then
+		MsBoss = "Cake Queen"
+		NameBoss = "Cake Queen"
+		NameQuestBoss = "IceCreamIslandQuest"
+		LevelQuestBoss = 3;
+		CFrameQuestBoss = CFrame.new(- 716, 382, - 11010)
+		CFrameBoss = CFrame.new(- 821, 66, - 10965)
+	elseif selected == "rip_indra True Form" then
+		MsBoss = "rip_indra True Form"
+		NameBoss = "rip_indra True Form"
+		CFrameBoss = CFrame.new(- 5359, 424, - 2735)
+	elseif selected == "Longma" then
+		MsBoss = "Longma"
+		NameBoss = "Longma"
+		CFrameBoss = CFrame.new(- 10248.3936, 353.79129, - 9306.34473)
+	elseif selected == "Soul Reaper" then
+		MsBoss = "Soul Reaper"
+		NameBoss = "Soul Reaper"
+		CFrameBoss = CFrame.new(- 9515.62109, 315.925537, 6691.12012)
+	end
+    if not CFrameBoss then return nil end
+    return {Mob=MsBoss or NameBoss, Name=NameQuestBoss, Tier=LevelQuestBoss, Quest=CFrameQuestBoss, Spawn=CFrameBoss}
+end
+
+local function materialForName(selected)
+    local MMon, MPos
+	if selected == "Radioactive Material" then
+		MMon = "Factory Staff"
+		MPos = CFrame.new(- 507.7895202636719, 72.99479675292969, - 126.45632934570312)
+	elseif selected == "Mystic Droplet" then
+		MMon = "Water Fighter"
+		MPos = CFrame.new(- 3214.218017578125, 298.69952392578125, - 10543.685546875)
+	elseif selected == "Magma Ore" then
+		if sourcePlaceId() == 2753915549 then
+			MMon = "Military Spy"
+			MPos = CFrame.new(- 5850.2802734375, 77.28675079345703, 8848.6748046875)
+		elseif sourcePlaceId() == 4442272183 then
+			MMon = "Lava Pirate"
+			MPos = CFrame.new(- 5234.60595703125, 51.953372955322266, - 4732.27880859375)
+		end
+	elseif selected == "Angel Wings" then
+		MMon = "Royal Soldier"
+		MPos = CFrame.new(- 7827.15625, 5606.912109375, - 1705.5833740234375)
+	elseif selected == "Leather" then
+		if sourcePlaceId() == 2753915549 then
+			MMon = "Pirate"
+			MPos = CFrame.new(- 1211.8792724609375, 4.787090301513672, 3916.83056640625)
+		elseif sourcePlaceId() == 4442272183 then
+			MMon = "Marine Captain"
+			MPos = CFrame.new(- 2010.5059814453125, 73.00115966796875, - 3326.620849609375)
+		elseif sourcePlaceId() == 7449423635 then
+			MMon = "Jungle Pirate"
+			MPos = CFrame.new(- 11975.78515625, 331.7734069824219, - 10620.0302734375)
+		end
+	elseif selected == "Scrap Metal" then
+		if sourcePlaceId() == 2753915549 then
+			MMon = "Brute"
+			MPos = CFrame.new(- 1132.4202880859375, 14.844913482666016, 4293.30517578125)
+		elseif sourcePlaceId() == 4442272183 then
+			MMon = "Mercenary"
+			MPos = CFrame.new(- 972.307373046875, 73.04473876953125, 1419.2901611328125)
+		elseif sourcePlaceId() == 7449423635 then
+			MMon = "Pirate Millionaire"
+			MPos = CFrame.new(- 289.6311950683594, 43.8282470703125, 5583.66357421875)
+		end
+	elseif selected == "Demonic Wisp" then
+		MMon = "Demonic Soul"
+		MPos = CFrame.new(- 9503.388671875, 172.139892578125, 6143.0634765625)
+	elseif selected == "Vampire Fang" then
+		MMon = "Vampire"
+		MPos = CFrame.new(- 5999.20458984375, 6.437741279602051, - 1290.059326171875)
+	elseif selected == "Conjured Cocoa" then
+		MMon = "Chocolate Bar Battler"
+		MPos = CFrame.new(747.428466796875, 237.9543914794922, - 12700.2041015625)
+	elseif selected == "Dragon Scale" then
+		MMon = "Dragon Crew Warrior"
+		MPos = CFrame.new(5824.06982421875, 51.38640213012695, - 1106.694580078125)
+	elseif selected == "Gunpowder" then
+		MMon = "Pistol Billionaire"
+		MPos = CFrame.new(- 379.6134338378906, 73.84449768066406, 5928.5263671875)
+	elseif selected == "Fish Tail" then
+		MMon = "Fishman Captain"
+		MPos = CFrame.new(- 10961.0126953125, 331.7977600097656, - 8914.29296875)
+	elseif selected == "Mini Tusk" then
+		MMon = "Mythological Pirate"
+		MPos = CFrame.new(- 13516.0458984375, 469.8182373046875, - 6899.16064453125)
+	end
+    if MMon and MPos then return {Mob=MMon, Spawn=MPos} end
+end
+
+local materialNames = {"Radioactive Material", "Mystic Droplet", "Magma Ore", "Angel Wings", "Leather", "Scrap Metal", "Demonic Wisp", "Vampire Fang", "Conjured Cocoa", "Dragon Scale", "Gunpowder", "Fish Tail", "Mini Tusk"}
+local bossNames = {"Saber Expert", "The Saw", "Greybeard", "The Gorilla King", "Bobby", "Yeti", "Mob Leader", "Vice Admiral", "Warden", "Chief Warden", "Swan", "Magma Admiral", "Fishman Lord", "Wysper", "Thunder God", "Cyborg", "Diamond", "Jeremy", "Fajita", "Don Swan", "Smoke Admiral", "Cursed Captain", "Darkbeard", "Order", "Awakened Ice Admiral", "Tide Keeper", "Stone", "Hydra Leader", "Kilo Admiral", "Captain Elephant", "Beautiful Pirate", "Cake Queen", "rip_indra True Form", "Longma", "Soul Reaper"}
+local islandData = {
+    ["WindMill"] = {Target=CFrame.new(979.79895019531, 16.516613006592, 1429.0466308594), Entrance=false},
+    ["Marine"] = {Target=CFrame.new(-2566.4296875, 6.8556680679321, 2045.2561035156), Entrance=false},
+    ["Middle Town"] = {Target=CFrame.new(-690.33081054688, 15.09425163269, 1582.2380371094), Entrance=false},
+    ["Jungle"] = {Target=CFrame.new(-1612.7957763672, 36.852081298828, 149.12843322754), Entrance=false},
+    ["Pirate Village"] = {Target=CFrame.new(-1181.3093261719, 4.7514905929565, 3803.5456542969), Entrance=false},
+    ["Desert"] = {Target=CFrame.new(944.15789794922, 20.919729232788, 4373.3002929688), Entrance=false},
+    ["Snow Island"] = {Target=CFrame.new(1347.8067626953, 104.66806030273, -1319.7370605469), Entrance=false},
+    ["MarineFord"] = {Target=CFrame.new(-4914.8212890625, 50.963626861572, 4281.0278320313), Entrance=false},
+    ["Colosseum"] = {Target=CFrame.new(-1427.6203613281, 7.2881078720093, -2792.7722167969), Entrance=false},
+    ["Sky Island 1"] = {Target=CFrame.new(-4869.1025390625, 733.46051025391, -2667.0180664063), Entrance=false},
+    ["Sky Island 2"] = {Target=CFrame.new(-4607.82275, 872.54248, -1667.55688), Entrance=true},
+    ["Sky Island 3"] = {Target=CFrame.new(-7894.6176757813, 5547.1416015625, -380.29119873047), Entrance=true},
+    ["Prison"] = {Target=CFrame.new(4875.330078125, 5.6519818305969, 734.85021972656), Entrance=false},
+    ["Magma Village"] = {Target=CFrame.new(-5247.7163085938, 12.883934020996, 8504.96875), Entrance=false},
+    ["Under Water Island"] = {Target=CFrame.new(61163.8515625, 11.6796875, 1819.7841796875), Entrance=true},
+    ["Fountain City"] = {Target=CFrame.new(5127.1284179688, 59.501365661621, 4105.4458007813), Entrance=false},
+    ["Shank Room"] = {Target=CFrame.new(-1442.16553, 29.8788261, -28.3547478), Entrance=false},
+    ["Mob Island"] = {Target=CFrame.new(-2850.20068, 7.39224768, 5354.99268), Entrance=false},
+    ["The Cafe"] = {Target=CFrame.new(-380.47927856445, 77.220390319824, 255.82550048828), Entrance=false},
+    ["Frist Spot"] = {Target=CFrame.new(-11.311455726624, 29.276733398438, 2771.5224609375), Entrance=false},
+    ["Dark Area"] = {Target=CFrame.new(3780.0302734375, 22.652164459229, -3498.5859375), Entrance=false},
+    ["Flamingo Mansion"] = {Target=CFrame.new(-483.73370361328, 332.0383605957, 595.32708740234), Entrance=false},
+    ["Flamingo Room"] = {Target=CFrame.new(2284.4140625, 15.152037620544, 875.72534179688), Entrance=false},
+    ["Green Zone"] = {Target=CFrame.new(-2448.5300292969, 73.016105651855, -3210.6306152344), Entrance=false},
+    ["Factory"] = {Target=CFrame.new(424.12698364258, 211.16171264648, -427.54049682617), Entrance=false},
+    ["Colossuim"] = {Target=CFrame.new(-1503.6224365234, 219.7956237793, 1369.3101806641), Entrance=false},
+    ["Zombie Island"] = {Target=CFrame.new(-5622.033203125, 492.19604492188, -781.78552246094), Entrance=false},
+    ["Two Snow Mountain"] = {Target=CFrame.new(753.14288330078, 408.23559570313, -5274.6147460938), Entrance=false},
+    ["Punk Hazard"] = {Target=CFrame.new(-6127.654296875, 15.951762199402, -5040.2861328125), Entrance=false},
+    ["Cursed Ship"] = {Target=CFrame.new(923.40197753906, 125.05712890625, 32885.875), Entrance=false},
+    ["Ice Castle"] = {Target=CFrame.new(6148.4116210938, 294.38687133789, -6741.1166992188), Entrance=false},
+    ["Forgotten Island"] = {Target=CFrame.new(-3032.7641601563, 317.89672851563, -10075.373046875), Entrance=false},
+    ["Ussop Island"] = {Target=CFrame.new(4816.8618164063, 8.4599885940552, 2863.8195800781), Entrance=false},
+    ["Mini Sky Island"] = {Target=CFrame.new(-288.74060058594, 49326.31640625, -35248.59375), Entrance=false},
+    ["Great Tree"] = {Target=CFrame.new(2681.2736816406, 1682.8092041016, -7190.9853515625), Entrance=false},
+    ["Castle On The Sea"] = {Target=CFrame.new(-5074.45556640625, 314.5155334472656, -2991.054443359375), Entrance=false},
+    ["MiniSky"] = {Target=CFrame.new(-260.65557861328, 49325.8046875, -35253.5703125), Entrance=false},
+    ["Port Town"] = {Target=CFrame.new(-290.7376708984375, 6.729952812194824, 5343.5537109375), Entrance=false},
+    ["Hydra Island"] = {Target=CFrame.new(5255.1049, 1004.1949, 344.7700), Entrance=false},
+    ["Floating Turtle"] = {Target=CFrame.new(-13274.528320313, 531.82073974609, -7579.22265625), Entrance=false},
+    ["Mansion"] = {Target=CFrame.new(-12471.169921875, 374.94024658203, -7551.677734375), Entrance=true},
+    ["Haunted Castle"] = {Target=CFrame.new(-9515.3720703125, 164.00624084473, 5786.0610351562), Entrance=false},
+    ["Ice Cream Island"] = {Target=CFrame.new(-902.56817626953, 79.93204498291, -10988.84765625), Entrance=false},
+    ["Peanut Island"] = {Target=CFrame.new(-2062.7475585938, 50.473892211914, -10232.568359375), Entrance=false},
+    ["Cake Island"] = {Target=CFrame.new(-1884.7747802734375, 19.327526092529297, -11666.8974609375), Entrance=false},
+    ["Cocoa Island"] = {Target=CFrame.new(87.94276428222656, 73.55451202392578, -12319.46484375), Entrance=false},
+    ["Candy Island"] = {Target=CFrame.new(-1014.4241943359375, 149.11068725585938, -14555.962890625), Entrance=false},
+    ["Tiki Outpost"] = {Target=CFrame.new(-16218.6826, 9.08636189, 445.618408, -0.0610186495, 1.10512588e-09, -0.99813664, -1.83458475e-08, 1, 2.22871765e-09, 0.99813664, 1.84476558e-08, -0.0610186495), Entrance=false},
+}
+local shopData = {
+    {Name="Buy Geppo", Calls={{"BuyHaki","Geppo"}}},
+    {Name="Buy Buso Haki", Calls={{"BuyHaki","Buso"}}},
+    {Name="Buy Soru", Calls={{"BuyHaki","Soru"}}},
+    {Name="Buy Observation Haki", Calls={{"KenTalk","Buy"}}},
+    {Name="Buy Black Leg", Calls={{"BuyBlackLeg"}}},
+    {Name="Buy Electro", Calls={{"BuyElectro"}}},
+    {Name="Buy Water Kung Fu", Calls={{"BuyFishmanKarate"}}},
+    {Name="Buy Dragon Claw", Calls={{"BlackbeardReward","DragonClaw","1"},{"BlackbeardReward","DragonClaw","2"}}},
+    {Name="Buy Superhuman", Calls={{"BuySuperhuman"}}},
+    {Name="Buy Death Step", Calls={{"BuyDeathStep"}}},
+    {Name="Buy Sharkman Karate", Calls={{"BuySharkmanKarate",true},{"BuySharkmanKarate"}}},
+    {Name="Buy Electric Claw", Calls={{"BuyElectricClaw"}}},
+    {Name="Buy Dragon Talon", Calls={{"BuyDragonTalon"}}},
+    {Name="Buy God Human", Calls={{"BuyGodhuman"}}},
+    {Name="Buy Sanguine Art", Calls={{"BuySanguineArt", true},{"BuySanguineArt"}}},
+    {Name="Cutlass", Calls={{"BuyItem","Cutlass"}}},
+    {Name="Katana", Calls={{"BuyItem","Katana"}}},
+    {Name="Iron Mace", Calls={{"BuyItem","Iron Mace"}}},
+    {Name="Dual Katana", Calls={{"BuyItem","Dual Katana"}}},
+    {Name="Triple Katana", Calls={{"BuyItem","Triple Katana"}}},
+    {Name="Pipe", Calls={{"BuyItem","Pipe"}}},
+    {Name="Dual-Headed Blade", Calls={{"BuyItem","Dual-Headed Blade"}}},
+    {Name="Bisento", Calls={{"BuyItem","Bisento"}}},
+    {Name="Soul Cane", Calls={{"BuyItem","Soul Cane"}}},
+    {Name="Pole v.2", Calls={{"ThunderGodTalk"}}},
+    {Name="Slingshot", Calls={{"BuyItem","Slingshot"}}},
+    {Name="Musket", Calls={{"BuyItem","Musket"}}},
+    {Name="Flintlock", Calls={{"BuyItem","Flintlock"}}},
+    {Name="Refined Slingshot", Calls={{"BuyItem", "Refined Slingshot"}}},
+    {Name="Cannon", Calls={{"BuyItem","Cannon"}}},
+    {Name="Kabucha", Calls={{"BlackbeardReward","Slingshot","1"},{"BlackbeardReward","Slingshot","2"}}},
+    {Name="Reset Stats", Calls={{"BlackbeardReward","Refund","1"},{"BlackbeardReward","Refund","2"}}},
+    {Name="Random Race", Calls={{"BlackbeardReward","Reroll","1"},{"BlackbeardReward","Reroll","2"}}},
+    {Name="Refined Flintlock", Calls={{"BuyItem", "Refined Flintlock"}}},
+    {Name="Black Cape", Calls={{"BuyItem", "Black Cape"}}},
+    {Name="Swordsman Hat", Calls={{"BuyItem", "Swordsman Hat"}}},
+    {Name="Tomoe Ring", Calls={{"BuyItem", "Tomoe Ring"}}},
+    {Name="Bizarre Rifle", Calls={{"Ectoplasm", "Buy", 1}}},
+}
+
+-- Hoho preload supplies optional catalog coordinates, never combat or executable code.
+local function initPreload()
+-- Adapted data from acsu123/HohoV2/BloxFruit/preload; see provenance.json.
+-- Generated by extract_hoho.py; embedded data only, no remote loaders.
+local preloadRows={
+    [1]={
+        {LevelReq=0,Mob="Trainee",Name="MarineQuest",Tier=1,Boss=false,Quest=CFrame.new(-2655,30,2113),Spawns={CFrame.new(-2674.52368164,32.1167221069,2186.97265625),CFrame.new(-2728.64111328,32.9167175293,1966.21789551),CFrame.new(-2741.04101562,32.9167175293,1900.01794434),CFrame.new(-2748.03735352,30.3167190552,2152.703125),CFrame.new(-2788.25097656,30.687002182,2281.48095703),CFrame.new(-2710.5703125,30.687002182,2242.84570312),CFrame.new(-2667.44116211,32.9167175293,1900.01794434)}},
+        {LevelReq=10,Mob="Monkey",Name="JungleQuest",Tier=1,Boss=false,Quest=CFrame.new(-1679.76318359,48.7400054932,175.640014648),Spawns={CFrame.new(-1637.55456543,29.977350235,19.6401367188),CFrame.new(-1866.31335449,29.9336357117,21.5892028809),CFrame.new(-1450.64160156,28.9804954529,306.12121582),CFrame.new(-1610.23974609,29.165807724,399.664489746),CFrame.new(-1758.66125488,30.8861427307,-31.8153839111),CFrame.new(-1299.42724609,17.6543960571,81.4220199585),CFrame.new(-1525.55554199,27.246963501,163.957824707)}},
+        {LevelReq=15,Mob="Gorilla",Name="JungleQuest",Tier=2,Boss=false,Quest=CFrame.new(-1679.76318359,48.7400054932,175.640014648),Spawns={CFrame.new(-1401.0880127,26.4667453766,-463.957061768),CFrame.new(-1387.32824707,14.4667444229,-577.800048828),CFrame.new(-1198.41894531,17.3037509918,-689.849060059),CFrame.new(-1266.56518555,14.4667453766,-462.023651123)}},
+        {LevelReq=20,Mob="The Gorilla King",Name="JungleQuest",Tier=3,Boss=true,Quest=CFrame.new(-1679.76318359,48.7400054932,175.640014648),Spawns={CFrame.new(-1193.90661621,10.7214584351,-549.847290039)}},
+        {LevelReq=30,Mob="Pirate",Name="BuggyQuest1",Tier=1,Boss=false,Quest=CFrame.new(-1151.58642578,16.6152420044,3863.125),Spawns={CFrame.new(-980.980773926,30.4456329346,3966.83227539),CFrame.new(-1313.74499512,18.8687286377,3964.18530273),CFrame.new(-1122.78271484,19.9353103638,3965.88183594),CFrame.new(-1285.08447266,18.0345458984,3886.96728516),CFrame.new(-1176.76513672,19.7420425415,4027.27001953),CFrame.new(-963.942016602,27.6460914612,4043.71508789)}},
+        {LevelReq=40,Mob="Brute",Name="BuggyQuest1",Tier=2,Boss=false,Quest=CFrame.new(-1151.58642578,16.6152420044,3863.125),Spawns={CFrame.new(-1085.94348145,28.1044311523,4342.671875),CFrame.new(-942.354492188,29.7292480469,4387.24414062),CFrame.new(-1350.12817383,28.1044311523,4285.10888672),CFrame.new(-1436.78369141,28.1044311523,4357.19970703),CFrame.new(-1312.80505371,28.1044311523,4402.859375),CFrame.new(-1094.93334961,28.1044311523,4442.90722656)}},
+        {LevelReq=55,Mob="Chef",Name="BuggyQuest1",Tier=3,Boss=true,Quest=CFrame.new(-1151.58642578,16.6152420044,3863.125),Spawns={CFrame.new(-1120.45214844,54.7070007324,4121.15722656)}},
+        {LevelReq=60,Mob="Desert Bandit",Name="DesertQuest",Tier=1,Boss=false,Quest=CFrame.new(931.377990723,4.68400001526,4198.21289062),Spawns={CFrame.new(860.54107666,7.56500244141,4539.79736328),CFrame.new(999.850463867,7.56500244141,4490.33105469),CFrame.new(902.860229492,7.56500244141,4461.42138672),CFrame.new(931.70501709,7.56500244141,4564.53320312)}},
+        {LevelReq=75,Mob="Desert Officer",Name="DesertQuest",Tier=2,Boss=false,Quest=CFrame.new(931.377990723,4.68400001526,4198.21289062),Spawns={CFrame.new(1523.7845459,15.284995079,4095.42822266),CFrame.new(1543.99267578,14.1150026321,4240.97558594),CFrame.new(1615.49060059,14.2480010986,4187.38623047),CFrame.new(1608.39758301,14.1480007172,4112.2890625)}},
+        {LevelReq=90,Mob="Snow Bandit",Name="SnowQuest",Tier=1,Boss=false,Quest=CFrame.new(1400.56384277,77.3909988403,-1311.28503418),Spawns={CFrame.new(1519.47265625,77.9602355957,-1510.93786621),CFrame.new(1501.95739746,77.9602355957,-1402.37207031),CFrame.new(1260.2578125,77.9602355957,-1387.61035156),CFrame.new(1364.11621094,77.9602355957,-1429.65136719),CFrame.new(1431.75073242,77.9602355957,-1444.89233398)}},
+        {LevelReq=100,Mob="Snowman",Name="SnowQuest",Tier=2,Boss=false,Quest=CFrame.new(1400.56384277,77.3909988403,-1311.28503418),Spawns={CFrame.new(1121.54980469,98.1665802002,-1669.02416992),CFrame.new(1149.48852539,98.2227401733,-1540.46386719),CFrame.new(1272.36193848,98.3291625977,-1647.2545166),CFrame.new(1246.76879883,98.3291625977,-1555.6940918)}},
+        {LevelReq=105,Mob="Yeti",Name="SnowQuest",Tier=3,Boss=true,Quest=CFrame.new(1400.56384277,77.3909988403,-1311.28503418),Spawns={CFrame.new(1181.66162109,104.033042908,-1616.93188477)}},
+        {LevelReq=120,Mob="Chief Petty Officer",Name="MarineQuest2",Tier=1,Boss=false,Quest=CFrame.new(-4699.33105469,4.74101066589,4227.63916016),Spawns={CFrame.new(-4780.54248047,13.8792819977,4419.90722656),CFrame.new(-4828.58251953,13.126077652,4196.78662109),CFrame.new(-4763.67675781,13.3913078308,4288.84277344),CFrame.new(-4674.6328125,11.0316886902,4483.32568359),CFrame.new(-4836.43701172,16.3296909332,4465.78173828),CFrame.new(-4650.59033203,11.0316886902,4562.09765625),CFrame.new(-5002.20996094,11.0316886902,4004.73925781),CFrame.new(-4938.36132812,11.0316886902,3995.87109375)}},
+        {LevelReq=130,Mob="Vice Admiral",Name="MarineQuest2",Tier=2,Boss=true,Quest=CFrame.new(-4699.33105469,4.74101066589,4227.63916016),Spawns={CFrame.new(-5010.81982422,15.0615949631,4383.72753906)}},
+        {LevelReq=150,Mob="Sky Bandit",Name="SkyQuest",Tier=1,Boss=false,Quest=CFrame.new(-4750.18017578,966.066711426,-748.241455078),Spawns={CFrame.new(-4973.74316406,280.721466064,-1119.43041992),CFrame.new(-5221.64453125,280.721466064,-1068.63989258),CFrame.new(-5157.06640625,280.721466064,-916.718017578),CFrame.new(-5014.03417969,280.721466064,-972.079345703)}},
+        {LevelReq=175,Mob="Dark Master",Name="SkyQuest",Tier=2,Boss=false,Quest=CFrame.new(-4750.18017578,966.066711426,-748.241455078),Spawns={CFrame.new(-5206.77197266,504.74420166,-348.463867188),CFrame.new(-5411.25439453,504.932647705,-372.778625488),CFrame.new(-5283.16601562,505.063934326,-221.014190674),CFrame.new(-5269.00634766,504.982574463,-461.116241455)}},
+        {LevelReq=190,Mob="Prisoner",Name="PrisonerQuest",Tier=1,Boss=false,Quest=CFrame.new(5208.33837891,18.8711032867,736.586303711),Spawns={CFrame.new(5457.69091797,7.13356637955,507.47543335),CFrame.new(5057.80957031,7.13356637955,567.153991699),CFrame.new(5192.98535156,7.13356637955,414.304901123),CFrame.new(5278.59130859,7.13356637955,391.556884766),CFrame.new(5370.83837891,7.13356637955,459.186523438)}},
+        {LevelReq=210,Mob="Dangerous Prisoner",Name="PrisonerQuest",Tier=2,Boss=false,Quest=CFrame.new(5208.33837891,18.8711032867,736.586303711),Spawns={CFrame.new(5058.26269531,9.14381217957,900.918701172),CFrame.new(5295.2734375,9.14381217957,1104.78125),CFrame.new(5122.91357422,9.14381217957,969.896240234),CFrame.new(5188.85058594,9.14381217957,1058.125),CFrame.new(5456.38525391,9.14381217957,955.961364746)}},
+        {LevelReq=225,Mob="Ruthless Prisoner",Name="ImpelQuest",Tier=1,Boss=false,Quest=CFrame.new(5320.66601562,18.8855781555,856.281433105),Spawns={CFrame.new(5329.33544922,49.4212989807,819.451477051),CFrame.new(5393.91503906,16.37200737,673.581542969),CFrame.new(5272.94140625,16.37200737,673.581542969),CFrame.new(5393.91503906,16.37200737,795.263671875),CFrame.new(5271.36230469,16.37200737,799.607910156)}},
+        {LevelReq=230,Mob="Warden",Name="ImpelQuest",Tier=2,Boss=true,Quest=CFrame.new(5320.66601562,18.8855781555,856.281433105),Spawns={CFrame.new(5623.16552734,1.35667848587,733.808898926)}},
+        {LevelReq=250,Mob="Toga Warrior",Name="ColosseumQuest",Tier=1,Boss=false,Quest=CFrame.new(-1342.25549316,11.1514205933,-2928.58081055),Spawns={CFrame.new(-1819.48034668,9.21899795532,-2736.56494141),CFrame.new(-1533.140625,12.4893217087,-2781.29345703),CFrame.new(-1620.10302734,12.4893217087,-2672.29345703),CFrame.new(-1829.72351074,9.02930355072,-2661.5324707),CFrame.new(-1694.75183105,9.21899795532,-2633.26269531),CFrame.new(-1973.13171387,9.02927780151,-2744.93530273)}},
+        {LevelReq=275,Mob="Gladiator",Name="ColosseumQuest",Tier=2,Boss=false,Quest=CFrame.new(-1342.25549316,11.1514205933,-2928.58081055),Spawns={CFrame.new(-1238.91369629,11.6225595474,-3241.15893555),CFrame.new(-1212.63024902,11.6225595474,-3378.66992188),CFrame.new(-1144.47412109,11.6225595474,-3337.35913086),CFrame.new(-1118.91369629,11.6225595474,-3014.15893555),CFrame.new(-1161.91369629,11.6225595474,-3097.15893555)}},
+        {LevelReq=300,Mob="Military Soldier",Name="MagmaQuest",Tier=1,Boss=false,Quest=CFrame.new(-5308.8671875,17.0349807739,8482.69824219),Spawns={CFrame.new(-5623.79833984,17.0067863464,8314.05664062),CFrame.new(-5266.39111328,17.1308708191,8554.19335938),CFrame.new(-5694.47998047,17.0067920685,8329.20703125),CFrame.new(-5337.08789062,17.1308403015,8629.31640625),CFrame.new(-5418.47802734,18.0090122223,8421.08398438)}},
+        {LevelReq=325,Mob="Military Spy",Name="MagmaQuest",Tier=2,Boss=false,Quest=CFrame.new(-5308.8671875,17.0349807739,8482.69824219),Spawns={CFrame.new(-5952.54931641,76.9223327637,8742.40332031),CFrame.new(-5714.91845703,76.5920333862,8834.85839844),CFrame.new(-5808.98339844,77.3133239746,8791.20410156),CFrame.new(-5889.96289062,76.6140213013,8723.01074219)}},
+        {LevelReq=350,Mob="Magma Admiral",Name="MagmaQuest",Tier=3,Boss=true,Quest=CFrame.new(-5308.8671875,17.0349807739,8482.69824219),Spawns={CFrame.new(-5625.70996094,55.4438209534,8623.01171875)}},
+        {LevelReq=375,Mob="Fishman Warrior",Name="FishmanQuest",Tier=1,Boss=false,Quest=CFrame.new(61406.1953125,24.5187358856,1626.81640625),Spawns={CFrame.new(60715.9921875,25.2567386627,1284.89025879),CFrame.new(60892.2578125,23.8054046631,1500.49523926),CFrame.new(60788.3632812,23.8040161133,1484.52636719),CFrame.new(60930.921875,23.7948055267,1393.09350586),CFrame.new(60736.8125,23.7954559326,1396.33764648),CFrame.new(60859.6601562,23.7885627747,1328.19140625),CFrame.new(60626.4101562,25.2498073578,1142.828125)}},
+        {LevelReq=400,Mob="Fishman Commando",Name="FishmanQuest",Tier=2,Boss=false,Quest=CFrame.new(61406.1953125,24.5187358856,1626.81640625),Spawns={CFrame.new(61992.640625,24.549861908,1205.73803711),CFrame.new(61887.75,24.5488853455,1232.44702148),CFrame.new(62013.03125,24.5533771515,1329.94506836),CFrame.new(61808.0976562,24.5535316467,1328.58178711),CFrame.new(61994.5546875,24.5499229431,1425.44897461),CFrame.new(61872.875,24.5667133331,1464.17944336)}},
+        {LevelReq=425,Mob="Fishman Lord",Name="FishmanQuest",Tier=3,Boss=true,Quest=CFrame.new(61406.1953125,24.5187358856,1626.81640625),Spawns={CFrame.new(61352.9023438,67.1670074463,1029.11096191)}},
+        {LevelReq=450,Mob="God's Guard",Name="SkyExp1Quest",Tier=1,Boss=false,Quest=CFrame.new(-4882.89404297,926.177490234,-1031.05480957),Spawns={CFrame.new(-4364.76416016,1090.17175293,-383.479156494),CFrame.new(-4227.25097656,1087.96362305,-567.608886719),CFrame.new(-4130.80273438,1090.30334473,-291.206054688),CFrame.new(-4403.32763672,1088.21569824,-498.130004883),CFrame.new(-4234.55615234,1089.33435059,-267.375946045),CFrame.new(-4082.85107422,1087.26672363,-414.136230469)}},
+        {LevelReq=475,Mob="Shanda",Name="SkyExp1Quest",Tier=2,Boss=false,Quest=CFrame.new(-4882.89404297,926.177490234,-1031.05480957),Spawns={CFrame.new(-5890.41210938,5468.90478516,1956.18701172),CFrame.new(-5878.78808594,5470.43847656,1864.20336914),CFrame.new(-6040.20410156,5468.01318359,1734.20947266),CFrame.new(-5956.50146484,5470.09033203,1750.6015625),CFrame.new(-6026.83642578,5469.55273438,1851.04943848)}},
+        {LevelReq=500,Mob="Wysper",Name="SkyExp1Quest",Tier=3,Boss=true,Quest=CFrame.new(-4882.89404297,926.177490234,-1031.05480957),Spawns={CFrame.new(-6271.55859375,5472.77636719,1887.77050781)}},
+        {LevelReq=525,Mob="Royal Squad",Name="SkyExp2Quest",Tier=1,Boss=false,Quest=CFrame.new(-7033.10058594,5590.57421875,1353.10693359),Spawns={CFrame.new(-6706.87060547,5551.41357422,1155.43017578),CFrame.new(-6804.6875,5550.37402344,1083.56115723),CFrame.new(-6690.03955078,5551.41357422,1318.30541992),CFrame.new(-6868.93896484,5554.89013672,1319.95458984),CFrame.new(-6920.73339844,5551.41357422,1191.92456055)}},
+        {LevelReq=550,Mob="Royal Soldier",Name="SkyExp2Quest",Tier=2,Boss=false,Quest=CFrame.new(-7033.10058594,5590.57421875,1353.10693359),Spawns={CFrame.new(-7175.83544922,5541.05029297,947.144042969),CFrame.new(-6932.08789062,5541.05029297,842.444519043),CFrame.new(-7137.42773438,5541.05029297,892.987121582),CFrame.new(-7138.48193359,5541.05029297,1050.77429199),CFrame.new(-6938.38427734,5541.05029297,963.78125)}},
+        {LevelReq=575,Mob="Thunder God",Name="SkyExp2Quest",Tier=3,Boss=true,Quest=CFrame.new(-7033.10058594,5590.57421875,1353.10693359),Spawns={CFrame.new(-7125.41455078,5596.06298828,111.518699646)}},
+        {LevelReq=625,Mob="Galley Pirate",Name="FountainQuest",Tier=1,Boss=false,Quest=CFrame.new(5263.48779297,74.907989502,4087.61572266),Spawns={CFrame.new(5452.890625,78.7009429932,4112.57714844),CFrame.new(5327.61376953,76.2442779541,4014.50537109),CFrame.new(5708.22167969,80.9136810303,3928.11865234),CFrame.new(5670.65283203,79.5116882324,4074.46337891),CFrame.new(5430.41992188,77.9910812378,3953.56689453),CFrame.new(5840.02587891,76.8320617676,3975.56347656)}},
+        {LevelReq=650,Mob="Galley Captain",Name="FountainQuest",Tier=2,Boss=false,Quest=CFrame.new(5263.48779297,74.907989502,4087.61572266),Spawns={CFrame.new(5409.47851562,77.674331665,4686.9921875),CFrame.new(5782.203125,79.3242416382,4868.86425781),CFrame.new(5385.47460938,78.7068862915,4851.12109375),CFrame.new(5594.93359375,78.71144104,4751.86669922),CFrame.new(5685.41601562,77.6837005615,4742.5859375),CFrame.new(5899.57617188,76.5875778198,4809.02246094),CFrame.new(5544.03564453,76.8699951172,4899.09863281),CFrame.new(5773.7265625,77.6645431519,4703.10205078)}},
+        {LevelReq=675,Mob="Cyborg",Name="FountainQuest",Tier=3,Boss=true,Quest=CFrame.new(5263.48779297,74.907989502,4087.61572266),Spawns={CFrame.new(6252.39160156,9.31876659393,4941.38867188)}},
+    },
+    [2]={
+        {LevelReq=700,Mob="Raider",Name="Area1Quest",Tier=1,Boss=false,Quest=CFrame.new(-429.544006348,71.7700042725,1836.18200684),Spawns={CFrame.new(-917.437011719,40.0079956055,2250.43505859),CFrame.new(-612.437011719,40.0079956055,2557.43505859),CFrame.new(-607.437011719,40.0079956055,2202.43505859),CFrame.new(-904.336975098,40.0079956055,2501.43505859),CFrame.new(241.56300354,40.0079956055,2195.43505859),CFrame.new(549.562988281,40.0079956055,2190.43505859),CFrame.new(265.562988281,40.0079956055,2497.43505859),CFrame.new(475.562988281,40.0079956055,2433.43505859)}},
+        {LevelReq=725,Mob="Mercenary",Name="Area1Quest",Tier=2,Boss=false,Quest=CFrame.new(-429.544006348,71.7700042725,1836.18200684),Spawns={CFrame.new(-986.775024414,72.8760070801,1088.44702148),CFrame.new(-924.684020996,72.8760070801,1788.12402344),CFrame.new(-913.765014648,72.8760070801,1574.15100098),CFrame.new(-1085.15100098,72.8760070801,1696.39404297),CFrame.new(-1135.94396973,72.8760070801,1248.32702637),CFrame.new(-1209.20495605,72.8760070801,1073.0369873)}},
+        {LevelReq=750,Mob="Diamond",Name="Area1Quest",Tier=3,Boss=true,Quest=CFrame.new(-429.544006348,71.7700042725,1836.18200684),Spawns={CFrame.new(-1711.37097168,206.041000366,-97.0820007324)}},
+        {LevelReq=775,Mob="Swan Pirate",Name="Area2Quest",Tier=1,Boss=false,Quest=CFrame.new(638.445007324,71.7700042725,918.236022949),Spawns={CFrame.new(823.611999512,72.8079986572,1162.22094727),CFrame.new(984.630004883,72.8079986572,1401.6829834),CFrame.new(827.799987793,72.8079986572,1326.89697266),CFrame.new(1066.99401855,72.8079986572,1080.91796875),CFrame.new(967.17401123,72.9680023193,1180.75598145),CFrame.new(1063.18896484,72.8079986572,1399.76293945)}},
+        {LevelReq=800,Mob="Factory Staff",Name="Area2Quest",Tier=2,Boss=false,Quest=CFrame.new(638.445007324,71.7700042725,918.236022949),Spawns={CFrame.new(-105.88999939,72.8079986572,-670.24798584),CFrame.new(-426.890014648,72.8079986572,-367.24798584),CFrame.new(-93.8899993896,72.8079986572,-34.2279968262),CFrame.new(386.109985352,72.8079986572,91.7519989014),CFrame.new(936.109985352,72.8079986572,-71.2480010986),CFrame.new(692.109985352,72.8079986572,227.751998901)}},
+        {LevelReq=850,Mob="Jeremy",Name="Area2Quest",Tier=3,Boss=true,Quest=CFrame.new(638.445007324,71.7700042725,918.236022949),Spawns={CFrame.new(2338.00195312,451.425994873,700.106994629)}},
+        {LevelReq=875,Mob="Marine Lieutenant",Name="MarineQuest3",Tier=1,Boss=false,Quest=CFrame.new(-2440.79589844,71.7140045166,-3216.06811523),Spawns={CFrame.new(-2766.07006836,71.0140075684,-3144.74902344),CFrame.new(-2583.94506836,71.0140075684,-3039.61791992),CFrame.new(-3012.85205078,71.0140075684,-2921.83203125),CFrame.new(-3258.55004883,71.0140075684,-2990.86694336),CFrame.new(-2932.5,71.0140075684,-2604.09594727)}},
+        {LevelReq=900,Mob="Marine Captain",Name="MarineQuest3",Tier=2,Boss=false,Quest=CFrame.new(-2440.79589844,71.7140045166,-3216.06811523),Spawns={CFrame.new(-1805.36401367,73.0140075684,-3313.32495117),CFrame.new(-2030.24804688,73.0140075684,-3477.63500977),CFrame.new(-2103.93408203,73.0140075684,-3259.30297852),CFrame.new(-1928.38903809,73.0140075684,-3119.58007812),CFrame.new(-1601.3170166,73.0140075684,-3315.32495117)}},
+        {LevelReq=925,Mob="Orbitus",Name="MarineQuest3",Tier=3,Boss=true,Quest=CFrame.new(-2440.79589844,71.7140045166,-3216.06811523),Spawns={CFrame.new(-2138.48388672,75.9410095215,-4326.45507812)}},
+        {LevelReq=950,Mob="Zombie",Name="ZombieQuest",Tier=1,Boss=false,Quest=CFrame.new(-5497.06201172,47.5919952393,-795.236999512),Spawns={CFrame.new(-5595.60009766,49.3079986572,-524.24798584),CFrame.new(-5766.64892578,47.5010070801,-824.661987305),CFrame.new(-5512.23193359,49.3079986572,-847.978027344),CFrame.new(-5856.58886719,70.3509979248,-739.049987793),CFrame.new(-5761.9921875,49.3079986572,-654.937988281),CFrame.new(-5614.95996094,49.3079986572,-938.468994141)}},
+        {LevelReq=975,Mob="Vampire",Name="ZombieQuest",Tier=2,Boss=false,Quest=CFrame.new(-5497.06201172,47.5919952393,-795.236999512),Spawns={CFrame.new(-6277.26416016,9.00799560547,-1269.44897461),CFrame.new(-5776.55175781,9.00799560547,-1373.44995117),CFrame.new(-5952.99511719,9.00799560547,-1568.52905273),CFrame.new(-6132.39501953,9.00799560547,-1466.16894531),CFrame.new(-6039.68896484,9.00799560547,-1099.15905762)}},
+        {LevelReq=1000,Mob="Snow Trooper",Name="SnowMountainQuest",Tier=1,Boss=false,Quest=CFrame.new(609.859008789,400.119995117,-5372.25878906),Spawns={CFrame.new(572.692993164,400.808013916,-5605.20703125),CFrame.new(716.62701416,400.808013916,-5706.44091797),CFrame.new(642.666015625,400.808013916,-5454.48876953),CFrame.new(484.345001221,400.808013916,-5472.41601562),CFrame.new(445.944000244,442.808013916,-5553.90576172),CFrame.new(430.402008057,400.808013916,-5069.09521484),CFrame.new(392.218994141,400.808013916,-5207.68505859)}},
+        {LevelReq=1050,Mob="Winter Warrior",Name="SnowMountainQuest",Tier=2,Boss=false,Quest=CFrame.new(609.859008789,400.119995117,-5372.25878906),Spawns={CFrame.new(1205.45898438,428.808013916,-5397.35888672),CFrame.new(1226.30895996,428.808013916,-5215.97607422),CFrame.new(1142.43798828,428.808013916,-5043.05322266),CFrame.new(1446.27001953,428.808013916,-5369.21484375),CFrame.new(1043.30505371,428.808013916,-5049.78613281),CFrame.new(1371.87097168,428.808013916,-5194.703125)}},
+        {LevelReq=1100,Mob="Lab Subordinate",Name="IceSideQuest",Tier=1,Boss=false,Quest=CFrame.new(-6231.27197266,80.9337692261,-4851.32080078),Spawns={CFrame.new(-5897.82177734,81.699836731,-4554.62402344),CFrame.new(-5998.328125,90.0252456665,-4386.52246094),CFrame.new(-5766.35302734,81.699836731,-4249.66992188),CFrame.new(-5623.33300781,81.699836731,-4444.16064453),CFrame.new(-5693.31298828,81.699836731,-4628.29589844)}},
+        {LevelReq=1125,Mob="Horned Warrior",Name="IceSideQuest",Tier=2,Boss=false,Quest=CFrame.new(-6231.27197266,80.9337692261,-4851.32080078),Spawns={CFrame.new(-6182.00976562,29.2286148071,-5914.24609375),CFrame.new(-6445.95507812,31.0095653534,-5858.28808594),CFrame.new(-6539.96435547,29.2286148071,-5717.98291016),CFrame.new(-6421.203125,29.2286148071,-5591.42773438),CFrame.new(-6331.76513672,29.2286148071,-5778.94189453),CFrame.new(-6133.45117188,29.2286148071,-6049.02441406)}},
+        {LevelReq=1150,Mob="Smoke Admiral",Name="IceSideQuest",Tier=3,Boss=true,Quest=CFrame.new(-6231.27197266,80.9337692261,-4851.32080078),Spawns={CFrame.new(-4857.35839844,233.677841187,-5583.24316406)}},
+        {LevelReq=1175,Mob="Magma Ninja",Name="FireSideQuest",Tier=1,Boss=false,Quest=CFrame.new(-5403.36816406,28.2776184082,-5371.70019531),Spawns={CFrame.new(-5790.07568359,28.9154415131,-5393.24707031),CFrame.new(-5885.36865234,32.641620636,-5501.19726562),CFrame.new(-5845.98583984,50.2627563477,-5670.96972656),CFrame.new(-5811.14794922,30.0477333069,-5576.53662109),CFrame.new(-5711.41113281,47.4014968872,-5658.5234375),CFrame.new(-5657.26171875,34.2040710449,-5551.61328125)}},
+        {LevelReq=1200,Mob="Lava Pirate",Name="FireSideQuest",Tier=2,Boss=false,Quest=CFrame.new(-5403.36816406,28.2776184082,-5371.70019531),Spawns={CFrame.new(-5005.52148438,28.023431778,-4916.07714844),CFrame.new(-5005.39355469,28.4878692627,-5025.07617188),CFrame.new(-5082.35009766,28.9050598145,-4796.31738281),CFrame.new(-5111.28271484,32.1717300415,-5115.875),CFrame.new(-5218.38916016,29.7756690979,-4999.94921875)}},
+        {LevelReq=1250,Mob="Ship Deckhand",Name="ShipQuest1",Tier=1,Boss=false,Quest=CFrame.new(1040.55541992,124.943008423,32909.1054688),Spawns={CFrame.new(580.29901123,125.577011108,33124.25),CFrame.new(719.29901123,125.577011108,33032.109375),CFrame.new(1247.2989502,125.577011108,33218.109375),CFrame.new(1176.2989502,125.577011108,33119.109375),CFrame.new(1157.2989502,125.577011108,32930.109375),CFrame.new(1259.2989502,125.577011108,33032.109375),CFrame.new(580.29901123,125.577011108,32930.109375)}},
+        {LevelReq=1275,Mob="Ship Engineer",Name="ShipQuest1",Tier=2,Boss=false,Quest=CFrame.new(1040.55541992,124.943008423,32909.1054688),Spawns={CFrame.new(834.79699707,43.6930084229,32720.9257812),CFrame.new(729.229980469,43.6930084229,32950.34375),CFrame.new(1088.25195312,43.6930084229,32890.09375),CFrame.new(1016.77801514,43.6930084229,33074.1328125),CFrame.new(1025.65698242,43.6930084229,32740.8554688),CFrame.new(815.62902832,43.6930084229,33111.3398438)}},
+        {LevelReq=1300,Mob="Ship Steward",Name="ShipQuest2",Tier=1,Boss=false,Quest=CFrame.new(974.075927734,124.938667297,33253.6210938),Spawns={CFrame.new(1032.45800781,125.833999634,33512.3945312),CFrame.new(801.382995605,125.833999634,33505.1796875),CFrame.new(815.000976562,125.833999634,33376.203125),CFrame.new(986.882995605,125.833999634,33366.953125),CFrame.new(918.666992188,125.833999634,33506.5039062)}},
+        {LevelReq=1325,Mob="Ship Officer",Name="ShipQuest2",Tier=2,Boss=false,Quest=CFrame.new(974.075927734,124.938667297,33253.6210938),Spawns={CFrame.new(505.528991699,179.906005859,33263.6328125),CFrame.new(694.528991699,179.906005859,33112.6328125),CFrame.new(657.528991699,179.906005859,33460.6328125),CFrame.new(1144.52905273,179.906005859,33112.6015625),CFrame.new(1320.52905273,179.906005859,33294.6015625),CFrame.new(1162.52905273,179.906005859,33445.6015625)}},
+        {LevelReq=1350,Mob="Arctic Warrior",Name="FrostQuest",Tier=1,Boss=false,Quest=CFrame.new(5667.65820312,26.8000030518,-6486.08984375),Spawns={CFrame.new(6095.52587891,27.5599975586,-6077.94091797),CFrame.new(6271.31689453,27.5599975586,-6151.53808594),CFrame.new(5994.58886719,27.5599975586,-6324.27880859),CFrame.new(5832.19580078,27.5599975586,-6241.29003906),CFrame.new(6167.22216797,27.5599975586,-6319.22998047)}},
+        {LevelReq=1375,Mob="Snow Lurker",Name="FrostQuest",Tier=2,Boss=false,Quest=CFrame.new(5667.65820312,26.8000030518,-6486.08984375),Spawns={CFrame.new(5763.84619141,27.5599975586,-6671.04589844),CFrame.new(5443.421875,27.5599975586,-7031.28515625),CFrame.new(5567.85693359,27.5599975586,-6900.46484375),CFrame.new(5484.41796875,27.5599975586,-6733.75),CFrame.new(5524.15722656,27.5599975586,-6583.82080078)}},
+        {LevelReq=1400,Mob="Awakened Ice Admiral",Name="FrostQuest",Tier=3,Boss=true,Quest=CFrame.new(5667.65820312,26.8000030518,-6486.08984375),Spawns={CFrame.new(6551.79394531,325.295013428,-6989.89892578)}},
+        {LevelReq=1425,Mob="Sea Soldier",Name="ForgottenQuest",Tier=1,Boss=false,Quest=CFrame.new(-3054.44506836,238.343994141,-10142.8193359),Spawns={CFrame.new(-2550.92211914,28.4530029297,-9839.99707031),CFrame.new(-2840.09204102,27.4530029297,-9814.38085938),CFrame.new(-3499.34790039,16.0859985352,-9712.00585938),CFrame.new(-3293.05004883,5.90899658203,-9640.93164062),CFrame.new(-3459.69189453,25.6289978027,-9934.77246094),CFrame.new(-3240.33105469,27.4530029297,-9813.96582031)}},
+        {LevelReq=1450,Mob="Water Fighter",Name="ForgottenQuest",Tier=2,Boss=false,Quest=CFrame.new(-3054.44506836,238.343994141,-10142.8193359),Spawns={CFrame.new(-3331.70507812,239.138000488,-10553.3564453),CFrame.new(-3511.95898438,239.138000488,-10346.9287109),CFrame.new(-3396.35888672,239.138000488,-10745.1054688),CFrame.new(-3316.75390625,239.138000488,-10323.1689453),CFrame.new(-3657.94995117,239.138000488,-10591.1474609)}},
+        {LevelReq=1475,Mob="Tide Keeper",Name="ForgottenQuest",Tier=3,Boss=true,Quest=CFrame.new(-3054.44506836,238.343994141,-10142.8193359),Spawns={CFrame.new(-3760.41601562,78.3379974365,-11585.7041016)}},
+    },
+    [3]={
+        {LevelReq=1500,Mob="Pirate Millionaire",Name="PiratePortQuest",Tier=1,Boss=false,Quest=CFrame.new(-450.105010986,107.680999756,5950.72607422),Spawns={CFrame.new(-593.177001953,55.4869995117,5511.45703125),CFrame.new(-543.814025879,56.6920013428,5653.96923828),CFrame.new(-751.570007324,55.4819946289,5637.53320312),CFrame.new(-62.6029968262,55.4869995117,5803.47119141),CFrame.new(-232.919998169,57.0429992676,5757.83300781),CFrame.new(-118.809005737,55.4869995117,5649.16992188)}},
+        {LevelReq=1525,Mob="Pistol Billionaire",Name="PiratePortQuest",Tier=2,Boss=false,Quest=CFrame.new(-450.105010986,107.680999756,5950.72607422),Spawns={CFrame.new(-852.890991211,69.9970092773,6175.29589844),CFrame.new(-739.53302002,84.6340026855,5833.05712891),CFrame.new(-666.770996094,84.9440002441,6008.33789062),CFrame.new(-903.169006348,84.6340026855,5891.01123047),CFrame.new(-185.692993164,84.7089996338,6103.62695312),CFrame.new(-188.143005371,84.7089996338,6337.04101562),CFrame.new(-54.8110046387,83.7700042725,5947.84082031),CFrame.new(40.0599975586,85.2720031738,6114.29785156)}},
+        {LevelReq=1550,Mob="Stone",Name="PiratePortQuest",Tier=3,Boss=true,Quest=CFrame.new(-450.105010986,107.680999756,5950.72607422),Spawns={CFrame.new(-1109.92602539,53.3789978027,6811.72509766)}},
+        {LevelReq=1575,Mob="Dragon Crew Warrior",Name="DragonCrewQuest",Tier=1,Boss=false,Quest=CFrame.new(6735.11083984,126.990005493,-711.098022461),Spawns={CFrame.new(6709.76416016,52.3440093994,-1139.0300293),CFrame.new(7217.78710938,56.5700073242,-680.75),CFrame.new(6473.1640625,52.3440093994,-1231.7779541),CFrame.new(6919.08007812,57.7310028076,-940.838989258),CFrame.new(6615.23193359,52.3440093994,-978.935974121),CFrame.new(6998.79492188,53.7310028076,-519.408996582)}},
+        {LevelReq=1600,Mob="Dragon Crew Archer",Name="DragonCrewQuest",Tier=2,Boss=false,Quest=CFrame.new(6735.11083984,126.990005493,-711.098022461),Spawns={CFrame.new(6582.80517578,521.322998047,505.264007568),CFrame.new(6668.76220703,481.37701416,329.122009277),CFrame.new(6948.45800781,482.878997803,185.022994995),CFrame.new(6762.49707031,481.37701416,110.770004272),CFrame.new(6818.58886719,482.878997803,512.726989746)}},
+        {LevelReq=1625,Mob="Hydra Enforcer",Name="VenomCrewQuest",Tier=1,Boss=false,Quest=CFrame.new(5214.33886719,1003.46801758,759.507019043),Spawns={CFrame.new(4462.65283203,1005.10198975,551.005981445),CFrame.new(4581.51904297,1003.15197754,704.937011719),CFrame.new(4434.08007812,1005.65301514,209.520996094),CFrame.new(4671.68896484,1004.33398438,-14.5670013428),CFrame.new(4547.11523438,1003.10198975,334.195007324),CFrame.new(4456.42285156,1008.45300293,418.837005615)}},
+        {LevelReq=1650,Mob="Venomous Assailant",Name="VenomCrewQuest",Tier=2,Boss=false,Quest=CFrame.new(5214.33886719,1003.46801758,759.507019043),Spawns={CFrame.new(4448.78320312,1222.02197266,540.538024902),CFrame.new(4879.91992188,1093.68896484,1104.00805664),CFrame.new(4443.046875,1237.02404785,335.859985352),CFrame.new(4637.88378906,1078.78601074,882.41998291),CFrame.new(4674.92675781,1134.82702637,996.309020996),CFrame.new(4452.81689453,1220.82104492,698.911987305)}},
+        {LevelReq=1675,Mob="Hydra Leader",Name="VenomCrewQuest",Tier=3,Boss=true,Quest=CFrame.new(5214.33886719,1003.46801758,759.507019043),Spawns={CFrame.new(5888.77392578,1020.14898682,-117.815002441)}},
+        {LevelReq=1700,Mob="Marine Commodore",Name="MarineTreeIsland",Tier=1,Boss=false,Quest=CFrame.new(2485.73291016,73.3460083008,-6788.625),Spawns={CFrame.new(2577.25390625,75.6100006104,-7739.87207031),CFrame.new(2995.37988281,75.6100006104,-8054.45703125),CFrame.new(2367.90795898,75.6100006104,-7794.95605469),CFrame.new(2685.39990234,75.6100006104,-8066.04980469),CFrame.new(3222.41699219,75.6100006104,-7820.55712891),CFrame.new(2497.77490234,81.8470001221,-7356.93896484)}},
+        {LevelReq=1725,Mob="Marine Rear Admiral",Name="MarineTreeIsland",Tier=2,Boss=false,Quest=CFrame.new(2485.73291016,73.3460083008,-6788.625),Spawns={CFrame.new(3920.06103516,146.225997925,-7175.20605469),CFrame.new(3973.73803711,123.912002563,-6931.93701172),CFrame.new(3465.18408203,123.912002563,-7181.78417969),CFrame.new(3761.81005859,123.912002563,-6823.52197266),CFrame.new(3753.50292969,123.912002563,-7403.22021484)}},
+        {LevelReq=1750,Mob="Kilo Admiral",Name="MarineTreeIsland",Tier=3,Boss=true,Quest=CFrame.new(2485.73291016,73.3460083008,-6788.625),Spawns={CFrame.new(2998.29492188,508.794006348,-7344.32177734)}},
+        {LevelReq=1775,Mob="Fishman Raider",Name="DeepForestIsland3",Tier=1,Boss=false,Quest=CFrame.new(-10581.65625,330.87298584,-8761.18652344),Spawns={CFrame.new(-10523.7558594,332.602996826,-8597.58886719),CFrame.new(-10117.9472656,332.602996826,-8174.68603516),CFrame.new(-10223.1142578,332.602996826,-8482.54589844),CFrame.new(-10391.7382812,332.602996826,-8212.27636719),CFrame.new(-10853.8564453,332.602996826,-8425.24023438),CFrame.new(-10603.6445312,332.602996826,-8309.12597656)}},
+        {LevelReq=1800,Mob="Fishman Captain",Name="DeepForestIsland3",Tier=2,Boss=false,Quest=CFrame.new(-10581.65625,330.87298584,-8761.18652344),Spawns={CFrame.new(-11210.2685547,331.82598877,-9072.71191406),CFrame.new(-10828.1064453,331.82598877,-9049.14648438),CFrame.new(-10736.6728516,331.82598877,-8807.57910156),CFrame.new(-11107.8535156,331.82598877,-8842.91601562),CFrame.new(-11072.5996094,331.82598877,-8610.07226562),CFrame.new(-11135.2001953,331.82598877,-9240.88671875)}},
+        {LevelReq=1825,Mob="Forest Pirate",Name="DeepForestIsland",Tier=1,Boss=false,Quest=CFrame.new(-13234.0400391,331.488006592,-7625.40087891),Spawns={CFrame.new(-13345.5419922,332.226013184,-7630.7578125),CFrame.new(-13651.5429688,332.226013184,-7894.7578125),CFrame.new(-13600.5429688,332.226013184,-7741.7578125),CFrame.new(-13105.5429688,332.226013184,-7705.75683594),CFrame.new(-13513.5429688,332.226013184,-8008.7578125),CFrame.new(-13279.5429688,332.226013184,-7897.7578125)}},
+        {LevelReq=1850,Mob="Mythological Pirate",Name="DeepForestIsland",Tier=2,Boss=false,Quest=CFrame.new(-13234.0400391,331.488006592,-7625.40087891),Spawns={CFrame.new(-13732.0478516,469.433013916,-6826.96484375),CFrame.new(-13456.0498047,469.433013916,-7039.96386719),CFrame.new(-13876.0478516,469.433013916,-7009.96484375),CFrame.new(-13221.0302734,519.103027344,-6902.01806641),CFrame.new(-13221.03125,519.103027344,-6689.01611328),CFrame.new(-13320.0302734,519.103027344,-6785.01806641)}},
+        {LevelReq=1875,Mob="Captain Elephant",Name="DeepForestIsland",Tier=3,Boss=true,Quest=CFrame.new(-13234.0400391,331.488006592,-7625.40087891),Spawns={CFrame.new(-13365.5292969,321.230987549,-8484.99023438)}},
+        {LevelReq=1900,Mob="Jungle Pirate",Name="DeepForestIsland2",Tier=1,Boss=false,Quest=CFrame.new(-12680.3818359,389.971008301,-9902.01953125),Spawns={CFrame.new(-11902.2734375,331.291992188,-10432.0673828),CFrame.new(-12142.4589844,331.602996826,-10419.9111328),CFrame.new(-11708.4316406,331.875,-10700.0517578),CFrame.new(-11918.1035156,332.518005371,-10744.0898438),CFrame.new(-11612.4667969,335.821990967,-10489.4091797),CFrame.new(-12321.3115234,331.437011719,-10669.2548828),CFrame.new(-12306.3486328,331.071990967,-10352.8779297)}},
+        {LevelReq=1925,Mob="Musketeer Pirate",Name="DeepForestIsland2",Tier=2,Boss=false,Quest=CFrame.new(-12680.3818359,389.971008301,-9902.01953125),Spawns={CFrame.new(-13556.078125,391.394012451,-9735.94433594),CFrame.new(-13198.6435547,391.394012451,-9602.29589844),CFrame.new(-13075.6435547,391.394012451,-9890.29589844),CFrame.new(-13270.8818359,472.062011719,-9860.66113281),CFrame.new(-13337.8818359,472.062011719,-9698.66113281),CFrame.new(-13417.6435547,391.394012451,-9962.29589844),CFrame.new(-13514.8681641,403.403991699,-9866.51953125)}},
+        {LevelReq=1950,Mob="Beautiful Pirate",Name="DeepForestIsland2",Tier=3,Boss=true,Quest=CFrame.new(-12680.3818359,389.971008301,-9902.01953125),Spawns={CFrame.new(5367.31396484,26.3950042725,-64.7010040283)}},
+        {LevelReq=1975,Mob="Reborn Skeleton",Name="HauntedQuest1",Tier=1,Boss=false,Quest=CFrame.new(-9479.21679688,141.214996338,5566.09277344),Spawns={CFrame.new(-8762.65722656,141.611999512,6183.33984375),CFrame.new(-8710.1015625,140.95300293,6112.93017578),CFrame.new(-8682.1015625,140.95300293,5968.93017578),CFrame.new(-8868.1015625,140.95300293,6034.93017578),CFrame.new(-8646.1015625,140.95300293,5850.93017578),CFrame.new(-8826.1015625,140.95300293,6165.93017578),CFrame.new(-8811.56542969,143.104995728,5871.75292969)}},
+        {LevelReq=2000,Mob="Living Zombie",Name="HauntedQuest1",Tier=2,Boss=false,Quest=CFrame.new(-9479.21679688,141.214996338,5566.09277344),Spawns={CFrame.new(-10184.1015625,152.95300293,5741.93017578),CFrame.new(-10293.1015625,152.95300293,5960.93017578),CFrame.new(-10170.9023438,141.175003052,6159.62695312),CFrame.new(-10061.9023438,140.175003052,6038.62695312),CFrame.new(-10205.1015625,151.95300293,5861.93017578),CFrame.new(-9956.1015625,140.95300293,5966.93017578)}},
+        {LevelReq=2025,Mob="Demonic Soul",Name="HauntedQuest2",Tier=1,Boss=false,Quest=CFrame.new(-9516.99316406,172.016998291,6078.46484375),Spawns={CFrame.new(-9565.95605469,171.95300293,6235.40820312),CFrame.new(-9344.95605469,171.95300293,6201.40820312),CFrame.new(-9631.95605469,171.95300293,6053.40820312),CFrame.new(-9426.95605469,171.95300293,6048.40820312),CFrame.new(-9253.95605469,171.95300293,6050.40820312),CFrame.new(-9753.95605469,171.95300293,6166.40820312)}},
+        {LevelReq=2050,Mob="Posessed Mummy",Name="HauntedQuest2",Tier=2,Boss=false,Quest=CFrame.new(-9516.99316406,172.016998291,6078.46484375),Spawns={CFrame.new(-9609.3515625,5.95300292969,6361.97412109),CFrame.new(-9759.3515625,26.9530029297,6051.97412109),CFrame.new(-9449.3515625,5.95300292969,6342.97412109),CFrame.new(-9759.3515625,26.9530029297,6368.97412109),CFrame.new(-9399.64746094,12.1979980469,6118.81103516)}},
+        {LevelReq=2075,Mob="Peanut Scout",Name="NutsIslandQuest",Tier=1,Boss=false,Quest=CFrame.new(-2105.53198242,37.25,-10195.5087891),Spawns={CFrame.new(-2078.09106445,12.8549957275,-9997.10351562),CFrame.new(-1865.42700195,8.85499572754,-10086.2324219),CFrame.new(-2065.34790039,34.9519958496,-10066.8105469),CFrame.new(-1924.00097656,37.2720031738,-10199.6630859),CFrame.new(-2294.24804688,37.2369995117,-10176.1210938),CFrame.new(-2250.19091797,8.85499572754,-9948.83886719),CFrame.new(-2377.28295898,37.9519958496,-10308.21875)}},
+        {LevelReq=2100,Mob="Peanut President",Name="NutsIslandQuest",Tier=2,Boss=false,Quest=CFrame.new(-2105.53198242,37.25,-10195.5087891),Spawns={CFrame.new(-2311.98706055,87.3229980469,-10609.3427734),CFrame.new(-1874.36206055,37.2220001221,-10596.5761719),CFrame.new(-1996.06994629,37.2220001221,-10496.9267578),CFrame.new(-2247.47607422,87.3229980469,-10440.8681641),CFrame.new(-2395.12402344,87.3760070801,-10456.3066406),CFrame.new(-1993.40600586,37.2220001221,-10682.9052734)}},
+        {LevelReq=2125,Mob="Ice Cream Chef",Name="IceCreamIslandQuest",Tier=1,Boss=false,Quest=CFrame.new(-819.37701416,64.9260101318,-10967.2832031),Spawns={CFrame.new(-966.289001465,64.5590057373,-10973.5576172),CFrame.new(-1109.2869873,64.5590057373,-10931.265625),CFrame.new(-931.744995117,64.5590057373,-11146.7304688),CFrame.new(-797.031005859,64.5590057373,-10790.7246094),CFrame.new(-715.434020996,64.5590057373,-10920.4355469),CFrame.new(-502.410003662,64.5590057373,-10873.7949219)}},
+        {LevelReq=2150,Mob="Ice Cream Commander",Name="IceCreamIslandQuest",Tier=2,Boss=false,Quest=CFrame.new(-819.37701416,64.9260101318,-10967.2832031),Spawns={CFrame.new(-366.812988281,64.6529998779,-11094.4228516),CFrame.new(-657.549987793,129.740997314,-11215.7919922),CFrame.new(-528.749023438,65.4790039062,-11348.9228516),CFrame.new(-883.630004883,70.1410064697,-11485.5253906),CFrame.new(-770.414978027,125.61100769,-11159.8408203),CFrame.new(-675.096984863,67.6670074463,-11371.7246094)}},
+        {LevelReq=2175,Mob="Cake Queen",Name="IceCreamIslandQuest",Tier=3,Boss=true,Quest=CFrame.new(-819.37701416,64.9260101318,-10967.2832031),Spawns={CFrame.new(-678.478027344,381.856994629,-11114.3457031)}},
+        {LevelReq=2200,Mob="Cookie Crafter",Name="CakeQuest1",Tier=1,Boss=false,Quest=CFrame.new(-2022.2989502,36.9280090332,-12030.9765625),Spawns={CFrame.new(-2321.71191406,37.0050048828,-12216.7841797),CFrame.new(-2499.16894531,37.0050048828,-12165.0185547),CFrame.new(-2464.47705078,37.0050048828,-12049.9326172),CFrame.new(-2342.87304688,37.0050048828,-12009.2382812),CFrame.new(-2212.88989258,37.0050048828,-11969.2568359),CFrame.new(-2423.39892578,37.0050048828,-12265.7666016),CFrame.new(-2246.37402344,37.0050048828,-12126.9414062)}},
+        {LevelReq=2225,Mob="Cake Guard",Name="CakeQuest1",Tier=2,Boss=false,Quest=CFrame.new(-2022.2989502,36.9280090332,-12030.9765625),Spawns={CFrame.new(-1531.41101074,35.2190093994,-12132.4394531),CFrame.new(-1693.97998047,35.2190093994,-12436.84375),CFrame.new(-1736.54394531,35.2190093994,-12249.0605469),CFrame.new(-1471.12805176,35.2190093994,-12436.84375),CFrame.new(-1418.51098633,35.2190093994,-12255.71875)}},
+        {LevelReq=2250,Mob="Baking Staff",Name="CakeQuest2",Tier=1,Boss=false,Quest=CFrame.new(-1928.31799316,37.7299957275,-12840.6259766),Spawns={CFrame.new(-1720.85095215,34.6650085449,-13087.125),CFrame.new(-1828.80102539,34.6650085449,-12699.4384766),CFrame.new(-1980.43701172,34.6650085449,-12983.8408203),CFrame.new(-1774.07800293,34.6650085449,-12850.4521484),CFrame.new(-1847.17797852,34.6650085449,-13132.5039062),CFrame.new(-1759.28601074,34.6650085449,-12994.8398438)}},
+        {LevelReq=2275,Mob="Head Baker",Name="CakeQuest2",Tier=2,Boss=false,Quest=CFrame.new(-1928.31799316,37.7299957275,-12840.6259766),Spawns={CFrame.new(-2263.35400391,51.0099945068,-12711.3916016),CFrame.new(-2251.57592773,51.0099945068,-13033.3974609),CFrame.new(-2389.22900391,51.0099945068,-13018.3349609),CFrame.new(-2369.09008789,51.0099945068,-12807.921875),CFrame.new(-2151.37792969,51.0099945068,-13033.3974609),CFrame.new(-2100.70507812,51.0099945068,-12720.9658203)}},
+        {LevelReq=2300,Mob="Cocoa Warrior",Name="ChocQuest1",Tier=1,Boss=false,Quest=CFrame.new(231.75,23.8999938965,-12200.2919922),Spawns={CFrame.new(6.33200073242,26.2250061035,-12305.2089844),CFrame.new(-125.007003784,26.2250061035,-12345.8085938),CFrame.new(167.979003906,26.2250061035,-12238.8740234),CFrame.new(-128.669998169,26.2250061035,-12249.8134766),CFrame.new(34.8440093994,26.2250061035,-12169.6630859)}},
+        {LevelReq=2325,Mob="Chocolate Bar Battler",Name="ChocQuest1",Tier=2,Boss=false,Quest=CFrame.new(231.75,23.8999938965,-12200.2919922),Spawns={CFrame.new(717.515014648,25.5820007324,-12557.6708984),CFrame.new(582.828979492,25.5820007324,-12550.7041016),CFrame.new(701.312011719,25.5820007324,-12708.2148438),CFrame.new(598.833007812,25.5820007324,-12395.1210938),CFrame.new(833.197998047,25.5820007324,-12671.4042969),CFrame.new(806.958984375,25.5820007324,-12773.078125)}},
+        {LevelReq=2350,Mob="Sweet Thief",Name="ChocQuest2",Tier=1,Boss=false,Quest=CFrame.new(151.197998047,23.8910064697,-12774.6171875),Spawns={CFrame.new(-140.257995605,25.5820007324,-12652.3115234),CFrame.new(5.36599731445,25.5820007324,-12537.4257812),CFrame.new(88.4720001221,25.5820007324,-12662.2070312),CFrame.new(-77.6470031738,25.5820007324,-12765.6201172),CFrame.new(143.970001221,25.5820007324,-12531.7207031)}},
+        {LevelReq=2375,Mob="Candy Rebel",Name="ChocQuest2",Tier=2,Boss=false,Quest=CFrame.new(151.197998047,23.8910064697,-12774.6171875),Spawns={CFrame.new(166.820007324,25.5820007324,-13035.3457031),CFrame.new(47.9230041504,25.5820007324,-13029.2402344),CFrame.new(220.378005981,26.5820007324,-12913.9658203),CFrame.new(-72.1289978027,25.5820007324,-12940.3242188),CFrame.new(52.9980010986,26.5820007324,-12851.6757812)}},
+        {LevelReq=2400,Mob="Candy Pirate",Name="CandyQuest1",Tier=1,Boss=false,Quest=CFrame.new(-1164.49804688,59.2689971924,-14492.6181641),Spawns={CFrame.new(-1378.65698242,38.0240020752,-14802.8837891),CFrame.new(-1428.1529541,36.4069976807,-14637.8964844),CFrame.new(-1332.67504883,24.3430023193,-14327.3603516),CFrame.new(-1255.7989502,33.4669952393,-14507.0966797),CFrame.new(-1226.7869873,36.300994873,-14777.5878906),CFrame.new(-1440.3260498,32.4929962158,-14435.9345703)}},
+        {LevelReq=2425,Mob="Snow Demon",Name="CandyQuest1",Tier=2,Boss=false,Quest=CFrame.new(-1164.49804688,59.2689971924,-14492.6181641),Spawns={CFrame.new(-784.67199707,24.8099975586,-14631.7851562),CFrame.new(-771.226013184,14.2239990234,-14434.3037109),CFrame.new(-936.151977539,13.9960021973,-14552.4980469),CFrame.new(-813.560974121,15.3430023193,-14322.7148438),CFrame.new(-897.773010254,24.5939941406,-14733.7714844)}},
+        {LevelReq=2450,Mob="Isle Outlaw",Name="TikiQuest1",Tier=1,Boss=false,Quest=CFrame.new(-16548.8164062,55.6060028076,-172.81199646),Spawns={CFrame.new(-16433.71875,57.2210083008,-195.473007202),CFrame.new(-16351.7773438,23.4940032959,-282.45401001),CFrame.new(-16122.4052734,11.779006958,-257.354003906),CFrame.new(-16289.4882812,22.8740081787,-179.444000244),CFrame.new(-16163.4248047,11.9450073242,-99.3600006104)}},
+        {LevelReq=2475,Mob="Island Boy",Name="TikiQuest1",Tier=2,Boss=false,Quest=CFrame.new(-16548.8164062,55.6060028076,-172.81199646),Spawns={CFrame.new(-16991.7304688,12.766998291,-186.182998657),CFrame.new(-16736.21875,22.171005249,-131.720993042),CFrame.new(-16905.3046875,13.0939941406,-73.5070037842),CFrame.new(-16883.0488281,23.3470001221,-250.87399292),CFrame.new(-16661.5742188,57.3720092773,-252.962997437)}},
+        {LevelReq=2500,Mob="Sun-kissed Warrior",Name="TikiQuest2",Tier=1,Boss=false,Quest=CFrame.new(-16541.0214844,54.7709960938,1051.46105957),Spawns={CFrame.new(-16153.3652344,14.4649963379,942.447998047),CFrame.new(-16186.4208984,25.1040039062,1098.08300781),CFrame.new(-16413.5078125,56.7109985352,1054.43603516),CFrame.new(-16052.4560547,9.81799316406,1061.91296387),CFrame.new(-16357.3134766,21.0189971924,1005.65100098)}},
+        {LevelReq=2525,Mob="Isle Champion",Name="TikiQuest2",Tier=2,Boss=false,Quest=CFrame.new(-16541.0214844,54.7709960938,1051.46105957),Spawns={CFrame.new(-16940.7988281,14.1929931641,1070.8659668),CFrame.new(-16901.2304688,12.4510040283,969.968994141),CFrame.new(-16735.6757812,23.3460083008,1110.58496094),CFrame.new(-16618.7460938,58.3780059814,1099.5090332),CFrame.new(-16787.3203125,25.2050018311,992.132019043)}},
+        {LevelReq=2550,Mob="Serpent Hunter",Name="TikiQuest3",Tier=1,Boss=false,Quest=CFrame.new(-16665.1914062,104.596008301,1579.69396973),Spawns={CFrame.new(-16521.0625,106.093002319,1488.78503418),CFrame.new(-16599.7070312,71.0899963379,1757.91296387),CFrame.new(-16442.8261719,71.637008667,1693.44604492),CFrame.new(-16536.0253906,106.870010376,1347.14001465),CFrame.new(-16621.4199219,121.908004761,1290.68994141)}},
+        {LevelReq=2575,Mob="Skull Slayer",Name="TikiQuest3",Tier=2,Boss=false,Quest=CFrame.new(-16665.1914062,104.596008301,1579.69396973),Spawns={CFrame.new(-16855.0429688,122.457000732,1478.1529541),CFrame.new(-16812.8828125,72.1430053711,1757.16601562),CFrame.new(-16829.421875,193.199996948,1753.42199707),CFrame.new(-16948.578125,193.132003784,1643.61303711),CFrame.new(-16811.5625,86.125,1542.22900391),CFrame.new(-16985.7265625,59.2689971924,1632.82202148)}},
+        {LevelReq=2600,Mob="Reef Bandit",Name="SubmergedQuest1",Tier=1,Boss=false,Quest=CFrame.new(10780.6396484,-2088.4140625,9260.453125),Spawns={CFrame.new(10899.859375,-2145.23486328,9279.29394531),CFrame.new(11039.6269531,-2156.10327148,9279.11230469),CFrame.new(11085.1894531,-2160.54052734,9129.76367188),CFrame.new(10883.5478516,-2160.20458984,9075.48339844),CFrame.new(10980.5322266,-2160.41455078,9051.94921875)}},
+        {LevelReq=2625,Mob="Coral Pirate",Name="SubmergedQuest1",Tier=2,Boss=false,Quest=CFrame.new(10780.6396484,-2088.4140625,9260.453125),Spawns={CFrame.new(10703.7099609,-2087.29663086,9255.38183594),CFrame.new(10646.8447266,-2087.30175781,9304.16894531),CFrame.new(10839.4765625,-2087.29907227,9486.078125),CFrame.new(10733.1787109,-2087.29711914,9411.109375),CFrame.new(10824.5439453,-2087.29467773,9357.23144531)}},
+        {LevelReq=2650,Mob="Sea Chanter",Name="SubmergedQuest2",Tier=1,Boss=false,Quest=CFrame.new(10883.5986328,-2086.88891602,10034.0195312),Spawns={CFrame.new(10625.5058594,-2087.37304688,10191.6953125),CFrame.new(10786.3867188,-2087.37304688,10105.2617188),CFrame.new(10680.0761719,-2056.67480469,9933.88964844),CFrame.new(10581.5078125,-2071.7487793,10020.6503906),CFrame.new(10466.3046875,-2087.37304688,10106.8476562)}},
+        {LevelReq=2675,Mob="High Disciple",Name="SubmergedQuest3",Tier=1,Boss=false,Quest=CFrame.new(9637.29394531,-1993.13513184,9616.30175781),Spawns={CFrame.new(9854.43554688,-1995.0880127,9963.9375),CFrame.new(9835.43554688,-1995.0880127,9533.9375),CFrame.new(9778.43554688,-1995.0880127,9876.9375),CFrame.new(9778.43554688,-1995.0880127,9720.9375),CFrame.new(9886.43554688,-1995.0880127,9629.9375)}},
+        {LevelReq=2675,Mob="Ocean Prophet",Name="SubmergedQuest2",Tier=2,Boss=false,Quest=CFrame.new(9637.29394531,-1993.13513184,9616.30175781),Spawns={CFrame.new(10861.9707031,-2006.61682129,10245.2148438),CFrame.new(10924.234375,-1998.92248535,10121.0537109),CFrame.new(11003.3261719,-2007.02575684,10225.0625),CFrame.new(11111.5507812,-2007.3404541,10201.5078125),CFrame.new(11129.7890625,-2007.7989502,10051.4726562)}},
+        {LevelReq=2700,Mob="Grand Devotee",Name="SubmergedQuest3",Tier=2,Boss=false,Quest=CFrame.new(9637.29394531,-1993.13513184,9616.30175781),Spawns={CFrame.new(9620.51171875,-1994.39746094,9871.70898438),CFrame.new(9608.92773438,-1994.39758301,9956.375),CFrame.new(9719.8828125,-1989.86169434,10134.2207031),CFrame.new(9561.1796875,-1989.8638916,10090.4003906),CFrame.new(9559.19433594,-1994.39746094,9798.66503906),CFrame.new(9589.19726562,-1994.19165039,9704.75976562)}},
+    },
+}
+
+    local function rows() return preloadRows[seaIndex()] or {} end
+    local function nearestPoint(points)
+        local _,_,root=character()
+        local best,metric=nil,math.huge
+        for _,point in ipairs(points) do
+            local d=root and (root.Position-point.Position).Magnitude or 0
+            if d<metric then best,metric=point,d end
         end
-        local function match(q)
-            for _,row in ipairs(rows()) do
-                if row.Name==q.Name and cleanName(row.Mob)==cleanName(q.Mob)
-                    and (q.Tier==nil or tostring(row.Tier)==tostring(q.Tier)) then return row end
+        return best
+    end
+    local function match(q)
+        for _,row in ipairs(rows()) do
+            if row.Name==q.Name and cleanName(row.Mob)==cleanName(q.Mob)
+                and (q.Tier==nil or tostring(row.Tier)==tostring(q.Tier)) then return row end
+        end
+    end
+    local function complement(q)
+        if not q then return nil end
+        local row=match(q)
+        if not row then return q end
+        q=table.clone(q)
+        q.Spawn=q.Spawn or nearestPoint(row.Spawns)
+        if not q.Quest and row.Quest then
+            q.Quest=row.Quest;q.Tier=q.Tier or row.Tier
+            q.Source=(q.Source or "quest_event").."+hoho_position"
+        end
+        return q
+    end
+    local function bestQuest()
+        local value=path(LocalPlayer,"Data","Level")
+        local level=value and tonumber(value.Value)
+        if not level or level>2700 then return nil end
+        local best
+        for _,row in ipairs(rows()) do
+            if not row.Boss and row.Name~="MarineQuest" and row.Name~="BartiloQuest" and row.LevelReq<=level and row.Quest then
+                if not best or row.LevelReq>best.LevelReq then best=row end
             end
         end
-        local function complement(q)
-            if not q then return nil end
-            local row=match(q)
-            if not row then return q end
-            q=table.clone(q)
-            q.Spawn=q.Spawn or nearestPoint(row.Spawns)
-            if not q.Quest and row.Quest then
-                q.Quest=row.Quest;q.Tier=q.Tier or row.Tier
-                q.Source=(q.Source or "quest_event").."+hoho_position"
+        if not best then return nil end
+        return {Name=best.Name,Tier=best.Tier,Mob=best.Mob,Quest=best.Quest,Spawn=nearestPoint(best.Spawns),LevelReq=best.LevelReq,Source="hoho_preload"}
+    end
+    local function spawn(mob)
+        local points={}
+        for _,row in ipairs(rows()) do
+            if cleanName(row.Mob)==cleanName(mob) then
+                for _,point in ipairs(row.Spawns) do points[#points+1]=point end
             end
-            return q
         end
-        local function bestQuest()
-            local value=path(LocalPlayer,"Data","Level")
-            local level=value and tonumber(value.Value)
-            if not level or level>2700 then return nil end
-            local best
-            for _,row in ipairs(rows()) do
-                if not row.Boss and row.Name~="MarineQuest" and row.Name~="BartiloQuest" and row.LevelReq<=level and row.Quest then
-                    if not best or row.LevelReq>best.LevelReq then best=row end
+        return nearestPoint(points)
+    end
+    return {BestQuest=bestQuest,Complement=complement,Spawn=spawn,GetState=function()
+        local data=rows();local bosses,points=0,0
+        for _,r in ipairs(data) do if r.Boss then bosses=bosses+1 end;points=points+#r.Spawns end
+        return {Source="HohoV2/preload",Sea=seaIndex(),Rows=#data,Bosses=bosses,Spawns=points,MaxLevel=2700}
+    end}
+end
+local preload=initPreload()
+
+-- Adapted from Kaitun GetBestQuest/GetQuestPosition and QuestUpdate handling.
+-- Only named in-game modules are consulted; never executes the uploaded script.
+local function initQuestRuntime()
+    local cache={}
+    local state={Known=false,Active=false,Name=nil,Mob=nil,Modules="not_loaded"}
+    local watchedRemote,questConnection
+    local excluded={BartiloQuest=true,Trainees=true,MarineQuest=true,CitizenQuest=true}
+    local function moduleData(name)
+        local module=RS:FindFirstChild(name)
+        local entry=cache[name]
+        if entry and entry.Module==module and (entry.Data or os.clock()<entry.RetryAt) then return entry.Data end
+        entry={Module=module,RetryAt=os.clock()+5}
+        cache[name]=entry
+        if not module or not module:IsA("ModuleScript") then return nil end
+        local ok,data=pcall(require,module)
+        if not active or destroyed then return nil end
+        if ok and type(data)=="table" then entry.Data=data;return data end
+        state.LastError=name..": "..tostring(ok and "unexpected module schema" or data)
+        debugLog("WARN","quests.module",state.LastError)
+    end
+    local function cframeOf(value)
+        if typeof(value)=="CFrame" then return value end
+        if typeof(value)=="Vector3" then return CFrame.new(value) end
+        if typeof(value)=="Instance" then
+            if value:IsA("BasePart") then return value.CFrame end
+            if value:IsA("Model") then return value:GetPivot() end
+        end
+    end
+    local function referencesQuest(entry,name,depth,visited)
+        if type(entry)~="table" or depth>2 or visited[entry] then return false end
+        visited[entry]=true
+        for _,value in pairs(entry) do
+            if value==name then return true end
+            if type(value)=="table" and referencesQuest(value,name,depth+1,visited) then return true end
+        end
+        return false
+    end
+    local function GetQuestPosition(name)
+        if type(name)~="string" or name=="" then return nil end
+        local guide=moduleData("GuideModule")
+        local list=guide and type(guide.Data)=="table" and guide.Data.NPCList
+        if type(list)~="table" then return nil end
+        local _,_,root=character()
+        local nearestPosition,shortest=nil,math.huge
+        for _,entry in pairs(list) do
+            if type(entry)=="table" and referencesQuest(entry,name,0,{}) then
+                local position=cframeOf(entry.Position)
+                if position then
+                    local d=root and (root.Position-position.Position).Magnitude or 0
+                    if d<shortest then nearestPosition,shortest=position,d end
                 end
             end
-            if not best then return nil end
-            return {Name=best.Name,Tier=best.Tier,Mob=best.Mob,Quest=best.Quest,Spawn=nearestPoint(best.Spawns),LevelReq=best.LevelReq,Source="hoho_preload"}
         end
-        local function spawn(mob)
-            local points={}
-            for _,row in ipairs(rows()) do
-                if cleanName(row.Mob)==cleanName(mob) then
-                    for _,point in ipairs(row.Spawns) do points[#points+1]=point end
-                end
-            end
-            return nearestPoint(points)
-        end
-        return {BestQuest=bestQuest,Complement=complement,Spawn=spawn,GetState=function()
-            local data=rows();local bosses,points=0,0
-            for _,r in ipairs(data) do if r.Boss then bosses=bosses+1 end;points=points+#r.Spawns end
-            return {Source="HohoV2/preload",Sea=seaIndex(),Rows=#data,Bosses=bosses,Spawns=points,MaxLevel=2700}
-        end}
+        return nearestPosition
     end
-    local preload=initPreload()
-    -- Adapted from Kaitun GetBestQuest/GetQuestPosition and QuestUpdate handling.
-    -- Only named in-game modules are consulted; never executes the uploaded script.
-    local function initQuestRuntime()
-        local cache={}
-        local state={Known=false,Active=false,Name=nil,Mob=nil,Modules="not_loaded"}
-        local watchedRemote,questConnection
-        local excluded={BartiloQuest=true,Trainees=true,MarineQuest=true,CitizenQuest=true}
-        local function moduleData(name)
-            local module=RS:FindFirstChild(name)
-            local entry=cache[name]
-            if entry and entry.Module==module and (entry.Data or os.clock()<entry.RetryAt) then return entry.Data end
-            entry={Module=module,RetryAt=os.clock()+5}
-            cache[name]=entry
-            if not module or not module:IsA("ModuleScript") then return nil end
-            local ok,data=pcall(require,module)
-            if not active or destroyed then return nil end
-            if ok and type(data)=="table" then entry.Data=data;return data end
-            state.LastError=name..": "..tostring(ok and "unexpected module schema" or data)
-            debugLog("WARN","quests.module",state.LastError)
-        end
-        local function cframeOf(value)
-            if typeof(value)=="CFrame" then return value end
-            if typeof(value)=="Vector3" then return CFrame.new(value) end
-            if typeof(value)=="Instance" then
-                if value:IsA("BasePart") then return value.CFrame end
-                if value:IsA("Model") then return value:GetPivot() end
+    local function onQuestUpdate(payload)
+        if not active or destroyed then return end
+        if payload==nil or payload==false then
+            state.Known=true;state.Active=false;state.Name=nil;state.Mob=nil
+        elseif type(payload)=="table" and type(payload.Progress)=="table" then
+            local mob
+            for name in pairs(payload.Progress) do
+                if type(name)=="string" and name~="" and (not mob or name<mob) then mob=name end
             end
-        end
-        local function referencesQuest(entry,name,depth,visited)
-            if type(entry)~="table" or depth>2 or visited[entry] then return false end
-            visited[entry]=true
-            for _,value in pairs(entry) do
-                if value==name then return true end
-                if type(value)=="table" and referencesQuest(value,name,depth+1,visited) then return true end
-            end
-            return false
-        end
-        local function GetQuestPosition(name)
-            if type(name)~="string" or name=="" then return nil end
-            local guide=moduleData("GuideModule")
-            local list=guide and type(guide.Data)=="table" and guide.Data.NPCList
-            if type(list)~="table" then return nil end
-            local _,_,root=character()
-            local nearestPosition,shortest=nil,math.huge
-            for _,entry in pairs(list) do
-                if type(entry)=="table" and referencesQuest(entry,name,0,{}) then
-                    local position=cframeOf(entry.Position)
-                    if position then
-                        local d=root and (root.Position-position.Position).Magnitude or 0
-                        if d<shortest then nearestPosition,shortest=position,d end
-                    end
-                end
-            end
-            return nearestPosition
-        end
-        local function onQuestUpdate(payload)
-            if not active or destroyed then return end
-            if payload==nil or payload==false then
+            if not mob then
                 state.Known=true;state.Active=false;state.Name=nil;state.Mob=nil
-            elseif type(payload)=="table" and type(payload.Progress)=="table" then
-                local mob
-                for name in pairs(payload.Progress) do
-                    if type(name)=="string" and name~="" and (not mob or name<mob) then mob=name end
-                end
-                if not mob then
-                    state.Known=true;state.Active=false;state.Name=nil;state.Mob=nil
-                elseif type(payload.InternalQuestName)=="string" and payload.InternalQuestName~="" then
-                    state.Known=true;state.Active=true;state.Name=payload.InternalQuestName;state.Mob=mob
-                else
-                    debugLog("WARN","quests.event","quest update ignored: missing InternalQuestName")
-                    return
-                end
+            elseif type(payload.InternalQuestName)=="string" and payload.InternalQuestName~="" then
+                state.Known=true;state.Active=true;state.Name=payload.InternalQuestName;state.Mob=mob
             else
-                debugLog("WARN","quests.event","unrecognized payload ignored")
+                debugLog("WARN","quests.event","quest update ignored: missing InternalQuestName")
                 return
             end
-            debugLog("INFO","quests.event",state.Active and (state.Name.." / "..state.Mob) or "quest completed/cleared")
+        else
+            debugLog("WARN","quests.event","unrecognized payload ignored")
+            return
         end
-        local function observeQuestUpdate()
-            local remote=path(RS,"Remotes","QuestUpdate")
-            if remote==watchedRemote then return end
-            if questConnection then questConnection:Disconnect();questConnection=nil end
-            watchedRemote=remote
-            state.Known=false;state.Active=false;state.Name=nil;state.Mob=nil
-            if remote and remote:IsA("RemoteEvent") then
-                questConnection=bind(remote.OnClientEvent,onQuestUpdate,"quests.update")
-            end
+        debugLog("INFO","quests.event",state.Active and (state.Name.." / "..state.Mob) or "quest completed/cleared")
+    end
+    local function observeQuestUpdate()
+        local remote=path(RS,"Remotes","QuestUpdate")
+        if remote==watchedRemote then return end
+        if questConnection then questConnection:Disconnect();questConnection=nil end
+        watchedRemote=remote
+        state.Known=false;state.Active=false;state.Name=nil;state.Mob=nil
+        if remote and remote:IsA("RemoteEvent") then
+            questConnection=bind(remote.OnClientEvent,onQuestUpdate,"quests.update")
         end
-        local function Refresh()
-            observeQuestUpdate()
-            local quests=moduleData("Quests")
-            local guide=moduleData("GuideModule")
-            state.Modules=quests and guide and "available" or "fallback"
-            return quests
-        end
-        local function record(name,tier,mob,definition)
-            return {Name=name,Tier=tonumber(tier) or tier,Mob=mob,Quest=GetQuestPosition(name),
-                LevelReq=definition and definition.LevelReq,Source="game_modules"}
-        end
-        local function GetBestQuest()
-            local quests=Refresh()
-            local value=path(LocalPlayer,"Data","Level")
-            local level=value and tonumber(value.Value)
-            if not quests or not level then return nil end
-            -- In-game tables can contain all seas. Keep selection in the current sea's level band.
-            if seaIndex()==1 then level=math.min(level,699)
-            elseif seaIndex()==2 then level=math.min(level,1499) end
-            local best,bestLevel,bestKey=nil,-1,nil
-            for name,stages in pairs(quests) do
-                if type(name)=="string" and not excluded[name] and type(stages)=="table" then
-                    for tier,definition in pairs(stages) do
-                        if (type(tier)=="number" or type(tier)=="string") and type(definition)=="table" then
-                            local req,tasks=definition.LevelReq,definition.Task
-                            if type(req)=="number" and req>=0 and req<=level and type(tasks)=="table" then
-                                for mob,count in pairs(tasks) do
-                                    if type(mob)=="string" and type(count)=="number" and count>1 and count<math.huge then
-                                        local key=name..":"..tostring(tier)..":"..mob
-                                        if req>bestLevel or (req==bestLevel and (not bestKey or key<bestKey)) then
-                                            best={Name=name,Tier=tonumber(tier) or tier,Mob=mob,LevelReq=req,Source="game_modules"}
-                                            bestLevel,bestKey=req,key
-                                        end
+    end
+    local function Refresh()
+        observeQuestUpdate()
+        local quests=moduleData("Quests")
+        local guide=moduleData("GuideModule")
+        state.Modules=quests and guide and "available" or "fallback"
+        return quests
+    end
+    local function record(name,tier,mob,definition)
+        return {Name=name,Tier=tonumber(tier) or tier,Mob=mob,Quest=GetQuestPosition(name),
+            LevelReq=definition and definition.LevelReq,Source="game_modules"}
+    end
+    local function GetBestQuest()
+        local quests=Refresh()
+        local value=path(LocalPlayer,"Data","Level")
+        local level=value and tonumber(value.Value)
+        if not quests or not level then return nil end
+        -- In-game tables can contain all seas. Keep selection in the current sea's level band.
+        if seaIndex()==1 then level=math.min(level,699)
+        elseif seaIndex()==2 then level=math.min(level,1499) end
+        local best,bestLevel,bestKey=nil,-1,nil
+        for name,stages in pairs(quests) do
+            if type(name)=="string" and not excluded[name] and type(stages)=="table" then
+                for tier,definition in pairs(stages) do
+                    if (type(tier)=="number" or type(tier)=="string") and type(definition)=="table" then
+                        local req,tasks=definition.LevelReq,definition.Task
+                        if type(req)=="number" and req>=0 and req<=level and type(tasks)=="table" then
+                            for mob,count in pairs(tasks) do
+                                if type(mob)=="string" and type(count)=="number" and count>1 and count<math.huge then
+                                    local key=name..":"..tostring(tier)..":"..mob
+                                    if req>bestLevel or (req==bestLevel and (not bestKey or key<bestKey)) then
+                                        best={Name=name,Tier=tonumber(tier) or tier,Mob=mob,LevelReq=req,Source="game_modules"}
+                                        bestLevel,bestKey=req,key
                                     end
                                 end
                             end
@@ -2409,36 +2475,38 @@ local function initImportedFeatures()
                     end
                 end
             end
-            if best then best.Quest=GetQuestPosition(best.Name) end
-            return best
         end
-        local function GetActiveQuest()
-            local quests=Refresh()
-            if not state.Known or not state.Active then return nil end
-            local stages=quests and quests[state.Name]
-            if type(stages)=="table" then
-                for tier,definition in pairs(stages) do
-                    if type(definition)=="table" and type(definition.Task)=="table" then
-                        for mob in pairs(definition.Task) do
-                            if type(mob)=="string" and cleanName(mob)==cleanName(state.Mob) then
-                                return record(state.Name,tier,mob,definition)
-                            end
+        if best then best.Quest=GetQuestPosition(best.Name) end
+        return best
+    end
+    local function GetActiveQuest()
+        local quests=Refresh()
+        if not state.Known or not state.Active then return nil end
+        local stages=quests and quests[state.Name]
+        if type(stages)=="table" then
+            for tier,definition in pairs(stages) do
+                if type(definition)=="table" and type(definition.Task)=="table" then
+                    for mob in pairs(definition.Task) do
+                        if type(mob)=="string" and cleanName(mob)==cleanName(state.Mob) then
+                            return record(state.Name,tier,mob,definition)
                         end
                     end
                 end
             end
-            -- A recognized event still supplies the real current target if module layout changed.
-            return {Name=state.Name,Mob=state.Mob,Quest=GetQuestPosition(state.Name),Source="quest_event"}
         end
-        table.insert(cleanupFns,function()
-            if questConnection then questConnection:Disconnect();questConnection=nil end
-            watchedRemote=nil
-            table.clear(cache)
-        end)
-        return {Refresh=Refresh,GetBestQuest=GetBestQuest,GetQuestPosition=GetQuestPosition,
-            GetActiveQuest=GetActiveQuest,GetState=function() return table.clone(state) end}
+        -- A recognized event still supplies the real current target if module layout changed.
+        return {Name=state.Name,Mob=state.Mob,Quest=GetQuestPosition(state.Name),Source="quest_event"}
     end
-    local questRuntime=initQuestRuntime()
+    table.insert(cleanupFns,function()
+        if questConnection then questConnection:Disconnect();questConnection=nil end
+        watchedRemote=nil
+        table.clear(cache)
+    end)
+    return {Refresh=Refresh,GetBestQuest=GetBestQuest,GetQuestPosition=GetQuestPosition,
+        GetActiveQuest=GetActiveQuest,GetState=function() return table.clone(state) end}
+end
+local questRuntime=initQuestRuntime()
+
     local modes={"Off","Level","Nearest","Raid","Material","Bone","Cake","Ectoplasm","Elite","Boss","Law","White Belt","Dragon Hunter","Sea Event","Golem","Player"}
     local mobGroups={Bone={"Reborn Skeleton","Living Zombie","Demonic Soul","Posessed Mummy"},
         Cake={"Cookie Crafter","Cake Guard","Baking Staff","Head Baker","Cake Prince","Dough King"},
@@ -2700,7 +2768,7 @@ local function initImportedFeatures()
     end)
     addLabel(Farm,"Velocidade do Tween: menor = mais lento. O ajuste também vale durante o deslocamento.")
     dropdown(Farm,"Ataque do farm",{"Auto","Matsune Click","Hoho R2","Tool"},"Auto",function(v) attackState.Method=v end)
-    addLabel(Farm,"Auto: clique Matsune + ataque da arma/Net. Matsune Click: VirtualUser com alternativa R2. Hoho R2: exemplo comentado do carregador Hoho. Tool: ativação normal. DEBUG distingue envio e vida observada.")
+    addLabel(Farm,"Auto: usa o mesmo motor do Fast Attack do topo, com um único loop. O toggle manual ligado também tem prioridade sobre cliques simulados. Matsune Click: VirtualUser com alternativa R2. Hoho R2: exemplo comentado do carregador Hoho. Tool: ativação normal. DEBUG distingue envio e vida observada.")
     dropdown(Farm,"Arma",{"Melee","Sword","Gun","Blox Fruit"},options.Weapon,function(v) options.Weapon=v end)
     dropdown(Farm,"Modo",modes,"Off",function(v)
         options.Mode=v;farmQuest=nil;farmQuestKey=nil;fixedCombatTarget=nil;fixedCombatPoint=nil;stopMove("Farm")
@@ -3046,6 +3114,8 @@ local function initImportedFeatures()
         end
     end
     local function stopAll()
+        fastToggle.Set(false)
+        fastAttackApi:StopAll()
         releaseInput()
         requestSession=requestSession+1
         jumpOn=false;flags.SkillSpam=false
@@ -3067,7 +3137,7 @@ local function initImportedFeatures()
     report("startup",supported and "target game detected" or "UI available; target game unavailable")
     return {StopAll=stopAll,GetState=function()
         local running={};for name in pairs(jobs) do running[#running+1]=name end;table.sort(running)
-        return {Active=active,SupportedGame=supported,Mode=options.Mode,Attack=table.clone(attackState),TweenSpeed=options.Speed,Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),QuestRuntime=questRuntime.GetState(),Preload=preload.GetState(),Movement={Owner=moveOwner,Suspended=motionState~=nil,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
+        return {Active=active,SupportedGame=supported,Mode=options.Mode,Attack=table.clone(attackState),TweenSpeed=options.Speed,Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),FastAttack=fastAttackApi:GetState(),QuestRuntime=questRuntime.GetState(),Preload=preload.GetState(),Movement={Owner=moveOwner,Suspended=motionState~=nil,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
     end}
 end
 
@@ -3145,9 +3215,11 @@ local function debugReportText()
     local farm=snapshot.Farm or {}
     local attack=snapshot.Attack or {}
     local movement=snapshot.Movement or {}
+    local sharedAttack=snapshot.FastAttack or {}
     local rows={"XERECA HUB | diagnóstico local",
         "Farm: "..tostring(farm.Phase).." | alvo: "..tostring(farm.Target or farm.ExpectedMob),
         "Ataque: "..tostring(attack.Phase).." | método: "..tostring(attack.Method).." | transporte: "..tostring(attack.Transport).." | clique: "..tostring(attack.Input),
+        "FastAttack compartilhado: "..tostring(sharedAttack.Running).." | manual: "..tostring(sharedAttack.ManualEnabled).." | controle: "..tostring(sharedAttack.Owner).." | envios: "..tostring(sharedAttack.Dispatches),
         "Arma: "..tostring(attack.Tool).." | distância: "..tostring(attack.Distance).." | tentativas: "..tostring(attack.Attempts),
         "Vida do alvo: "..tostring(attack.Health).." / "..tostring(attack.MaxHealth).." | última queda de vida: "..(attack.LastDamageAt and string.format("há %.1fs",os.clock()-attack.LastDamageAt) or "não observada"),
         "Soltar clique: "..tostring(attack.InputRelease).." | alternativa: "..tostring(attack.InputFallback),
@@ -3190,6 +3262,7 @@ bind(game:GetService("RunService").Heartbeat,function()
         lastDebugPaint=os.clock();fitDebugWindow();refreshDebugPanel()
     end
 end,"debug.panel")
+
 
 addSection(Settings, "DEBUG")
 debugControl=addToggle(Settings, "Ativar DEBUG (Output)", DEBUG_DEFAULT, setDebug)
