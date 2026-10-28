@@ -9,16 +9,17 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 -- Optional diagnostics. No polling, external requests or global error hooks.
 local DEBUG_DEFAULT = false
+local debugTechnicalEnabled=false
 local debugEnabled = DEBUG_DEFAULT
 local debugControl, debugPanelControl, debugVisibility
 local debugHistory = {}
 local DEBUG_LIMIT = 100
 local function debugLog(level, event, detail)
-    if not debugEnabled and level~="WARN" and level~="ERROR" then return end
+    if (not debugEnabled or not debugTechnicalEnabled) and level~="WARN" and level~="ERROR" then return end
     local entry = {Time=os.clock(), Level=level, Event=event, Detail=tostring(detail or "")}
     if #debugHistory >= DEBUG_LIMIT then table.remove(debugHistory, 1) end
     debugHistory[#debugHistory + 1] = entry
-    if not debugEnabled then return end
+    if not debugEnabled or not debugTechnicalEnabled then return end
     local message = "[UILib DEBUG][" .. level .. "][" .. event .. "] " .. entry.Detail
     if level == "ERROR" or level == "WARN" then warn(message) else print(message) end
 end
@@ -128,6 +129,97 @@ shared._uilibGui = uiGui
 ownedGui = uiGui
 bind(uiGui.Destroying, unload)
 shared._UILibUnload = unload
+
+-- Availability is determined before creating controls; unavailable actions are never registered.
+local seaPolicy={Sea=({[2753915549]=1,[85211729168715]=1,[4442272183]=2,[79091703265657]=2,[7449423635]=3,[100117331123089]=3})[game.PlaceId]}
+seaPolicy.Aliases={["Haki & Stats"]="Player",Status="Home"}
+function seaPolicy.AllowsTab(name)
+    if name=="First Sea"then return seaPolicy.Sea==1 end
+    if name=="Raids" or name=="Sea Events"then return seaPolicy.Sea==2 or seaPolicy.Sea==3 end
+    if name=="Dragon Dojo" or name=="Race V4"then return seaPolicy.Sea==3 end
+    return true
+end
+local required={
+    ["Flower ESP"]={2},["Real Fruit (Apple) ESP"]={3},
+    ["Primeiro mar"]={2,3},["Segundo mar"]={1,3},["Terceiro mar"]={2},
+    ["Auto ativar Race V3"]={2,3},["Auto ativar Race V4"]={3},
+    ["Comprar Haki Color"]={2,3},["Auto Legendary Sword Dealer"]={2},["Trocar Bones"]={3},["Auto trocar Bones"]={3},
+    ["Comprar microchip Law"]={2},["Iniciar Law"]={2},["Auto comprar microchip Law"]={2},["Auto iniciar Law"]={2},
+    ["Rezar na Kitsune Statue"]={3},["Ir a Kitsune Island"]={3},["Ir a Mirage Island"]={3},["Ir a Prehistoric Island"]={3},
+    ["Coletar Azure Ember por contato"]={3},["Coletar Dragon Bone por contato"]={3},["Coletar Dragon Egg por contato"]={3},
+    ["ESP Gear"]={3},["ESP Mirage"]={3},["ESP Prehistoric"]={3},["ESP Kitsune"]={3},
+    ["Buy Dragon Claw"]={2,3},["Buy Superhuman"]={2,3},["Buy Death Step"]={2,3},["Buy Sharkman Karate"]={2,3},
+    ["Buy Electric Claw"]={3},["Buy Dragon Talon"]={3},["Buy God Human"]={3},["Buy Sanguine Art"]={3},
+    ["Pole v.2"]={2,3},Kabucha={2,3},["Reset Stats"]={2,3},["Random Race"]={2,3},["Bizarre Rifle"]={2},
+}
+function seaPolicy.AllowsControl(_,title)
+    local list=required[title];if not list then return true end
+    for _,sea in ipairs(list)do if seaPolicy.Sea==sea then return true end end
+    return false
+end
+function seaPolicy.Filter(values,kind)
+    local result={}
+    local modes={Off={1,2,3},Level={1,2,3},Nearest={1,2,3},Material={1,2,3},Boss={1,2,3},Player={1,2,3},Raid={2,3},Law={2},Ectoplasm={2},Bone={3},Cake={3},Elite={3},["White Belt"]={3},["Dragon Hunter"]={3},["Sea Event"]={2,3},Golem={3}}
+    local materials={["Magma Ore"]={1,2},["Angel Wings"]={1},Leather={1,2,3},["Scrap Metal"]={1,2,3},["Radioactive Material"]={2},["Mystic Droplet"]={2},["Vampire Fang"]={2},["Demonic Wisp"]={3},["Conjured Cocoa"]={3},["Dragon Scale"]={3},Gunpowder={3},["Fish Tail"]={3},["Mini Tusk"]={3}}
+    for index,name in ipairs(values)do
+        local allowed
+        if kind=="Mode"then allowed=modes[name]
+        elseif kind=="Material"then allowed=materials[name]
+        elseif kind=="Boss"then allowed={index<=16 and 1 or index<=26 and 2 or 3}
+        elseif kind=="Island"then allowed={seaPolicy.Islands[name]}end
+        if not allowed then result[#result+1]=name else for _,sea in ipairs(allowed)do if sea==seaPolicy.Sea then result[#result+1]=name;break end end end
+    end
+    return result
+end
+seaPolicy.Islands={}
+seaPolicy.Islands['WindMill']=1
+seaPolicy.Islands['Marine']=1
+seaPolicy.Islands['Middle Town']=1
+seaPolicy.Islands['Jungle']=1
+seaPolicy.Islands['Pirate Village']=1
+seaPolicy.Islands['Desert']=1
+seaPolicy.Islands['Snow Island']=1
+seaPolicy.Islands['MarineFord']=1
+seaPolicy.Islands['Colosseum']=1
+seaPolicy.Islands['Sky Island 1']=1
+seaPolicy.Islands['Sky Island 2']=1
+seaPolicy.Islands['Sky Island 3']=1
+seaPolicy.Islands['Prison']=1
+seaPolicy.Islands['Magma Village']=1
+seaPolicy.Islands['Under Water Island']=1
+seaPolicy.Islands['Fountain City']=1
+seaPolicy.Islands['Shank Room']=1
+seaPolicy.Islands['Mob Island']=1
+seaPolicy.Islands['The Cafe']=2
+seaPolicy.Islands['Frist Spot']=2
+seaPolicy.Islands['Dark Area']=2
+seaPolicy.Islands['Flamingo Mansion']=2
+seaPolicy.Islands['Flamingo Room']=2
+seaPolicy.Islands['Green Zone']=2
+seaPolicy.Islands['Factory']=2
+seaPolicy.Islands['Colossuim']=2
+seaPolicy.Islands['Zombie Island']=2
+seaPolicy.Islands['Two Snow Mountain']=2
+seaPolicy.Islands['Punk Hazard']=2
+seaPolicy.Islands['Cursed Ship']=2
+seaPolicy.Islands['Ice Castle']=2
+seaPolicy.Islands['Forgotten Island']=2
+seaPolicy.Islands['Ussop Island']=2
+seaPolicy.Islands['Mini Sky Island']=2
+seaPolicy.Islands['Great Tree']=3
+seaPolicy.Islands['Castle On The Sea']=3
+seaPolicy.Islands['MiniSky']=3
+seaPolicy.Islands['Port Town']=3
+seaPolicy.Islands['Hydra Island']=3
+seaPolicy.Islands['Floating Turtle']=3
+seaPolicy.Islands['Mansion']=3
+seaPolicy.Islands['Haunted Castle']=3
+seaPolicy.Islands['Ice Cream Island']=3
+seaPolicy.Islands['Peanut Island']=3
+seaPolicy.Islands['Cake Island']=3
+seaPolicy.Islands['Cocoa Island']=3
+seaPolicy.Islands['Candy Island']=3
+seaPolicy.Islands['Tiki Outpost']=3
 
 -- WindUI is embedded and pinned; native icon data is bundled.
 local windOwnedGuis={}
@@ -40218,11 +40310,19 @@ bind(Main.Destroying,unload,"fluent.window.destroy")
 local Float=new("TextButton",{Name="WindFloat",Text="UI",Size=UDim2.fromOffset(56,56),Position=UDim2.fromOffset(20,80),Font=Enum.Font.GothamBold,TextSize=17,AutoButtonColor=false,Theme={BackgroundColor3="Accent",TextColor3="Text"}},uiGui)
 new("UICorner",{CornerRadius=UDim.new(1,0)},Float)
 local fluentTabs={}
+local seaTabPages={}
+local unavailablePages={}
 local fluentTabOrder={}
 local tabIcons={Home="home",Player="user",Visual="eye",Settings="settings",Farm="swords",ESP="scan",Fruit="apple",Teleport="map-pin",Compras="shopping-cart",Raids="flame",Status="activity"}
 local function addTab(name)
+    if seaPolicy then
+        local alias=seaPolicy.Aliases[name]
+        if alias and seaTabPages[alias]then return seaTabPages[alias]end
+        if not seaPolicy.AllowsTab(name)then local page={};unavailablePages[page]=true;return page end
+    end
     local tab=FluentWindow:AddTab({Title=name,Icon=tabIcons[name] or "layers"})
     local page=tab.ContainerFrame
+    seaTabPages[name]=page
     fluentTabs[page]=tab
     fluentTabOrder[#fluentTabOrder+1]=tab
     tab._XerecaIndex=#fluentTabOrder
@@ -40430,6 +40530,14 @@ local function addTextbox(parent, opts)
 end
 
 
+local function unavailableControl(parent,title)
+    if unavailablePages and unavailablePages[parent]then return true end
+    local tab=fluentTabs[parent]
+    return seaPolicy and tab and not seaPolicy.AllowsControl(tab.Name,title) or false
+end
+local function inertControl(value)
+    return {Value=value,Get=function()return value end,Set=function()end,Refresh=function()end,Destroy=function()end}
+end
 local uiRegistry={Records={},ById={},Recording=true}
 local function pageSnapshot(parent)
     local seen={};for _,child in ipairs(parent:GetChildren()) do seen[child]=true end;return seen
@@ -40450,6 +40558,8 @@ local function registerControl(parent,title,kind,api,native,before,run)
     local persist=kind=="Slider" or (kind=="Dropdown" and title~="Jogador" and title~="NPC deste servidor") or (kind=="Toggle" and safeToggle)
     local record={Id=id,Title=title,Page=parent,Tab=tab,Kind=kind,API=api,Frame=frame,Run=run,Persist=persist,Path=tab.Name.." / "..title}
     uiRegistry.Records[#uiRegistry.Records+1]=record;uiRegistry.ById[id]=record
+    if tab.Name=="Player"then uiRegistry.ById["Haki & Stats/"..kind.."/"..title]=record end
+    if tab.Name=="Home"then uiRegistry.ById["Status/"..kind.."/"..title]=record end
     return record
 end
 local function preferenceChanged(record)
@@ -40469,6 +40579,7 @@ local function dispatch(label,callback,...)
     if not ok then debugLog("ERROR",label,err);error(err,0) end
 end
 addBtn=function(parent,text,cb)
+    if unavailableControl(parent,text)then return inertControl()end
     local tab=fluentTabs[parent]
     if not tab then return legacyBtn(parent,text,cb) end
     local before=pageSnapshot(parent)
@@ -40478,6 +40589,7 @@ addBtn=function(parent,text,cb)
     return native
 end
 addToggle=function(parent,label,default,cb)
+    if unavailableControl(parent,label)then return inertControl(false)end
     local tab=fluentTabs[parent]
     if not tab then return legacyToggle(parent,label,default,cb) end
     local ready=false
@@ -40500,6 +40612,7 @@ addToggle=function(parent,label,default,cb)
     return api
 end
 addSlider=function(parent,opts)
+    if unavailableControl(parent,opts.Name)then return inertControl(opts.Default or opts.Min)end
     local tab=fluentTabs[parent]
     if not tab then return legacySlider(parent,opts) end
     local record
@@ -40525,6 +40638,7 @@ addSlider=function(parent,opts)
     return api
 end
 addLabel=function(parent,text)
+    if unavailableControl(parent,text)then return {Text="",Visible=false}end
     local tab=fluentTabs[parent]
     if not tab then return legacyLabel(parent,text) end
     local element=tab:AddParagraph({Title="",Content=text})
@@ -40532,11 +40646,13 @@ addLabel=function(parent,text)
     return element.DescLabel
 end
 addSection=function(parent,title)
+    if unavailableControl(parent,title)then return inertControl()end
     local tab=fluentTabs[parent]
     if not tab then return legacySection(parent,title) end
     return tab:AddSection(title)
 end
 addTextbox=function(parent,opts)
+    if unavailableControl(parent,opts.Placeholder)then return inertControl("")end
     local tab=fluentTabs[parent]
     if not tab then return legacyTextbox(parent,opts) end
     local before=pageSnapshot(parent)
@@ -40550,6 +40666,9 @@ addTextbox=function(parent,opts)
     return api
 end
 local function fluentDropdown(page,label,values,default,callback)
+    if unavailableControl(page,label)then return inertControl(default)end
+    local function valid(value)if value==nil then return true end;for _,item in ipairs(values)do if item==value then return true end end;return false end
+    if not valid(default)then default=values[1]end
     local tab=assert(fluentTabs[page],"Fluent tab missing: "..label)
     local ready,quiet=false,false
     local selected=default
@@ -40561,11 +40680,11 @@ local function fluentDropdown(page,label,values,default,callback)
     end})
     ready=true
     local api={Get=function() return selected end,Set=function(value,silent)
-        if destroyed then return end
+        if destroyed or not valid(value)then return end
         quiet=silent==true;native:SetValue(value);selected=native.Value;quiet=false
     end,Refresh=function(items)
         if destroyed then return end
-        quiet=true;native:SetValues(items);selected=native.Value;quiet=false
+        values=items;quiet=true;native:SetValues(items);selected=native.Value;quiet=false
     end}
     record=registerControl(page,label,"Dropdown",api,native,before)
     return api
@@ -40848,12 +40967,29 @@ local fruitEnabled=false
 local fruitSession=0
 local fruitTimer,fruitWake,armFruit
 local fruitStatus
+local fruitLastMessage="Fruta aleatória: aguardando."
+local function fruitBalance()
+    local data=LocalPlayer:FindFirstChild("Data")
+    local level=data and data:FindFirstChild("Level")
+    local money=data and data:FindFirstChild("Beli")
+    local lv=level and tonumber(level.Value)
+    local balance=money and tonumber(money.Value)
+    local price=lv and 25000+150*math.max(0,lv-1)
+    local text="Beli: "..tostring(balance or "indisponível")
+    if price then text=text.." | estimativa normal: "..tostring(price)end
+    if lv and lv<50 then text=text.." | requer nível 50"
+    elseif price and balance and balance<price then text=text.." | saldo abaixo da estimativa (descontos podem variar)"end
+    return text,lv,balance,price
+end
+local function paintFruitStatus()
+    if fruitStatus then fruitStatus.Text=fruitLastMessage.."\n"..fruitBalance()end
+end
 local function cancelFruitTimer()
     if fruitTimer then pcall(task.cancel,fruitTimer);fruitTimer=nil end
 end
 local function fruitFeedback(text,manual)
     if destroyed then return end
-    if fruitStatus then fruitStatus.Text=text end
+    fruitLastMessage=text;paintFruitStatus()
     if manual then notify({Title="Fruta aleatória",Text=text})end
 end
 local function physicalFruitSnapshot()
@@ -40869,6 +41005,11 @@ local function requestFruit(manual)
     if destroyed then return end
     if fruitGate.busy or os.clock()<(fruitGate.nextAllowed or 0)then
         fruitFeedback(fruitGate.busy and "Solicitação em andamento." or "Aguarde alguns segundos para tentar novamente.",manual);return
+    end
+    local _,level=fruitBalance()
+    if level and level<50 then
+        fruitGate.nextAutoAllowed=os.clock()+FRUIT_SPACING
+        fruitFeedback("Nível insuficiente para a fruta aleatória: requer 50.",manual);return
     end
     local remotes=game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
     local remote=remotes and remotes:FindFirstChild("CommF_")
@@ -40921,6 +41062,11 @@ addSection(Fruit,"Fruta aleatória")
 addBtn(Fruit,"Random Fruit",function()requestFruit(true)end)
 local fruitControl=addToggle(Fruit,"Auto Random Fruit",false,setFruitEnabled)
 fruitStatus=addLabel(Fruit,"")
+paintFruitStatus()
+local lastFruitBalance=0
+bind(game:GetService("RunService").Heartbeat,function()
+    if not destroyed and (fruitEnabled or Main.Visible)and os.clock()-lastFruitBalance>=2 then lastFruitBalance=os.clock();paintFruitStatus()end
+end,"fruit.balance")
 
 -- hotkey
 bind(UserInputService.InputBegan, function(i, gameProcessed)
@@ -40966,7 +41112,7 @@ local function initImportedFeatures()
     local active = true
     local requestSession=0
     local requestOwners=setmetatable({}, {__mode="k"})
-    local movementJobs={Farm=true,SeaCombat=true,FruitCollect=true,RaidNext=true,Boat=true,Trials=true,TrialPath=true,Azure=true,BoneCollect=true,EggCollect=true,Berries=true,Chests=true}
+    local movementJobs={Farm=true,SeaCombat=true,FruitCollect=true,RaidNext=true,Boat=true,Trials=true,TrialPath=true,Azure=true,BoneCollect=true,EggCollect=true,FirstSea=true,Berries=true,Chests=true}
     local function requestToken()
         local owner=requestOwners[coroutine.running()]
         return {Session=requestSession,Owner=owner}
@@ -41543,7 +41689,7 @@ progressTracker=initProgressTracker()
         move(destination,owner)
         local mastery=options.Mastery~="Off" and hp/math.max(1,maxHP)*100 <= options.MasteryHealth
         local c=LocalPlayer.Character
-        local levelAuto=owner=="Farm" and options.Mode=="Level"
+        local levelAuto=(owner=="Farm" and options.Mode=="Level") or owner=="FirstSea"
         local tool=(levelAuto or options.AutoEquip) and equip(levelAuto and options.Weapon or mastery and options.Mastery or options.Weapon) or (c and c:FindFirstChildOfClass("Tool"))
         if owner=="Farm" then progressTracker.Track(target) end
         attackState.Target=target.Name
@@ -43102,6 +43248,11 @@ local bring=initMissionBring()
     ownedESP.Set=function(_,name,on) setESP((name:gsub("ESP$","")),on) end
     ownedESP.StopLoop=function() stopJob("ESP");clearMarkers() end
     for _,method in ipairs({"UpdateIsland","UpdatePlayers","UpdateChest","UpdateDevilFruit","UpdateFlower","UpdateRealFruit"}) do ownedESP[method]=function() end end
+    if seaPolicy then
+        modes=seaPolicy.Filter(modes,"Mode");materialNames=seaPolicy.Filter(materialNames,"Material");bossNames=seaPolicy.Filter(bossNames,"Boss")
+        local currentBoss=false;for _,name in ipairs(bossNames)do if name==options.Boss then currentBoss=true end end
+        if not currentBoss then options.Boss=bossNames[1] or options.Boss end
+    end
     local pagePlayer=addTab("Haki & Stats")
     local pageRaid=addTab("Raids")
     local pageShop=addTab("Compras")
@@ -43156,7 +43307,7 @@ local bring=initMissionBring()
     local previousFarmStop=onJobStop.Farm
     onJobStop.Farm=function()previousFarmStop();releaseLevelSupport()end
     fastAttackApi.CombatFallback=function(owner,target,reason)
-        if owner~="Farm" or options.Mode~="Level" or not flags.Farm or os.clock()<manualUntil then return false end
+        if not ((owner=="Farm" and options.Mode=="Level" and flags.Farm) or (owner=="FirstSea" and flags.FirstSea)) or os.clock()<manualUntil then return false end
         if reason~="remotes_unavailable" and reason~="remote_failed"then return false end
         local c=LocalPlayer.Character;local tool=c and c:FindFirstChildOfClass("Tool")
         if not tool or distance(target)>fastAttackApi.Distance then return false end
@@ -43366,9 +43517,9 @@ local bring=initMissionBring()
     toggleJob(pageShop,"Auto trocar Bones","BonesTrade",10,function() comm("bone.trade",10,"Bones","Buy",1,1) end)
     button(pageSea,"Rezar na Kitsune Statue",function() net("kitsune.pray",5,"RF/KitsuneStatuePray") end)
     local function islandNames()
-        local names={};for name in pairs(islandData) do names[#names+1]=name end;table.sort(names);return names
+        local names={};for name in pairs(islandData)do if not seaPolicy or seaPolicy.Islands[name]==seaPolicy.Sea then names[#names+1]=name end end;table.sort(names);return names
     end
-    local selectedIsland="Middle Town"
+    local selectedIsland=(seaIndex()==1 and "Middle Town" or seaIndex()==2 and "The Cafe" or "Port Town")
     dropdown(pageTP,"Ilha (confira o mar)",islandNames(),selectedIsland,function(v) selectedIsland=v end)
     button(pageTP,"Ir à ilha selecionada",function()
         local data=islandData[selectedIsland]
@@ -43429,8 +43580,9 @@ local bring=initMissionBring()
     addSection(ESPtab,"ESP de eventos")
     for _,group in ipairs({"Berry","Gear","Mirage","Prehistoric","Kitsune"}) do controls["ESP."..group]=addToggle(ESPtab,"ESP "..group,false,function(on) setESP(group,on) end) end
     addSection(pageSea,"Eventos marítimos")
-    local seaTarget="Terrorshark"
-    dropdown(pageSea,"Alvo",{"Terrorshark","Shark","Piranha","Fish Crew Member","SeaBeast","Ghost Ship","Leviathan Segment","Leviathan Tail"},seaTarget,function(v) seaTarget=v end)
+    local seaTargets=seaIndex()==2 and {"SeaBeast","Ghost Ship"}or {"Terrorshark","Shark","Piranha","Fish Crew Member","SeaBeast","Ghost Ship","Leviathan Segment","Leviathan Tail"}
+    local seaTarget=seaTargets[1]
+    dropdown(pageSea,"Alvo",seaTargets,seaTarget,function(v) seaTarget=v end)
     toggleJob(pageSea,"Combater alvo marítimo","SeaCombat",0.4,function()
         local target=named(workspace:FindFirstChild("Enemies"),{seaTarget})
         if seaTarget=="Ghost Ship" then target=named(workspace:FindFirstChild("Enemies"),{"FishBoat","PirateBasic","PirateBrigade","PirateGrandBrigade"})
@@ -43463,14 +43615,14 @@ local bring=initMissionBring()
         if boatModel then boatModel:PivotTo(boatModel:GetPivot()+boatDirection*25) end
     end)
     local lightingOriginal
-    controls.Day=addToggle(pageSea,"Sempre dia",false,function(on)
+    controls.Day=addToggle(Visual,"Sempre dia",false,function(on)
         if on then
             lightingOriginal=lightingOriginal or Lighting.ClockTime
             startJob("Day",1,function() Lighting.ClockTime=12 end)
         else stopJob("Day");if lightingOriginal then Lighting.ClockTime=lightingOriginal;lightingOriginal=nil end end
     end)
     local fogOriginal
-    controls.Fog=addToggle(pageSea,"Remover neblina",false,function(on)
+    controls.Fog=addToggle(Visual,"Remover neblina",false,function(on)
         if on then
             if not fogOriginal then fogOriginal={FogEnd=Lighting.FogEnd,FogStart=Lighting.FogStart,Atmospheres={}} end
             Lighting.FogEnd=100000;Lighting.FogStart=100000
@@ -43534,7 +43686,7 @@ local bring=initMissionBring()
     local function status()
         local sky=Lighting:FindFirstChildOfClass("Sky")
         local text="Mar/PlaceId: "..tostring(game.PlaceId).." | Horário: "..tostring(Lighting.ClockTime)
-        for _,pair in ipairs({{"Mirage","MysticIsland"},{"Kitsune","KitsuneIsland"},{"Prehistoric","PrehistoricIsland"}}) do text=text.."\n"..pair[1]..": "..(eventPart(pair[2]) and "presente" or "não encontrado") end
+        if seaIndex()==3 then for _,pair in ipairs({{"Mirage","MysticIsland"},{"Kitsune","KitsuneIsland"},{"Prehistoric","PrehistoricIsland"}}) do text=text.."\n"..pair[1]..": "..(eventPart(pair[2]) and "presente" or "não encontrado") end end
         if sky then text=text.."\nLua (asset): "..tostring(sky.MoonTextureId) end
         local quest=questRuntime.GetBestQuest() or questForLevel() or preload.BestQuest();text=text.."\nQuest selecionada: "..(quest and quest.Mob or "sem dados")
         statusLabel.Text=text
@@ -43556,6 +43708,104 @@ local bring=initMissionBring()
             fogOriginal=nil
         end
     end
+    -- Scoped adaptations of Kaitun GetSaber/UnlockSecondSea and Matsune map stages.
+    local firstSeaState={Phase="off",Goal="Saber"}
+    local firstQueries={}
+    local function firstQuery(key,...)
+        local entry=firstQueries[key]
+        if entry and (entry.Busy or os.clock()<(entry.Next or 0))then return entry.Value end
+        local remote=path(RS,"Remotes","CommF_");if not remote then return nil end
+        entry=entry or {};firstQueries[key]=entry;entry.Busy=true;entry.Next=os.clock()+3
+        local token=requestToken();local args=table.pack(...)
+        task.defer(function()
+            if not validRequest(token)then entry.Busy=false;entry.Next=0;return end
+            local ok,result=pcall(function()return remote:InvokeServer(table.unpack(args,1,args.n))end)
+            entry.Busy=false
+            if validRequest(token)and ok then entry.Value=result elseif not ok then debugLog("WARN","firstsea.query",result)end
+        end)
+        return entry.Value
+    end
+    local function firstEquip(name)
+        local tool=hasTool(name);local _,h=character()
+        if tool and h then h:EquipTool(tool);return tool end
+    end
+    local function firstGo(cf,phase)
+        firstSeaState.Phase=phase;move(cf,"FirstSea")
+        local _,_,root=character();return root and (root.Position-cf.Position).Magnitude<10
+    end
+    local function firstFight(name,cf)
+        firstSeaState.Phase="Combater "..name
+        local target=named(workspace:FindFirstChild("Enemies"),{name})
+        if target then
+            local c=character();if c and not c:FindFirstChild("HasBuso")then comm("haki.buso",3,"Buso")end
+            fight(target,"FirstSea")
+        else fastAttackApi:ReleaseCombat("FirstSea");if cf then move(cf,"FirstSea")end end
+    end
+    local plateIndex=1
+    local firstLabel
+    local function firstStep()
+        if seaIndex()~=1 then controls.FirstSea.Set(false);return end
+        local _,_,root=character();if not root then firstSeaState.Phase="Esperando personagem";return end
+        local lv=path(LocalPlayer,"Data","Level");local level=lv and tonumber(lv.Value)or 0
+        local goal=firstSeaState.Goal
+        if goal=="Segundo Sea"then
+            if level<700 then firstSeaState.Phase="Requer nível 700";return end
+            local data=firstQuery("sea2","DressrosaQuestProgress")
+            if type(data)~="table"then firstSeaState.Phase="Consultando progresso do Segundo Sea";return end
+            if not data.TalkedDetective then
+                if firstGo(CFrame.new(4851.87,5.65,718.47),"Ir ao Military Detective")then comm("first.detective",3,"DressrosaQuestProgress","Detective")end
+            elseif not data.UsedKey then
+                if firstGo(CFrame.new(1347.8,37.4,-1325.6),"Usar chave na Frozen Village")then firstEquip("Key");comm("first.key",3,"DressrosaQuestProgress","UseKey")end
+            elseif not data.KilledIceBoss then firstFight("Ice Admiral",CFrame.new(1328,43,-1346))
+            else firstSeaState.Phase="Viajar ao Segundo Sea";stopMove("FirstSea");comm("travel",5,"TravelDressrosa")end
+        else
+            if hasTool("Saber")then firstSeaState.Phase="Saber obtido";controls.FirstSea.Set(false);return end
+            if level<200 then firstSeaState.Phase="Saber requer nível 200";return end
+            local data=firstQuery("saber","ProQuestProgress")
+            if type(data)~="table"then firstSeaState.Phase="Consultando progresso Saber";return end
+            if data.UsedRelic then firstFight("Saber Expert",CFrame.new(-1404.9,29.97,3.8))
+            else
+                local plates=path(workspace,"Map","Jungle","QuestPlates")
+                local door=plates and plates:FindFirstChild("Door")
+                if not door then firstGo(CFrame.new(-1612.55,36.97,148.71),"Carregando puzzle da Jungle")
+                elseif door.Transparency==0 then
+                    local plate=path(plates,"Plate"..plateIndex,"Button")
+                    if plate and firstGo(plate.CFrame,"Puzzle Jungle: placa "..plateIndex)then plateIndex=plateIndex%5+1 end
+                elseif not data.UsedTorch then
+                    if not hasTool("Torch")then
+                        if firstGo(CFrame.new(-1610,11.5,164),"Obter Torch")then comm("first.torch",3,"ProQuestProgress","GetTorch")end
+                    elseif firstGo(CFrame.new(1114.61,5.04,4350.22),"Usar Torch no Desert")then firstEquip("Torch");comm("first.burn",3,"ProQuestProgress","DestroyTorch")end
+                elseif not data.UsedCup then
+                    if not hasTool("Cup")then firstSeaState.Phase="Obter Cup";comm("first.cup",3,"ProQuestProgress","GetCup")
+                    else
+                        local cup=firstEquip("Cup")
+                        if cup then comm("first.fill",3,"ProQuestProgress","FillCup",cup)end
+                        if firstGo(CFrame.new(1395.77,37.47,-1326.34),"Ajudar Sick Man")then comm("first.sick",3,"ProQuestProgress","SickMan")end
+                    end
+                elseif not data.TalkedSon then firstSeaState.Phase="Falar com Rich Son";comm("first.son",3,"ProQuestProgress","RichSon")
+                elseif not data.KilledMob then firstFight("Mob Leader",CFrame.new(-2967.59,7,5328.7))
+                elseif not hasTool("Relic")then firstSeaState.Phase="Obter Relic";comm("first.relic",3,"ProQuestProgress","RichSon")
+                elseif firstGo(CFrame.new(-1404.9,29.97,3.8),"Colocar Relic na Jungle")then firstEquip("Relic");comm("first.place",3,"ProQuestProgress","PlaceRelic")end
+            end
+        end
+        if firstLabel then firstLabel.Text=firstSeaState.Phase end
+    end
+    if seaIndex()==1 then
+        local firstPage=addTab("First Sea")
+        dropdown(firstPage,"Objetivo First Sea",{"Saber","Segundo Sea"},"Saber",function(v)
+            if controls.FirstSea then controls.FirstSea.Set(false)end
+            firstSeaState.Goal=v;firstQueries={};plateIndex=1
+        end)
+        toggleJob(firstPage,"Auto objetivo First Sea","FirstSea",0.5,function()firstStep();if firstLabel then firstLabel.Text=firstSeaState.Phase end end)
+        firstLabel=addLabel(firstPage,"Selecione Saber ou Segundo Sea.")
+        button(firstPage,"Ver progresso do objetivo",function()
+            local action=firstSeaState.Goal=="Saber" and "ProQuestProgress" or "DressrosaQuestProgress"
+            comm("first.progress",3,action)
+            notify({Title="First Sea",Text=firstSeaState.Phase})
+        end)
+        onJobStop.FirstSea=function()releaseInput();firstSeaState.Phase="Parado";if firstLabel then firstLabel.Text="Parado"end end
+    end
+
     local function stopAll()
         fastToggle.Set(false)
         fastAttackApi:StopAll()
@@ -43580,7 +43830,7 @@ local bring=initMissionBring()
     report("startup",supported and "target game detected" or "UI available; target game unavailable")
     return {IsLightMode=function()return options.LightMode end,SetLightMode=function(v)options.LightMode=v==true end,StopAll=stopAll,ResetProgress=progressTracker.Reset,GetState=function()
         local running={};for name in pairs(jobs) do running[#running+1]=name end;table.sort(running)
-        return {Active=active,SupportedGame=supported,Mode=options.Mode,AutoEquip=options.AutoEquip,Progress=progressTracker.GetState(),Attack=table.clone(attackState),TweenSpeed=options.Speed,Bring=bring.GetState(),Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),FastAttack=fastAttackApi:GetState(),LevelFarm=table.clone(levelState),QuestRuntime=questRuntime.GetState(),Preload=preload.GetState(),Movement={Distance=moveRoot and moveTarget and (moveRoot.Position-moveTarget.Position).Magnitude or 0,ActualSpeed=actualSpeed,Backend="physics_path",Phase=movementPhase,Rebases=movementRebases,Owner=moveOwner,Suspended=motionState~=nil,Holding=motionState and motionState.Holding==true or false,Anchored=moveRoot and moveRoot.Anchored or false,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
+        return {Sea=seaIndex(),Active=active,SupportedGame=supported,Mode=options.Mode,AutoEquip=options.AutoEquip,Progress=progressTracker.GetState(),Attack=table.clone(attackState),TweenSpeed=options.Speed,Bring=bring.GetState(),Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),FastAttack=fastAttackApi:GetState(),FirstSea=table.clone(firstSeaState),LevelFarm=table.clone(levelState),QuestRuntime=questRuntime.GetState(),Preload=preload.GetState(),Movement={Distance=moveRoot and moveTarget and (moveRoot.Position-moveTarget.Position).Magnitude or 0,ActualSpeed=actualSpeed,Backend="physics_path",Phase=movementPhase,Rebases=movementRebases,Owner=moveOwner,Suspended=motionState~=nil,Holding=motionState and motionState.Holding==true or false,Anchored=moveRoot and moveRoot.Anchored or false,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
     end}
 end
 
@@ -43613,10 +43863,108 @@ local function getDebugLog()
     return copy
 end
 
+-- Read-only local observations. Missing streamed objects are never proof of server-wide absence.
+local function initServerEvents()
+    local Lighting=game:GetService("Lighting")
+    local RS=game:GetService("ReplicatedStorage")
+    local snapshot,lastScan,dirty=nil,-math.huge,true
+    for _,name in ipairs({"DescendantAdded","DescendantRemoving"})do
+        local signal=workspace[name]
+        if signal then bind(signal,function()dirty=true end,"events.world")end
+    end
+    local function findEvent(names)
+        for _,parent in pairs({workspace:FindFirstChild("Map"),workspace:FindFirstChild("_WorldOrigin")and workspace._WorldOrigin:FindFirstChild("Locations")})do
+            if parent then for _,name in ipairs(names)do if parent:FindFirstChild(name)then return true end end end
+        end
+        return false
+    end
+    local function clockText(value)
+        value=math.max(0,math.floor(value));return string.format("%02d:%02d",math.floor(value/60),value%60)
+    end
+    local function replicatedTimer(names)
+        for _,root in pairs({workspace:FindFirstChild("_WorldOrigin"),RS:FindFirstChild("WorldEvent"),RS:FindFirstChild("WorldEvents")})do
+            if root then for _,name in ipairs(names)do
+                local object=root:FindFirstChild(name,true)
+                if object then
+                    for _,field in ipairs({"TimeLeft","Countdown"})do
+                        local child=object:FindFirstChild(field)
+                        local value=object:GetAttribute(field)or(child and child.Value)
+                        if type(value)=="number"and value==value and value>=0 and value<864000 then return clockText(value)end
+                    end
+                    for _,field in ipairs({"NextSpawnTime","SpawnTime"})do
+                        local value=object:GetAttribute(field)
+                        if type(value)=="number"and value==value then
+                            local ok,now=pcall(function()return workspace:GetServerTimeNow()end)
+                            if ok and value>=now and value-now<864000 then return clockText(value-now)end
+                        end
+                    end
+                end
+            end end
+        end
+        return "Sem contador replicado"
+    end
+    local function getState(force)
+        local interval=dirty and 0.25 or 1
+        if snapshot and not force and os.clock()-lastScan<interval then return snapshot end
+        lastScan=os.clock();dirty=false
+        local sea=seaPolicy and seaPolicy.Sea
+        local sky=Lighting:FindFirstChildOfClass("Sky")
+        local moonId=sky and tostring(sky.MoonTextureId):match("(%d+)$")
+        local full;if sky then full=moonId=="9709149431"end
+        local time=tonumber(Lighting.ClockTime)or 0
+        local night=time>16 or time<5
+        local fruitCount=0
+        for _,object in ipairs(workspace:GetChildren())do
+            if (object:IsA("Tool")or object:IsA("Model"))and object.Name:lower():find("fruit",1,true)and object:FindFirstChild("Handle",true)then fruitCount=fruitCount+1 end
+        end
+        local bosses={}
+        local enemies=workspace:FindFirstChild("Enemies")
+        if enemies then for _,object in ipairs(enemies:GetDescendants())do
+            if object:IsA("Model")then
+                local hp=object:FindFirstChildOfClass("Humanoid")
+                if hp and hp.Health>0 then bosses[object.Name:gsub("%s*%[.-%]","")]=true end
+            end
+        end end
+        local previous=snapshot
+        snapshot={Sea=sea,ClockTime=time,FullMoon=full,Night=night,GroundFruits=fruitCount,Bosses=bosses,
+            Mirage=sea==3 and findEvent({"MysticIsland","Mirage Island"})or false,
+            Kitsune=sea==3 and findEvent({"KitsuneIsland","Kitsune Island"})or false,
+            Prehistoric=sea==3 and findEvent({"PrehistoricIsland","Prehistoric Island"})or false,
+            FOD=sea==3 and replicatedTimer({"FrozenDimension","Frozen Dimension","FOD"})or nil,
+            Chilly=sea==3 and replicatedTimer({"Chilly","ChillyEvent"})or nil}
+        if debugEnabled then
+            if fruitCount>0 and (not previous or fruitCount>previous.GroundFruits)then notify({Title="DEBUG • Fruta",Text=tostring(fruitCount).." fruta(s) observada(s) no chão."})end
+            if snapshot.Mirage and (not previous or not previous.Mirage)then notify({Title="DEBUG • Evento",Text="Mirage Island observada no mapa."})end
+        end
+        return snapshot
+    end
+    local function row(label,value)
+        if value==nil then return '<font color="#aaaaaa">? '..label..': indisponível</font>'end
+        return value and '<font color="#7be59d">✔ '..label..'</font>'or '<font color="#f08080">✖ '..label..' não observado</font>'
+    end
+    local function text()
+        local s=getState()
+        local rows={"XERECA | Eventos • "..(s.Sea and ("Sea "..s.Sea)or "Sea desconhecido"),
+            row("Lua cheia"..(s.Night and " • noite"or " • dia"),s.FullMoon),
+            row("Fruta no chão: "..s.GroundFruits,s.GroundFruits>0)}
+        if s.Sea==1 then
+            for _,name in ipairs({"Saber Expert","The Saw","Thunder God","Greybeard"})do rows[#rows+1]=row(name,s.Bosses[name]==true)end
+        elseif s.Sea==2 then
+            for _,name in ipairs({"Darkbeard","Cursed Captain","Order"})do rows[#rows+1]=row(name,s.Bosses[name]==true)end
+        elseif s.Sea==3 then
+            rows[#rows+1]=row("Mirage Island",s.Mirage);rows[#rows+1]=row("Kitsune Island",s.Kitsune);rows[#rows+1]=row("Prehistoric Island",s.Prehistoric)
+            rows[#rows+1]="FOD: "..s.FOD;rows[#rows+1]="Chilly: "..s.Chilly
+        end
+        return table.concat(rows,"\n")
+    end
+    return {GetState=getState,Text=text,IsDirty=function()return dirty end}
+end
+local eventMonitor=initServerEvents()
+
 -- Diagnostics stay local; no external logging or global error interception.
 local debugWindow=new("Frame",{Name="XerecaDebugWindow",ZIndex=20,Size=UDim2.fromOffset(460,420),Position=UDim2.fromOffset(30,80),Visible=false,Active=true,BorderSizePixel=0,Theme={BackgroundColor3="ComponentBg"}},uiGui)
 new("UICorner",{CornerRadius=UDim.new(0,8)},debugWindow)
-local debugTitle=new("TextLabel",{Text="XERECA | DEBUG • arraste aqui",Size=UDim2.new(1,-45,0,36),BackgroundTransparency=1,Active=true,Font=Enum.Font.GothamBold,TextSize=13,Theme={TextColor3="Text"}},debugWindow)
+local debugTitle=new("TextLabel",{Text="XERECA | DEBUG • Eventos",Size=UDim2.new(1,-45,0,36),BackgroundTransparency=1,Active=true,Font=Enum.Font.GothamBold,TextSize=13,Theme={TextColor3="Text"}},debugWindow)
 local debugClose=new("TextButton",{Text="X",Size=UDim2.fromOffset(34,30),Position=UDim2.new(1,-38,0,3),BackgroundTransparency=1,Font=Enum.Font.GothamBold,TextSize=14,Theme={TextColor3="Text"}},debugWindow)
 local debugPage=new("ScrollingFrame",{Position=UDim2.fromOffset(12,40),Size=UDim2.new(1,-20,1,-48),BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=4,CanvasSize=UDim2.new(),AutomaticCanvasSize=Enum.AutomaticSize.Y},debugWindow)
 new("UIListLayout",{Padding=UDim.new(0,8),SortOrder=Enum.SortOrder.LayoutOrder},debugPage)
@@ -43646,20 +43994,23 @@ bind(UserInputService.InputEnded,function(input) if input==debugDrag or input.Us
 bind(UserInputService.WindowFocusReleased,function() debugDrag=nil end,"debug.drag.focus")
 bind(debugClose.Activated,function() setDebug(false) end,"debug.close")
 addBtn(Settings,"Abrir janela DEBUG",function() setDebug(true) end)
-addSection(debugPage,"Diagnóstico do XERECA HUB")
-addLabel(debugPage,"Envio de ataque não confirma dano. Confira a vida observada abaixo. Logs locais, limitados a 100 entradas; nenhum envio externo.")
+addSection(debugPage,"Monitor do servidor")
+local eventStatus=addLabel(debugPage,"")
+eventStatus.RichText=true
+local showTechnical=false
 local panelPaused,onlyProblems=false,false
 local debugSearch=""
 local debugStatus=addLabel(debugPage,"DEBUG desativado")
 local debugOutput=addLabel(debugPage,"")
 debugOutput.RichText=false
+debugStatus.Visible=false;debugOutput.Visible=false
 local function debugReportText()
     local snapshot=importedFeatures.GetState()
     local farm=snapshot.Farm or {}
     local attack=snapshot.Attack or {}
     local movement=snapshot.Movement or {}
     local sharedAttack=snapshot.FastAttack or {}
-    local rows={"XERECA HUB | diagnóstico local",
+    local rows={eventMonitor.Text():gsub("<[^>]*>",""),"", "XERECA HUB | diagnóstico local",
         "Farm: "..tostring(farm.Phase).." | alvo: "..tostring(farm.Target or farm.ExpectedMob),
         "Ataque: "..tostring(attack.Phase).." | método: "..tostring(attack.Method).." | transporte: "..tostring(attack.Transport).." | clique: "..tostring(attack.Input),
         "FastAttack compartilhado: "..tostring(sharedAttack.Running).." | manual: "..tostring(sharedAttack.ManualEnabled).." | controle: "..tostring(sharedAttack.Owner).." | envios: "..tostring(sharedAttack.Dispatches),
@@ -43676,6 +44027,8 @@ end
 local function refreshDebugPanel()
     if destroyed then return end
     if not debugEnabled then debugStatus.Text="DEBUG desativado";return end
+    eventStatus.Text=eventMonitor.Text()
+    if not showTechnical then return end
     debugStatus.Text=debugReportText()
     local rows={}
     for i=#debugHistory,1,-1 do
@@ -43688,12 +44041,23 @@ local function refreshDebugPanel()
     end
     debugOutput.Text=#rows>0 and table.concat(rows,"\n") or "Sem registros para este filtro."
 end
+local technicalFrames={}
+local function technical(make)
+    local before={};for _,child in ipairs(debugPage:GetChildren())do before[child]=true end
+    make()
+    for _,child in ipairs(debugPage:GetChildren())do if not before[child]then technicalFrames[#technicalFrames+1]=child;child.Visible=showTechnical end end
+end
+addToggle(debugPage,"Mostrar diagnóstico técnico",false,function(on)
+    showTechnical=on;debugTechnicalEnabled=on;debugStatus.Visible=on;debugOutput.Visible=on
+    for _,frame in ipairs(technicalFrames)do frame.Visible=on end
+    refreshDebugPanel()
+end)
 debugPanelControl=addToggle(debugPage,"Ativar painel DEBUG",false,function(on) setDebug(on);refreshDebugPanel() end)
 addToggle(debugPage,"Pausar atualização do painel",false,function(on) panelPaused=on end)
-addToggle(debugPage,"Somente avisos e erros",false,function(on) onlyProblems=on;refreshDebugPanel() end)
-addTextbox(debugPage,{Placeholder="Filtrar logs (ex.: combat)",Callback=function(text) debugSearch=tostring(text):lower();refreshDebugPanel() end})
-addBtn(debugPage,"Atualizar diagnóstico",function() runDebug();refreshDebugPanel() end)
-addBtn(debugPage,"Limpar registros",function() table.clear(debugHistory);refreshDebugPanel() end)
+technical(function()addToggle(debugPage,"Somente avisos e erros",false,function(on) onlyProblems=on;refreshDebugPanel() end)end)
+technical(function()addTextbox(debugPage,{Placeholder="Filtrar logs (ex.: combat)",Callback=function(text) debugSearch=tostring(text):lower();refreshDebugPanel() end})end)
+technical(function()addBtn(debugPage,"Atualizar diagnóstico",function() runDebug();refreshDebugPanel() end)end)
+technical(function()addBtn(debugPage,"Limpar registros",function() table.clear(debugHistory);refreshDebugPanel() end)end)
 debugVisibility=function(on)
     if destroyed then return end
     debugWindow.Visible=on
@@ -43702,7 +44066,7 @@ debugVisibility=function(on)
 end
 local lastDebugPaint=0
 bind(game:GetService("RunService").Heartbeat,function()
-    if debugEnabled and debugWindow.Visible and not panelPaused and os.clock()-lastDebugPaint>=(importedFeatures.IsLightMode() and 3 or 1) then
+    if debugEnabled and debugWindow.Visible and not panelPaused and os.clock()-lastDebugPaint>=(importedFeatures.IsLightMode() and 3 or (eventMonitor.IsDirty() and 0.25 or 1)) then
         lastDebugPaint=os.clock();fitDebugWindow();refreshDebugPanel()
     end
 end,"debug.panel")
