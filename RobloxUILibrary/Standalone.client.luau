@@ -40757,7 +40757,7 @@ local function initFastAttack()
         end
     end
     local lastDispatch=-math.huge
-    function api:AttackTarget(enemy)
+    function api:AttackTarget(enemy,extras)
         if destroyed then return false,"unloaded" end
         local c=LocalPlayer.Character
         local h=c and c:FindFirstChildOfClass("Humanoid")
@@ -40769,6 +40769,18 @@ local function initFastAttack()
         if tool.ToolTip=="Gun" then return false,"skill_weapon" end
         if not targetHumanoid or targetHumanoid.Health<=0 or not head or not head:IsA("BasePart") then return false,"invalid_target" end
         if (head.Position-root.Position).Magnitude>self.Distance then return false,"out_of_range" end
+        local targets,seen={},{}
+        local function include(candidate)
+            if #targets>=20 or seen[candidate]then return end
+            local humanoid=candidate and candidate:FindFirstChildOfClass("Humanoid")
+            local point=candidate and (candidate:FindFirstChild("Head")or candidate:FindFirstChild("HumanoidRootPart"))
+            if candidate~=c and candidate.Parent and humanoid and humanoid.Health>0 and point and point:IsA("BasePart")
+                and (point.Position-root.Position).Magnitude<=self.Distance then
+                seen[candidate]=true;targets[#targets+1]={candidate,point}
+            end
+        end
+        include(enemy)
+        for _,candidate in ipairs(extras or {})do include(candidate)end
         local leftClick=tool:FindFirstChild("LeftClickRemote")
         local attack,hit=remote("RE/RegisterAttack"),remote("RE/RegisterHit")
         if not (leftClick and leftClick:IsA("RemoteEvent")) and (not attack or not hit) then return false,"remotes_unavailable" end
@@ -40777,22 +40789,24 @@ local function initFastAttack()
         local ok,err=pcall(function()
             -- Matsune prioritizes the equipped weapon's own M1 remote.
             if leftClick and leftClick:IsA("RemoteEvent") then
-                local delta=head.Position-root.Position
-                if delta.Magnitude<=0.001 then error("target direction unavailable") end
-                leftClick:FireServer(delta.Unit,1)
+                for _,entry in ipairs(targets)do
+                    local point=entry[1]:FindFirstChild("HumanoidRootPart")or entry[2]
+                    local delta=point.Position-root.Position
+                    if delta.Magnitude>0.001 then leftClick:FireServer(delta.Unit,1)end
+                end
             else
                 attack:FireServer(0)
-                hit:FireServer(head,{{enemy,head}})
+                hit:FireServer(head,targets)
             end
         end)
         if not ok then debugLog("WARN","combat.remote",err);return false,"remote_failed" end
         transport.Dispatches=transport.Dispatches+1
-        transport.LastSentAt=os.clock();transport.Target=enemy.Name
+        transport.LastSentAt=os.clock();transport.Target=enemy.Name;transport.TargetCount=#targets
         transport.LastTransport=leftClick and leftClick:IsA("RemoteEvent") and "left_click_remote_sent" or "remote_sent"
         return true,transport.LastTransport
     end
     local observedTarget,observedHealth,observedAt,lastCycle=nil,nil,nil,-math.huge
-    function api:DispatchTarget(owner,target)
+    function api:DispatchTarget(owner,target,extras)
         local c=LocalPlayer.Character
         local h=c and c:FindFirstChildOfClass("Humanoid")
         local root=c and c:FindFirstChild("HumanoidRootPart")
@@ -40813,18 +40827,20 @@ local function initFastAttack()
             observedTarget=target;observedAt=os.clock()
         end
         observedHealth=hp
-        local method=self.GetMethod and self.GetMethod(owner)or "Auto"
+        local method=self.GetMethod and self.GetMethod(owner)or "Matsune Click"
         local clicked,inputReason=false,"normal_click_unavailable"
-        if self.NormalClick then clicked,inputReason=self.NormalClick(owner,target,method)end
+        if method~="Matsune Click"and self.NormalClick then clicked,inputReason=self.NormalClick(owner,target,method)end
+        if method=="Matsune Click"then inputReason="remote_only_no_mouse"end
+        if not extras and self.GetCombatTargets then extras=self.GetCombatTargets(owner,target)end
         local sent,remoteReason=false,"disabled_by_method"
-        if method=="Auto"then sent,remoteReason=self:AttackTarget(target)end
+        if method=="Auto"or method=="Matsune Click"then sent,remoteReason=self:AttackTarget(target,extras)end
         transport.Target=target.Name;transport.Method=method
         transport.Input=inputReason;transport.Remote=remoteReason
         transport.Health=hp;transport.NoDamageFor=os.clock()-observedAt
         transport.DamageObserved=transport.NoDamageFor==0 and hp< (transport.PreviousHealth or hp) and transport.PreviousTarget==target
         transport.PreviousHealth=hp;transport.PreviousTarget=target
         transport.DamageStatus=transport.NoDamageFor>=2 and "sem queda de vida observada; confira arma, alcance e altura"or "observando vida do alvo"
-        transport.LastTransport=sent and remoteReason or clicked and "normal_click_sent"or inputReason
+        transport.LastTransport=sent and remoteReason or clicked and "normal_click_sent"or method=="Matsune Click"and remoteReason or inputReason
         return sent or clicked,transport.LastTransport
     end
     function api:AttackNearest()
@@ -40835,19 +40851,27 @@ local function initFastAttack()
         local tool=c and c:FindFirstChildOfClass("Tool")
         if not root or not h or h.Health<=0 or not tool or tool.ToolTip=="Gun" then return end
         local best,bestDistance=nil,math.huge
+        local candidates={}
         local function gather(folder)
             if folder then for _,enemy in ipairs(folder:GetDescendants()) do
                 local enemyHumanoid=enemy:FindFirstChildOfClass("Humanoid")
                 local head=enemy:FindFirstChild("Head") or enemy:FindFirstChild("HumanoidRootPart")
                 if enemy~=c and enemyHumanoid and enemyHumanoid.Health>0 and head and head:IsA("BasePart") then
                     local d=(head.Position-root.Position).Magnitude
-                    if d<=self.Distance and d<bestDistance then best=enemy;bestDistance=d end
+                    if d<=self.Distance then
+                        candidates[#candidates+1]={Model=enemy,Distance=d}
+                        if d<bestDistance then best=enemy;bestDistance=d end
+                    end
                 end
             end end
         end
         if self.attackMobs then gather(workspace:FindFirstChild("Enemies") or workspace:FindFirstChild("Hostiles")) end
         if self.attackPlayers then gather(workspace:FindFirstChild("Characters")) end
-        if best then return self:DispatchTarget("Manual",best) end
+        if best then
+            table.sort(candidates,function(a,b)return a.Distance<b.Distance end)
+            local extras={};for i=1,math.min(20,#candidates)do extras[#extras+1]=candidates[i].Model end
+            return self:DispatchTarget("Manual",best,extras)
+        end
         transport.LastTransport="no_target_observed"
     end
     function api:CanAttack()
@@ -41759,7 +41783,7 @@ progressTracker=initProgressTracker()
 
     fastAttackApi.EquipSelected=function() if options.AutoEquip then return equip(options.Weapon) end end
     local lastInputClick=-math.huge
-    local attackState={Phase="idle",Method="Auto",Attempts=0}
+    local attackState={Phase="idle",Method="Matsune Click",Attempts=0}
     local inputLease
     local function releaseInput()
         local lease=inputLease
@@ -43416,7 +43440,9 @@ local bring=initMissionBring()
         stopMove("Farm")
     end)
     addLabel(Farm,"Velocidade do Tween: menor = mais lento. O ajuste também vale durante o deslocamento.")
-    dropdown(Farm,"Ataque do farm",{"Auto","Matsune Click","Tool"},"Auto",function(v) attackState.Method=v end)
+    dropdown(Farm,"Ataque do farm",{"Matsune Click","Auto","Tool"},"Matsune Click",function(v)
+        fastAttackApi.ReleaseInput();attackState.Method=v
+    end)
     addToggle(Farm,"Auto equipar arma selecionada",true,function(on) options.AutoEquip=on end)
     dropdown(Farm,"Arma",{"Melee","Sword","Gun","Blox Fruit"},options.Weapon,function(v) options.Weapon=v end)
     modeControl=dropdown(Farm,"Modo",modes,"Off",function(v)
@@ -43450,7 +43476,21 @@ local bring=initMissionBring()
     controls.LevelFarm=levelToggle
     local previousFarmStop=onJobStop.Farm
     onJobStop.Farm=function()previousFarmStop();releaseLevelSupport()end
-    fastAttackApi.GetMethod=function(owner) return owner=="Manual" and "Auto" or attackState.Method end
+    fastAttackApi.GetCombatTargets=function(owner,target)
+        local extras={}
+        if owner~="Farm"or not flags.Farm or options.Mode~="Level"or not flags.Bring or not levelState.Quest then return extras end
+        local folder=workspace:FindFirstChild("Enemies")
+        if not folder or not part(target)or cleanName(target.Name)~=cleanName(levelState.Quest.Mob)then return extras end
+        for _,enemy in ipairs(folder:GetDescendants())do
+            if #extras>=19 then break end
+            if enemy:IsA("Model")and enemy~=target and cleanName(enemy.Name)==cleanName(levelState.Quest.Mob)
+                and not enemy.Name:lower():find("boss",1,true)and not enemy:GetAttribute("IsBoss")and not enemy:GetAttribute("Boss")
+                and not Players:GetPlayerFromCharacter(enemy)and health(enemy)>0 and part(enemy)
+                and (part(enemy).Position-part(target).Position).Magnitude<=20 then extras[#extras+1]=enemy end
+        end
+        return extras
+    end
+    fastAttackApi.GetMethod=function(owner) return owner=="Manual" and "Matsune Click" or attackState.Method end
     do
         local toolLease
         local function releaseTool()
@@ -43898,6 +43938,82 @@ local bring=initMissionBring()
             fogOriginal=nil
         end
     end
+    do
+        local platform,waterPart,watchedHumanoid,deathConnection
+        local nextWaterLookup=0
+        local function removePlatform()
+            if platform then platform:Destroy();platform=nil end
+        end
+        local function clear()
+            removePlatform()
+            if deathConnection then deathConnection:Disconnect();deathConnection=nil end
+            watchedHumanoid=nil
+        end
+        local function waterName(object)
+            return object and object:IsA("BasePart")and (object.Name=="WaterBase"or object.Name=="Water"or object.Name=="Ocean"or object.Name=="SeaWater")
+        end
+        local function knownWater()
+            if waterPart and not waterPart.Parent then waterPart=nil end
+            if os.clock()>=nextWaterLookup then
+                nextWaterLookup=os.clock()+2
+                local map=workspace:FindFirstChild("Map")
+                waterPart=map and (map:FindFirstChild("WaterBase",true)or map:FindFirstChild("SeaWater",true)or map:FindFirstChild("Water",true))
+                    or workspace:FindFirstChild("WaterBase")
+                if not waterName(waterPart)then waterPart=nil end
+            end
+            return waterPart
+        end
+        local function surface(root,c)
+            local params=RaycastParams.new()
+            params.FilterType=Enum.RaycastFilterType.Exclude
+            params.FilterDescendantsInstances=platform and {c,platform}or {c}
+            params.IgnoreWater=false
+            local result=workspace:Raycast(root.Position+Vector3.new(0,8,0),Vector3.new(0,-256,0),params)
+            if result and (result.Material==Enum.Material.Water or waterName(result.Instance))then return result.Position.Y end
+            -- Some maps use a named water plane with CanQuery disabled.
+            local water=knownWater()
+            if water then
+                local p=water.CFrame:PointToObjectSpace(root.Position)
+                if math.abs(p.X)<=water.Size.X/2 and math.abs(p.Z)<=water.Size.Z/2 then
+                    local y=water.Position.Y+water.Size.Y/2
+                    if y<=root.Position.Y+8 and (not result or result.Position.Y<y-0.05)then return y end
+                end
+            end
+        end
+        controls.WalkWater=addToggle(pagePlayer,"Andar sobre a água",false,function(on)
+            flags.WalkWater=on;nextWaterLookup=0
+            if not on then clear()end
+        end)
+        bind(RunService.Stepped,function()
+            if not active or destroyed or not flags.WalkWater then return end
+            local c,h,root=character()
+            if not root or h.Sit or motionState then removePlatform();return end
+            if watchedHumanoid~=h then
+                clear();watchedHumanoid=h;deathConnection=h.Died:Connect(removePlatform)
+            end
+            local waterY=surface(root,c)
+            local height=math.max(0,h.HipHeight or 0)+root.Size.Y/2
+            if h.RigType==Enum.HumanoidRigType.R6 then
+                local leg=c:FindFirstChild("Left Leg")or c:FindFirstChild("Right Leg")
+                height=height+(leg and leg.Size.Y or 2)
+            end
+            local feet=root.Position.Y-height
+            if not waterY or feet<waterY-1.5 or feet>waterY+12 then removePlatform();return end
+            if not platform then
+                platform=Instance.new("Part")
+                platform.Name="_XerecaWaterWalk"
+                platform.Size=Vector3.new(math.max(8,root.Size.X*3),0.5,10)
+                platform.Anchored=true;platform.Transparency=1
+                platform.CanCollide=true;platform.CanTouch=false;platform.CanQuery=false
+                platform.Parent=workspace
+            end
+            -- Fixed at the detected water level: jumping cannot raise the platform.
+            platform.CFrame=CFrame.new(root.Position.X,waterY-0.25,root.Position.Z)
+        end,"player.walk_water")
+        bind(LocalPlayer.CharacterRemoving,clear,"player.walk_water.respawn")
+        table.insert(cleanupFns,clear)
+    end
+
     -- Scoped adaptations of Kaitun GetSaber/UnlockSecondSea and Matsune map stages.
     local firstSeaState={Phase="off",Goal="Saber"}
     local firstQueries={}
