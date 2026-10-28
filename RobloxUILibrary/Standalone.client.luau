@@ -40832,104 +40832,91 @@ mkEspToggle("Devil Fruit ESP", "DevilFruit")
 mkEspToggle("Flower ESP", "Flower")
 mkEspToggle("Real Fruit (Apple) ESP", "RealFruit")
 
--- Fruit requests have one shared gate, including across UI reloads.
--- 120 seconds is a conservative client spacing, NOT a server cooldown.
--- No server response schema is available: all responses remain diagnostics.
-local FRUIT_SPACING = 120
-local fruitGate = shared._UILibFruitGate
-if type(fruitGate) ~= "table" then
-    fruitGate = {busy = nil, nextAllowed = 0}
-    shared._UILibFruitGate = fruitGate
+-- One shared request gate across reloads, separate manual throttle and auto retry interval.
+local FRUIT_SPACING=120
+local fruitGate=shared._UILibFruitGate
+if type(fruitGate)~="table"then fruitGate={};shared._UILibFruitGate=fruitGate end
+if fruitGate.Version~=2 then
+    if not fruitGate.busy then fruitGate.nextAllowed=0 end
+    fruitGate.nextAutoAllowed=0;fruitGate.Version=2
 end
-local fruitEnabled = false
-local fruitSession = 0
-local fruitTimer
-local fruitWake
-local armFruit
-
+local fruitEnabled=false
+local fruitSession=0
+local fruitTimer,fruitWake,armFruit
+local fruitStatus
 local function cancelFruitTimer()
-    if fruitTimer then pcall(task.cancel, fruitTimer); fruitTimer = nil end
+    if fruitTimer then pcall(task.cancel,fruitTimer);fruitTimer=nil end
 end
-
+local function fruitFeedback(text,manual)
+    if destroyed then return end
+    if fruitStatus then fruitStatus.Text=text end
+    if manual then notify({Title="Fruta aleatória",Text=text})end
+end
+local function physicalFruitSnapshot()
+    local set={}
+    for _,container in pairs({LocalPlayer:FindFirstChildOfClass("Backpack"),LocalPlayer.Character})do
+        if container then for _,tool in ipairs(container:GetChildren())do
+            if tool:IsA("Tool") and (tool:FindFirstChild("EatRemote",true)or tool.Name:lower():find("fruit",1,true))then set[tool]=true end
+        end end
+    end
+    return set
+end
 local function requestFruit(manual)
     if destroyed then return end
-    if fruitGate.busy or os.clock() < fruitGate.nextAllowed then
-        if manual then
-            notify({Title="Fruit", Text="Solicitação pendente ou intervalo local de segurança ativo."})
-        end
-        return
+    if fruitGate.busy or os.clock()<(fruitGate.nextAllowed or 0)then
+        fruitFeedback(fruitGate.busy and "Solicitação em andamento." or "Aguarde alguns segundos para tentar novamente.",manual);return
     end
-    local remotes = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
-    local remote = remotes and remotes:FindFirstChild("CommF_")
-    if not remote or not remote:IsA("RemoteFunction") then
-        if manual then notify({Title="Fruit", Text="RemoteFunction Remotes.CommF_ indisponível."}) end
-        warn("[Fruit] RemoteFunction ReplicatedStorage.Remotes.CommF_ indisponível.")
-        fruitGate.nextAllowed = os.clock() + FRUIT_SPACING
-        return
+    local remotes=game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+    local remote=remotes and remotes:FindFirstChild("CommF_")
+    if not remote or not remote:IsA("RemoteFunction")then
+        fruitGate.nextAllowed=os.clock()+3;fruitGate.nextAutoAllowed=os.clock()+FRUIT_SPACING
+        fruitFeedback("Compra indisponível: Remotes.CommF_ não encontrado.",manual)
+        debugLog("WARN","fruit.random","Remotes.CommF_ missing");return
     end
-    local previousAllowed=fruitGate.nextAllowed
     local session=fruitSession
-    local owner = {}
-    fruitGate.busy = owner
-    fruitGate.nextAllowed = os.clock() + FRUIT_SPACING
-    -- Intentionally not in tasksPending: canceling a yielding InvokeServer cannot
-    -- cancel the server operation. Keep the gate until the call actually returns.
+    local previousAllowed,previousAuto=fruitGate.nextAllowed,fruitGate.nextAutoAllowed
+    local owner={};fruitGate.busy=owner
+    fruitGate.nextAllowed=os.clock()+3;fruitGate.nextAutoAllowed=os.clock()+FRUIT_SPACING
+    local before=physicalFruitSnapshot()
+    fruitFeedback("Solicitando fruta...",false)
     task.defer(function()
-        if destroyed or session~=fruitSession then
-            if fruitGate.busy==owner then fruitGate.busy=nil;fruitGate.nextAllowed=previousAllowed end
+        if destroyed or fruitSession~=session then
+            if fruitGate.busy==owner then fruitGate.busy=nil;fruitGate.nextAllowed=previousAllowed;fruitGate.nextAutoAllowed=previousAuto end
             return
         end
-        local ok, response = pcall(function()
-            return remote:InvokeServer("Cousin", "Buy")
-        end)
-        if fruitGate.busy == owner then fruitGate.busy = nil end
-        warn("[Fruit] Diagnóstico (pcall=" .. tostring(ok) .. ", tipo="
-            .. typeof(response) .. "): " .. tostring(response))
-        -- Resume scheduling before optional UI diagnostics.
-        local wake = fruitGate.wake
-        if wake then wake() end
-        if not destroyed then
-            notify({Title="Fruit", Text=ok
-                and "Resposta recebida; compra não confirmada. Veja o diagnóstico no Output."
-                or "Falha na solicitação. Veja o diagnóstico no Output."})
-        end
+        local ok,result=pcall(function()return remote:InvokeServer("Cousin","Buy")end)
+        if fruitGate.busy==owner then fruitGate.busy=nil end
+        local wake=fruitGate.wake;if wake then wake()end
+        if destroyed or fruitSession~=session then return end
+        debugLog(ok and "INFO" or "ERROR","fruit.random",tostring(result))
+        local received
+        for tool in pairs(physicalFruitSnapshot())do if not before[tool]then received=tool.Name;break end end
+        if received then fruitFeedback("Recebida: "..received,manual)
+        elseif not ok then fruitFeedback("Falha: "..tostring(result):sub(1,140),manual)
+        elseif type(result)=="string" and result~=""then fruitFeedback("Resposta: "..result:sub(1,140),manual)
+        else fruitFeedback("Solicitação enviada; nenhuma fruta nova observada. Resposta: "..tostring(result):sub(1,80),manual)end
     end)
 end
-
-armFruit = function(session)
-    if destroyed or not fruitEnabled or fruitSession ~= session or fruitTimer then return end
-    -- No polling while waiting for a request; completion wakes the active session.
-    if fruitGate.busy then return end
-    fruitTimer = task.delay(math.max(0, fruitGate.nextAllowed - os.clock()), function()
-        if destroyed or not fruitEnabled or fruitSession ~= session then return end
-        fruitTimer = nil
-        requestFruit(false)
-        armFruit(session)
+armFruit=function(session)
+    if destroyed or not fruitEnabled or fruitSession~=session or fruitTimer or fruitGate.busy then return end
+    fruitTimer=task.delay(math.max(0,(fruitGate.nextAutoAllowed or 0)-os.clock()),function()
+        fruitTimer=nil
+        if destroyed or not fruitEnabled or fruitSession~=session then return end
+        requestFruit(false);armFruit(session)
     end)
 end
-
-local function setFruitEnabled(enabled)
-    fruitSession = fruitSession + 1
-    fruitEnabled = enabled == true
-    cancelFruitTimer()
-    if fruitGate.wake == fruitWake then fruitGate.wake = nil end
-    local session = fruitSession
-    fruitWake = function()
-        if not destroyed and fruitEnabled and fruitSession == session then armFruit(session) end
-    end
-    if fruitEnabled then
-        fruitGate.wake = fruitWake
-        armFruit(session)
-    end
+local function setFruitEnabled(on)
+    fruitSession=fruitSession+1;fruitEnabled=on==true;cancelFruitTimer()
+    if fruitGate.wake==fruitWake then fruitGate.wake=nil end
+    local session=fruitSession
+    fruitWake=function()if not destroyed and fruitEnabled and fruitSession==session then armFruit(session)end end
+    if fruitEnabled then fruitGate.wake=fruitWake;armFruit(session)end
 end
-table.insert(cleanupFns, function()
-    setFruitEnabled(false)
-end)
-
-addSection(Fruit, "Fruit")
-addLabel(Fruit, "Auto: intervalo local de 120 s, sem cooldown do servidor confirmado. Respostas são diagnósticos; o servidor decide a compra.")
-addBtn(Fruit, "Random Fruit", function() requestFruit(true) end)
-local fruitControl=addToggle(Fruit, "Auto Random Fruit", false, setFruitEnabled)
+table.insert(cleanupFns,function()setFruitEnabled(false)end)
+addSection(Fruit,"Fruta aleatória")
+addBtn(Fruit,"Random Fruit",function()requestFruit(true)end)
+local fruitControl=addToggle(Fruit,"Auto Random Fruit",false,setFruitEnabled)
+fruitStatus=addLabel(Fruit,"")
 
 -- hotkey
 bind(UserInputService.InputBegan, function(i, gameProcessed)
@@ -43035,7 +43022,6 @@ local bring=initMissionBring()
     local pageRace=addTab("Race V4")
     local pageStatus=addTab("Status")
     addSection(Farm,"Farm integrado")
-    addLabel(Farm,"Um modo de farm por vez. Coordenadas/missões vêm das fontes; progresso e dano dependem do servidor. Missões consultadas no jogo; catálogo alternativo Hoho até nível 2700 (cobertura parcial).")
     local farmControl
     addToggle(Farm,"Recuperar farm travado",false,function(v) options.Recover=v;watchdog.At=os.clock();watchdog.Retries=0 end)
     addSlider(Farm,{Name="Tempo sem progresso",Min=15,Max=120,Default=30,Step=5,Callback=function(v)options.StallSeconds=v end})
@@ -43049,7 +43035,6 @@ local bring=initMissionBring()
     end)
     addLabel(Farm,"Velocidade do Tween: menor = mais lento. O ajuste também vale durante o deslocamento.")
     dropdown(Farm,"Ataque do farm",{"Auto","Matsune Click","Hoho R2","Tool"},"Auto",function(v) attackState.Method=v end)
-    addLabel(Farm,"Auto: usa o mesmo motor do Fast Attack do topo, com um único loop. O toggle manual ligado também tem prioridade sobre cliques simulados. Matsune Click: VirtualUser com alternativa R2. Hoho R2: exemplo comentado do carregador Hoho. Tool: ativação normal. DEBUG distingue envio e vida observada.")
     addToggle(Farm,"Auto equipar arma selecionada",true,function(on) options.AutoEquip=on end)
     dropdown(Farm,"Arma",{"Melee","Sword","Gun","Blox Fruit"},options.Weapon,function(v) options.Weapon=v end)
     dropdown(Farm,"Modo",modes,"Off",function(v)
@@ -43067,8 +43052,6 @@ local bring=initMissionBring()
     addSlider(Farm,{Name="Alcance do BRING",Min=25,Max=400,Default=150,Step=25,Suffix=" studs",Callback=bring.SetRadius})
     addSlider(Farm,{Name="Máximo de NPCs no BRING",Min=1,Max=20,Default=20,Step=1,Callback=bring.SetLimit})
     addSlider(Farm,{Name="Espaçamento do BRING",Min=2,Max=12,Default=3,Step=1,Callback=bring.SetSpacing})
-    bring.BindLabel(addLabel(Farm,""))
-    addLabel(Farm,"BRING funciona no modo Level, com missão ativa e perto do alvo. Agrupa até 20 inimigos próximos por etapa; jogadores e bosses ficam de fora.")
     controls.SkillSpam=addToggle(Farm,"Usar skills Z/X/C/V/F",false,function(on) flags.SkillSpam=on end)
     for _,key in ipairs({"Z","X","C","V","F"}) do
         addToggle(Farm,"Skill "..key,options["Skill"..key],function(on) options["Skill"..key]=on end)
@@ -43124,36 +43107,94 @@ local bring=initMissionBring()
     end)
     local function fruits(container)
         local found={}
-        if container then for _,o in ipairs(container:GetChildren()) do if o:IsA("Tool") and o.Name:lower():find("fruit",1,true) then found[#found+1]=o end end end
+        if container then for _,o in ipairs(container:GetChildren())do
+            if o:IsA("Tool") and (o:FindFirstChild("EatRemote",true) or type(o:GetAttribute("OriginalName"))=="string" or o.Name:lower():find("fruit",1,true))then found[#found+1]=o end
+        end end
         return found
     end
-    local function storeFruits()
-        local c=LocalPlayer.Character
+    local fruitTransactions=shared._XerecaFruitTransactions
+    if type(fruitTransactions)~="table"then fruitTransactions=setmetatable({},{__mode="k"});shared._XerecaFruitTransactions=fruitTransactions end
+    local function inventoryFruits()
         local all=fruits(LocalPlayer:FindFirstChildOfClass("Backpack"))
-        for _,o in ipairs(fruits(c)) do all[#all+1]=o end
-        for _,fruit in ipairs(all) do
-            local original=fruit:GetAttribute("OriginalName")
-            if type(original)=="string" then comm("fruit.store."..original,5,"StoreFruit",original,fruit) end
+        for _,fruit in ipairs(fruits(LocalPlayer.Character))do all[#all+1]=fruit end
+        return all
+    end
+    local function ownedFruit(fruit)
+        return fruit.Parent and (fruit.Parent==LocalPlayer.Character or fruit.Parent==LocalPlayer:FindFirstChildOfClass("Backpack"))
+    end
+    local function fruitId(fruit)
+        local original=fruit:GetAttribute("OriginalName")
+        if type(original)=="string" and original~=""then return original end
+        local value=fruit:FindFirstChild("OriginalName")
+        if value and value:IsA("StringValue") and value.Value~=""then return value.Value end
+        local name=fruit.Name:gsub("%s+Fruit$","")
+        if name:match("^(.-)%-%1$")then return name end
+        -- Fallback used by the supplied Matsune source; special variants should expose OriginalName.
+        if name~="" and name~="Fruit" and name~="Blox"then return name.."-"..name end
+    end
+    local function transactFruit(fruit,action,manual)
+        if not supported or not ownedFruit(fruit)then return end
+        local gate=fruitTransactions[fruit]
+        if gate and (gate.Busy or os.clock()<(gate.Next or 0))then return end
+        local remote,id
+        if action=="store"then
+            remote=path(RS,"Remotes","CommF_");id=fruitId(fruit)
+            if not id then if manual then notify({Title="Frutas",Text="Nome de armazenamento indisponível: "..fruit.Name})end;debugLog("WARN","fruit.store.id",fruit.Name);return end
+        else remote=fruit:FindFirstChild("EatRemote",true)end
+        if not remote or not remote:IsA("RemoteFunction")then
+            if manual then notify({Title="Frutas",Text="Ação indisponível para "..fruit.Name})end
+            debugLog("WARN","fruit."..action,"RemoteFunction missing: "..fruit.Name);return
         end
+        gate={Busy=true,Next=os.clock()+5};fruitTransactions[fruit]=gate
+        local token=requestToken()
+        -- Do not cancel an in-flight InvokeServer; only cancel before it is sent.
+        task.defer(function()
+            if not validRequest(token)or not ownedFruit(fruit)then gate.Busy=false;gate.Next=0;return end
+            local ok,result=pcall(function()
+                if action=="drop"then
+                    local _,h=character();if not h then error("Personagem indisponível")end
+                    h:EquipTool(fruit)
+                    task.wait(0.1)
+                    if not validRequest(token)or not ownedFruit(fruit)then return "cancelado"end
+                    return remote:InvokeServer("Drop")
+                end
+                return remote:InvokeServer("StoreFruit",id,fruit)
+            end)
+            gate.Busy=false;gate.Next=os.clock()+5
+            if active and not destroyed and validRequest(token)then
+                debugLog(ok and "INFO" or "ERROR","fruit."..action,fruit.Name..": "..tostring(result))
+                if manual then notify({Title=action=="store" and "Guardar fruta" or "Soltar fruta",Text=(ok and "Resposta: " or "Falha: ")..tostring(result):sub(1,140)})end
+            end
+        end)
+        return gate
+    end
+    local function storeFruits(manual)
+        local all=inventoryFruits()
+        if #all==0 and manual then notify({Title="Frutas",Text="Nenhuma fruta física no inventário."})end
+        for _,fruit in ipairs(all)do transactFruit(fruit,"store",manual==true)end
     end
     button(Fruit,"Soltar frutas do inventário",function()
-        local _,_,root=character()
-        if not root then return end
-        for _,fruit in ipairs(fruits(LocalPlayer:FindFirstChildOfClass("Backpack"))) do
-            fruit.Parent=workspace
-            local handle=part(fruit);if handle then handle.CFrame=root.CFrame*CFrame.new(0,0,-4) end
+        -- Disable auto-storage before dropping so both actions cannot consume the same item.
+        if controls.FruitStore then controls.FruitStore.Set(false)end
+        local all=inventoryFruits()
+        if #all==0 then notify({Title="Frutas",Text="Nenhuma fruta física no inventário."})end
+        local token=requestToken()
+        for _,fruit in ipairs(all)do
+            if not validRequest(token)then break end
+            local transaction=transactFruit(fruit,"drop",true)
+            while transaction and transaction.Busy and validRequest(token)do task.wait(0.05)end
         end
     end)
     local function collectFruit()
         local target,best=nil,math.huge
-        for _,fruit in ipairs(fruits(workspace)) do local d=distance(fruit);if d<best then target,best=fruit,d end end
-        if target then move(part(target).CFrame,"FruitCollect") end
+        for _,fruit in ipairs(fruits(workspace))do local d=distance(fruit);if d<best then target,best=fruit,d end end
+        if target then move(part(target).CFrame,"FruitCollect")end
     end
-    addSection(Fruit,"Funções importadas")
-    button(Fruit,"Guardar frutas do inventário",storeFruits)
-    toggleJob(Fruit,"Auto guardar frutas","FruitStore",5,storeFruits)
+    addSection(Fruit,"Inventário e coleta")
+    button(Fruit,"Guardar frutas do inventário",function()storeFruits(true)end)
+    toggleJob(Fruit,"Auto guardar frutas","FruitStore",5,function()storeFruits(false)end)
     toggleJob(Fruit,"Ir até fruta caída","FruitCollect",0.5,collectFruit)
-    addLabel(Fruit,"A coleta ocorre por contato normal do personagem. O servidor decide se a fruta pode ser coletada/guardada.")
+
     local function hasTool(name)
         return path(LocalPlayer.Character,name) or path(LocalPlayer:FindFirstChildOfClass("Backpack"),name)
     end
@@ -43329,7 +43370,6 @@ local bring=initMissionBring()
     button(pageDojo,"Pedir missão Dojo Trainer",function() net("dojo.quest",5,"RF/InteractDragonQuest",{NPC="Dojo Trainer",Command="RequestQuest"}) end)
     button(pageDojo,"Ver missão Dragon Hunter",function() net("dragon.check",5,"RF/DragonHunter",{Context="Check"}) end)
     button(pageDojo,"Craft Volcanic Magnet",function() comm("dragon.craft",10,"CraftItem","Craft","Volcanic Magnet") end)
-    addLabel(pageDojo,"Farm: modos White Belt e Dragon Hunter. O botão pede a missão; progresso e requisitos são controlados pelo servidor.")
     local racePositions={Human=CFrame.new(29221.8223,14890.9756,-205.9911),Skypiea=CFrame.new(28960.1582,14919.624,235.0395),Fishman=CFrame.new(28231.1758,14890.9756,-211.6417),Cyborg=CFrame.new(28502.6816,14895.9756,-423.7279),Ghoul=CFrame.new(28674.2441,14890.6768,445.4311),Mink=CFrame.new(29012.3418,14890.9756,-380.1493)}
     addSection(pageRace,"Race V4")
     button(pageRace,"Topo da Great Tree",function() move(CFrame.new(3030.3945,2280.6172,-7320.1836),"Manual") end)
@@ -43373,7 +43413,6 @@ local bring=initMissionBring()
             if target then fight(target,"TrialPath") end
         end
     end)
-    addLabel(pageRace,"Trials: combate normal; não altera Health local nem confirma conclusão no servidor. Para PvP, escolha jogador e modo Player em Farm.")
     addSection(pageStatus,"Status do servidor")
     local statusLabel=addLabel(pageStatus,"Clique em Atualizar status.")
     local function status()
