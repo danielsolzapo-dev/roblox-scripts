@@ -40791,6 +40791,24 @@ local function initFastAttack()
         transport.LastTransport=leftClick and leftClick:IsA("RemoteEvent") and "left_click_remote_sent" or "remote_sent"
         return true,transport.LastTransport
     end
+    local observedTarget,observedHealth,observedAt
+    function api:DispatchTarget(owner,target)
+        local humanoid=target and target:FindFirstChildOfClass("Humanoid")
+        local hp=humanoid and humanoid.Health
+        if target~=observedTarget or hp~=observedHealth then
+            observedTarget=target;observedHealth=hp;observedAt=os.clock()
+        end
+        local sent,reason=self:AttackTarget(target)
+        -- FireServer succeeding only confirms dispatch, never server damage.
+        local stalled=sent and reason~="cooldown" and observedAt and os.clock()-observedAt>=2
+        if (not sent or stalled) and self.CombatFallback then
+            local fallback,method=self.CombatFallback(owner,target,stalled and "no_damage_observed" or reason)
+            if fallback then sent=true;reason=method end
+        end
+        transport.LastTransport=reason
+        transport.Health=hp;transport.NoDamageFor=observedAt and os.clock()-observedAt or nil
+        return sent,reason
+    end
     function api:AttackNearest()
         if self.EquipSelected then self.EquipSelected() end
         local c=LocalPlayer.Character
@@ -40811,7 +40829,8 @@ local function initFastAttack()
         end
         if self.attackMobs then gather(workspace:FindFirstChild("Enemies") or workspace:FindFirstChild("Hostiles")) end
         if self.attackPlayers then gather(workspace:FindFirstChild("Characters")) end
-        if best then return self:AttackTarget(best) end
+        if best then return self:DispatchTarget("Manual",best) end
+        transport.LastTransport="no_target_observed"
     end
     function api:CanAttack()
         local c=LocalPlayer.Character
@@ -40845,12 +40864,7 @@ local function initFastAttack()
                 local ok,err=pcall(function()
                     if combat then
                         if combat.Target then
-                            local sent,reason=api:AttackTarget(combat.Target)
-                            if not sent and api.CombatFallback then
-                                local fallback,method=api.CombatFallback(combat.Owner,combat.Target,reason)
-                                if fallback then sent=true;transport.LastTransport=method end
-                            end
-                            if not sent then transport.LastTransport=reason end
+                            api:DispatchTarget(combat.Owner,combat.Target)
                         else transport.LastTransport="paused_for_skills" end
                     else api:AttackNearest() end
                 end)
@@ -43429,8 +43443,8 @@ local bring=initMissionBring()
     local previousFarmStop=onJobStop.Farm
     onJobStop.Farm=function()previousFarmStop();releaseLevelSupport()end
     fastAttackApi.CombatFallback=function(owner,target,reason)
-        if not ((owner=="Farm" and options.Mode=="Level" and flags.Farm) or (owner=="FirstSea" and flags.FirstSea)or(owner=="DropFarm"and flags.DropFarm)or(owner=="MaterialGoal"and flags.MaterialGoal)) or os.clock()<manualUntil then return false end
-        if reason~="remotes_unavailable" and reason~="remote_failed"then return false end
+        if not ((owner=="Manual" and fastAttackApi.ManualEnabled) or (owner=="Farm" and flags.Farm) or (owner=="FirstSea" and flags.FirstSea)or(owner=="DropFarm"and flags.DropFarm)or(owner=="MaterialGoal"and flags.MaterialGoal)) or os.clock()<manualUntil then return false end
+        if reason~="remotes_unavailable" and reason~="remote_failed" and reason~="no_damage_observed"then return false end
         local c=LocalPlayer.Character;local tool=c and c:FindFirstChildOfClass("Tool")
         if not tool or distance(target)>fastAttackApi.Distance then return false end
         local activated=pcall(function()tool:Activate()end)
