@@ -946,12 +946,13 @@ local function initImportedFeatures()
         return active and not destroyed and token.Session==requestSession
             and (not token.Owner or generations[token.Owner.Name]==token.Owner.Generation)
     end
-    local moveTween, moveRoot, moveTarget, moveOwner
+    local moveRoot, moveTarget, moveOwner
+    local stopMove
+    local movementPauseUntil=0
     local heldKeys = {}
     local motionState
     local fixedCombatTarget, fixedCombatPoint, fixedCombatOffset
     local collisionState = {}
-    local moveVersion=0
     local function restoreCollisions()
         for object,value in pairs(collisionState) do if object.Parent then object.CanCollide=value end end
         table.clear(collisionState)
@@ -1013,6 +1014,11 @@ local function initImportedFeatures()
         return true, "requested"
     end
     local function comm(key, spacing, ...)
+        local action=select(1,...)
+        if action=="requestEntrance" or action=="TravelMain" or action=="TravelDressrosa" or action=="TravelZou" then
+            stopMove();fixedCombatTarget=nil;fixedCombatPoint=nil;fixedCombatOffset=nil
+            movementPauseUntil=os.clock()+0.5
+        end
         return command(key, spacing, path(RS,"Remotes","CommF_"), ...)
     end
     local function commSequence(key, spacing, calls)
@@ -1039,6 +1045,9 @@ local function initImportedFeatures()
     local function net(key, spacing, name, ...)
         return command(key, spacing, path(RS,"Modules","Net",name) or path(RS,"Packages","Net",name), ...)
     end
+    -- One physics controller for travel and holding. No HRP Tween/CFrame animation.
+    local movementPhase="idle"
+    local movementRebases=0
     local function releaseMotion()
         local previous=motionState
         motionState=nil
@@ -1046,124 +1055,100 @@ local function initImportedFeatures()
         if previous.Died then previous.Died:Disconnect() end
         for i=#(previous.Owned or {}),1,-1 do previous.Owned[i]:Destroy() end
         if previous.Root.Parent then
-            previous.Root.Anchored=previous.Anchored
+            -- This controller never writes Anchored, so it cannot undo game-owned changes.
             previous.Root.AssemblyLinearVelocity=Vector3.new(0,0,0)
             previous.Root.AssemblyAngularVelocity=Vector3.new(0,0,0)
         end
         if previous.Humanoid.Parent then previous.Humanoid.AutoRotate=previous.AutoRotate end
     end
-    local function stopMove(owner)
-        if owner and moveOwner ~= owner then return end
-        moveVersion=moveVersion+1
-        if moveTween then moveTween:Cancel() end
-        restoreCollisions()
-        releaseMotion()
-        moveTween,moveRoot,moveTarget,moveOwner=nil,nil,nil,nil
+    stopMove=function(owner)
+        if owner and moveOwner~=owner then return end
+        restoreCollisions();releaseMotion()
+        moveRoot,moveTarget,moveOwner=nil,nil,nil
+        movementPhase="idle"
     end
-    local function suspendMotion(root,humanoid)
-        motionState={Root=root,Humanoid=humanoid,Anchored=root.Anchored,AutoRotate=humanoid.AutoRotate}
-        motionState.Died=humanoid.Died:Connect(function()
+    local function acquireMotion(root,humanoid)
+        local lease={Root=root,Humanoid=humanoid,AutoRotate=humanoid.AutoRotate,Owned={},Holding=false,Goal=root.CFrame}
+        motionState=lease
+        local function own(class,name)
+            local object=Instance.new(class)
+            lease.Owned[#lease.Owned+1]=object
+            object.Name=name;object.Parent=root
+            return object
+        end
+        local attachment=own("Attachment","_XerecaFarmHoldAttachment")
+        local position=own("AlignPosition","_XerecaFarmHoldPosition")
+        position.Mode=Enum.PositionAlignmentMode.OneAttachment
+        position.Attachment0=attachment
+        position.ApplyAtCenterOfMass=true
+        position.RigidityEnabled=false
+        position.MaxForce=100000000
+        position.MaxVelocity=options.Speed
+        position.Responsiveness=100
+        position.Position=root.Position
+        local orientation=own("AlignOrientation","_XerecaFarmHoldOrientation")
+        orientation.Mode=Enum.OrientationAlignmentMode.OneAttachment
+        orientation.Attachment0=attachment
+        orientation.RigidityEnabled=false
+        orientation.MaxTorque=100000000
+        orientation.MaxAngularVelocity=50
+        orientation.Responsiveness=100
+        orientation.CFrame=root.CFrame-root.Position
+        lease.PositionHold=position;lease.OrientationHold=orientation
+        lease.Died=humanoid.Died:Connect(function()
             stopMove();fixedCombatTarget=nil;fixedCombatPoint=nil;fixedCombatOffset=nil
         end)
-        humanoid.Sit=false
-        humanoid.AutoRotate=false
-        root.Anchored=true
+        humanoid.Sit=false;humanoid.AutoRotate=false
         root.AssemblyLinearVelocity=Vector3.new(0,0,0)
         root.AssemblyAngularVelocity=Vector3.new(0,0,0)
     end
     local function holdFarmPosition(target)
         local lease=motionState
-        if not lease or not lease.Root.Parent then return end
-        if not lease.Holding then
-            lease.Owned={}
-            local function own(class,name)
-                local object=Instance.new(class)
-                lease.Owned[#lease.Owned+1]=object
-                object.Name=name;object.Parent=lease.Root
-                return object
-            end
-            local attachment=own("Attachment","_XerecaFarmHoldAttachment")
-            local position=own("AlignPosition","_XerecaFarmHoldPosition")
-            position.Mode=Enum.PositionAlignmentMode.OneAttachment
-            position.Attachment0=attachment
-            position.ApplyAtCenterOfMass=true
-            position.RigidityEnabled=false
-            position.MaxForce=100000000
-            position.MaxVelocity=100
-            position.Responsiveness=100
-            position.Position=target.Position
-            local orientation=own("AlignOrientation","_XerecaFarmHoldOrientation")
-            orientation.Mode=Enum.OrientationAlignmentMode.OneAttachment
-            orientation.Attachment0=attachment
-            orientation.RigidityEnabled=false
-            orientation.MaxTorque=100000000
-            orientation.MaxAngularVelocity=50
-            orientation.Responsiveness=100
-            orientation.CFrame=target-target.Position
-            lease.PositionHold=position;lease.OrientationHold=orientation
-            lease.Holding=true
-        end
+        if not lease then return end
+        lease.Holding=true;lease.Goal=target
         lease.PositionHold.Position=target.Position
+        lease.PositionHold.MaxVelocity=100
         lease.OrientationHold.CFrame=target-target.Position
-        -- Anchoring is only temporary during travel. Combat uses world-space forces.
-        -- Preserve a root that the game had already anchored before our movement.
-        lease.Root.Anchored=lease.Anchored
-        lease.Root.AssemblyLinearVelocity=Vector3.new(0,0,0)
-        lease.Root.AssemblyAngularVelocity=Vector3.new(0,0,0)
+        movementPhase="holding"
     end
-    local function move(target, owner)
+    local function cancelAutoMovement()
+        for name in pairs(movementJobs) do if flags[name] and controls[name] then controls[name].Set(false) end end
+        stopMove();fixedCombatTarget=nil;fixedCombatPoint=nil;fixedCombatOffset=nil
+    end
+    local function move(target,owner)
+        if not active or destroyed or typeof(target)~="CFrame" then return end
+        if os.clock()<movementPauseUntil then return end
         if owner=="Manual" then
             for name in pairs(movementJobs) do if flags[name] and controls[name] then controls[name].Set(false) end end
         end
         local _,h,root=character()
-        if not root or typeof(target) ~= "CFrame" then return end
-        if moveRoot==root and moveOwner==owner and moveTarget and motionState
-            and (moveTarget.Position-target.Position).Magnitude<0.5 then
-            -- Reuse the completed world's fixed hold without re-anchoring the root.
-            -- Reacquiring an identical destination every farm tick interrupts attacks.
-            if owner=="Farm" or (moveTween and moveTween.PlaybackState==Enum.PlaybackState.Playing) then return end
+        if not root then return end
+        if moveRoot==root and moveOwner==owner and motionState then
+            if moveTarget and (moveTarget.Position-target.Position).Magnitude<0.5 then return end
+            -- Retarget the same controller from the actual current position, never an old start.
+            moveTarget=target;motionState.Holding=false;motionState.Goal=root.CFrame
+        else
+            stopMove()
+            moveRoot,moveTarget,moveOwner=root,target,owner
+            acquireMotion(root,h)
         end
-        stopMove()
-        moveOwner,moveRoot,moveTarget=owner,root,target
-        suspendMotion(root,h)
-        local delta=(root.Position-target.Position).Magnitude
-        if delta<0.1 then
-            if owner=="Farm" then holdFarmPosition(target) else releaseMotion() end
-            return
+        movementPhase="travelling"
+        if (root.Position-target.Position).Magnitude<=0.75 then
+            if owner=="Farm" then holdFarmPosition(target) else stopMove(owner) end
         end
-        moveTween=TweenService:Create(root,TweenInfo.new(math.max(0.1,delta/options.Speed),Enum.EasingStyle.Linear),{CFrame=target})
-        local version=moveVersion
-        moveTween.Completed:Once(function(playback)
-            if moveVersion~=version then return end
-            if playback==Enum.PlaybackState.Completed and owner=="Farm" then
-                root.CFrame=target
-                holdFarmPosition(target)
-            else
-                restoreCollisions()
-                releaseMotion()
-            end
-        end)
-        moveTween:Play()
     end
     local function setTweenSpeed(value)
         if syncingSpeed or not active or destroyed then return end
         if type(value)~="number" or value~=value or value==math.huge or value==-math.huge then return end
         local speed=math.clamp(math.floor(value/5+0.5)*5,10,500)
-        local changed=options.Speed~=speed
         options.Speed=speed
         syncingSpeed=true
-        for _,slider in ipairs(speedSliders) do
-            if slider.Get()~=speed then slider.Set(speed) end
-        end
+        for _,slider in ipairs(speedSliders) do if slider.Get()~=speed then slider.Set(speed) end end
         syncingSpeed=false
-        if changed then
-            debugLog("INFO","tween.speed",tostring(speed).." studs/s")
-            if moveTween and moveTween.PlaybackState==Enum.PlaybackState.Playing then
-                local destination,owner,previousRoot=moveTarget,moveOwner,moveRoot
-                stopMove()
-                local _,_,root=character()
-                if root==previousRoot and destination then move(destination,owner) end
-            end
+        if motionState and not motionState.Holding then
+            motionState.PositionHold.MaxVelocity=speed
+            motionState.Goal=motionState.Root.CFrame
+            motionState.PositionHold.Position=motionState.Root.Position
         end
     end
     local function speedSlider(page)
@@ -1172,19 +1157,30 @@ local function initImportedFeatures()
         speedSliders[#speedSliders+1]=slider
         return slider
     end
+    local function syncActualPosition(lease,root)
+        if root.Anchored then movementPhase="game_anchored";return false end
+        local maxLead=math.max(2,options.Speed*0.1)
+        if lease.Holding then
+            if (root.Position-moveTarget.Position).Magnitude>math.max(30,math.min(60,options.Speed*0.25)) then
+                stopMove();fixedCombatTarget=nil;fixedCombatPoint=nil;fixedCombatOffset=nil
+                movementPauseUntil=os.clock()+0.5;movementRebases=movementRebases+1
+                movementPhase="repositioned"
+                debugLog("WARN","movement.repositioned","old fixed hold released; next route starts at current position")
+                return false
+            end
+        elseif (lease.Goal.Position-root.Position).Magnitude>maxLead*2+5 then
+            lease.Goal=root.CFrame;lease.PositionHold.Position=root.Position
+            movementRebases=movementRebases+1
+            debugLog("INFO","movement.rebase","path resumed from actual character position")
+        end
+        return true
+    end
+    -- Collision changes happen before physics; the goal advances after physics.
     bind(RunService.Stepped,function()
         if not motionState then return end
         local c,h,root=character()
         if not active or destroyed or root~=motionState.Root or h~=motionState.Humanoid then stopMove();return end
-        if motionState.Holding then
-            -- Do not force Anchored=true or overwrite CFrame while fighting.
-            -- Constraints hold a world point and are independent of platforms/NPC falls.
-            root.Anchored=motionState.Anchored
-        else
-            root.Anchored=true
-            root.AssemblyLinearVelocity=Vector3.new(0,0,0)
-            root.AssemblyAngularVelocity=Vector3.new(0,0,0)
-        end
+        if not moveTarget or not syncActualPosition(motionState,root) then return end
         for _,object in ipairs(c:GetDescendants()) do
             if object:IsA("BasePart") then
                 if collisionState[object]==nil then collisionState[object]=object.CanCollide end
@@ -1192,6 +1188,30 @@ local function initImportedFeatures()
             end
         end
     end,"features.movement.physics")
+    bind(RunService.Heartbeat,function(deltaTime)
+        local lease=motionState
+        if not lease then return end
+        local _,h,root=character()
+        if not active or destroyed or root~=lease.Root or h~=lease.Humanoid or not moveTarget then stopMove();return end
+        if not syncActualPosition(lease,root) or lease.Holding then return end
+        local dt=tonumber(deltaTime)
+        if not dt or dt~=dt or dt<=0 then return end
+        dt=math.min(dt,0.1)
+        if (root.Position-moveTarget.Position).Magnitude<=0.75 then
+            if moveOwner=="Farm" then holdFarmPosition(moveTarget) else stopMove(moveOwner) end
+            return
+        end
+        local maxLead=math.max(2,options.Speed*0.1)
+        local lead=(lease.Goal.Position-root.Position).Magnitude
+        local remaining=(moveTarget.Position-lease.Goal.Position).Magnitude
+        local step=math.min(options.Speed*dt,math.max(0,maxLead-lead),remaining)
+        if remaining>0 and step>0 then lease.Goal=lease.Goal:Lerp(moveTarget,step/remaining) end
+        lease.PositionHold.Position=lease.Goal.Position
+        lease.PositionHold.MaxVelocity=options.Speed
+        lease.OrientationHold.CFrame=lease.Goal-lease.Goal.Position
+        movementPhase="travelling"
+    end,"features.movement.path")
+
     local function stopJob(name)
         fastAttackApi:ReleaseCombat(name)
         generations[name]=(generations[name] or 0)+1
@@ -2742,6 +2762,7 @@ local bring=initMissionBring()
             local titleObject=path(questGui,"Container","QuestTitle","Title")
             local title=titleObject and titleObject:IsA("TextLabel") and titleObject.Text or ""
             if q.Entrance and q.Quest and (root.Position-q.Quest.Position).Magnitude>10000 then
+                stopMove("Farm");fixedCombatTarget=nil;fixedCombatPoint=nil;fixedCombatOffset=nil
                 farmProgress("requesting_entrance",q.Mob,nil,CFrame.new(q.Entrance),title)
                 comm("entrance",5,"requestEntrance",q.Entrance);return
             end
@@ -3051,9 +3072,9 @@ local bring=initMissionBring()
     dropdown(pageTP,"Ilha (confira o mar)",islandNames(),selectedIsland,function(v) selectedIsland=v end)
     button(pageTP,"Ir à ilha selecionada",function()
         local data=islandData[selectedIsland]
-        if data.Entrance then comm("entrance",3,"requestEntrance",data.Target.Position) else move(data.Target,"Manual") end
+        if data.Entrance then cancelAutoMovement();comm("entrance",3,"requestEntrance",data.Target.Position) else move(data.Target,"Manual") end
     end)
-    for _,sea in ipairs({{"Primeiro mar","TravelMain"},{"Segundo mar","TravelDressrosa"},{"Terceiro mar","TravelZou"}}) do button(pageTP,sea[1],function() comm("travel",5,sea[2]) end) end
+    for _,sea in ipairs({{"Primeiro mar","TravelMain"},{"Segundo mar","TravelDressrosa"},{"Terceiro mar","TravelZou"}}) do button(pageTP,sea[1],function() cancelAutoMovement();comm("travel",5,sea[2]) end) end
     speedSlider(pageTP)
     local npcSelection=""
     local function npcNames()
@@ -3169,7 +3190,7 @@ local bring=initMissionBring()
     local racePositions={Human=CFrame.new(29221.8223,14890.9756,-205.9911),Skypiea=CFrame.new(28960.1582,14919.624,235.0395),Fishman=CFrame.new(28231.1758,14890.9756,-211.6417),Cyborg=CFrame.new(28502.6816,14895.9756,-423.7279),Ghoul=CFrame.new(28674.2441,14890.6768,445.4311),Mink=CFrame.new(29012.3418,14890.9756,-380.1493)}
     addSection(pageRace,"Race V4")
     button(pageRace,"Topo da Great Tree",function() move(CFrame.new(3030.3945,2280.6172,-7320.1836),"Manual") end)
-    button(pageRace,"Temple of Time",function() comm("entrance",3,"requestEntrance",Vector3.new(28286.3555,14895.3018,102.6247)) end)
+    button(pageRace,"Temple of Time",function() cancelAutoMovement();comm("entrance",3,"requestEntrance",Vector3.new(28286.3555,14895.3018,102.6247)) end)
     button(pageRace,"Alavanca",function() move(CFrame.new(28575.1816,14936.6279,72.3164),"Manual") end)
     button(pageRace,"Ancient Clock",function() move(CFrame.new(29553.7812,15066.6133,-88.275),"Manual") end)
     button(pageRace,"Porta da minha raça",function()
@@ -3261,7 +3282,7 @@ local bring=initMissionBring()
     report("startup",supported and "target game detected" or "UI available; target game unavailable")
     return {StopAll=stopAll,GetState=function()
         local running={};for name in pairs(jobs) do running[#running+1]=name end;table.sort(running)
-        return {Active=active,SupportedGame=supported,Mode=options.Mode,Attack=table.clone(attackState),TweenSpeed=options.Speed,Bring=bring.GetState(),Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),FastAttack=fastAttackApi:GetState(),QuestRuntime=questRuntime.GetState(),Preload=preload.GetState(),Movement={Owner=moveOwner,Suspended=motionState~=nil,Holding=motionState and motionState.Holding==true or false,Anchored=moveRoot and moveRoot.Anchored or false,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
+        return {Active=active,SupportedGame=supported,Mode=options.Mode,Attack=table.clone(attackState),TweenSpeed=options.Speed,Bring=bring.GetState(),Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),FastAttack=fastAttackApi:GetState(),QuestRuntime=questRuntime.GetState(),Preload=preload.GetState(),Movement={Backend="physics_path",Phase=movementPhase,Rebases=movementRebases,Owner=moveOwner,Suspended=motionState~=nil,Holding=motionState and motionState.Holding==true or false,Anchored=moveRoot and moveRoot.Anchored or false,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
     end}
 end
 
@@ -3347,7 +3368,7 @@ local function debugReportText()
         "Arma: "..tostring(attack.Tool).." | distância: "..tostring(attack.Distance).." | tentativas: "..tostring(attack.Attempts),
         "Vida do alvo: "..tostring(attack.Health).." / "..tostring(attack.MaxHealth).." | última queda de vida: "..(attack.LastDamageAt and string.format("há %.1fs",os.clock()-attack.LastDamageAt) or "não observada"),
         "Soltar clique: "..tostring(attack.InputRelease).." | alternativa: "..tostring(attack.InputFallback),
-        "Movimento: "..tostring(movement.Owner).." | fixo: "..tostring(movement.Holding).." | ancorado: "..tostring(movement.Anchored),
+        "Movimento: "..tostring(movement.Owner).." | fase: "..tostring(movement.Phase).." | recálculos: "..tostring(movement.Rebases).." | fixo: "..tostring(movement.Holding).." | ancorado: "..tostring(movement.Anchored),
         "BRING: "..tostring(snapshot.Bring and snapshot.Bring.Phase).." | grupo: "..tostring(snapshot.Bring and snapshot.Bring.Grouped),
         "Preload: "..tostring(snapshot.Preload and snapshot.Preload.Rows).." registros | mar: "..tostring(snapshot.Preload and snapshot.Preload.Sea),
         "Missão: "..tostring(farm.QuestSource).." | spawn: "..tostring(farm.SpawnSource),
