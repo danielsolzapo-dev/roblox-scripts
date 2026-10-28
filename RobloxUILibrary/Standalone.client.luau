@@ -43147,7 +43147,7 @@ local bring=initMissionBring()
         else releaseLevelSupport()end
         if levelToggle and levelToggle.Get()~=levelOn then syncingLevel=true;levelToggle.Set(levelOn);syncingLevel=false end
     end
-    levelToggle=addToggle(Farm,"Auto farm de level (Haki + ataque)",false,function(on)
+    levelToggle=addToggle(Farm,"Level Farm",false,function(on)
         if syncingLevel then return end
         if on then modeControl.Set("Level");farmControl.Set(true)
         elseif flags.Farm and options.Mode=="Level"then farmControl.Set(false)end
