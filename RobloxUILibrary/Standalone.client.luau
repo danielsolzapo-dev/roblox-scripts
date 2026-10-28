@@ -40834,12 +40834,13 @@ local function initFastAttack()
         if not extras and self.GetCombatTargets then extras=self.GetCombatTargets(owner,target)end
         local sent,remoteReason=false,"disabled_by_method"
         if method=="Auto"or method=="Matsune Click"then sent,remoteReason=self:AttackTarget(target,extras)end
-        transport.Target=target.Name;transport.Method=method
+        transport.Target=target.Name;transport.Method=method;transport.Tool=tool.Name
+        transport.Distance=(root.Position-point.Position).Magnitude;transport.LastCycleAt=os.clock()
         transport.Input=inputReason;transport.Remote=remoteReason
         transport.Health=hp;transport.NoDamageFor=os.clock()-observedAt
         transport.DamageObserved=transport.NoDamageFor==0 and hp< (transport.PreviousHealth or hp) and transport.PreviousTarget==target
         transport.PreviousHealth=hp;transport.PreviousTarget=target
-        transport.DamageStatus=transport.NoDamageFor>=2 and "sem queda de vida observada; confira arma, alcance e altura"or "observando vida do alvo"
+        transport.DamageStatus=transport.NoDamageFor>=2 and (sent and "remote enviado sem queda de vida observada; envio não confirma dano"or "sem queda de vida observada; remote: "..tostring(remoteReason))or "observando vida do alvo"
         transport.LastTransport=sent and remoteReason or clicked and "normal_click_sent"or method=="Matsune Click"and remoteReason or inputReason
         return sent or clicked,transport.LastTransport
     end
@@ -40872,7 +40873,8 @@ local function initFastAttack()
             local extras={};for i=1,math.min(20,#candidates)do extras[#extras+1]=candidates[i].Model end
             return self:DispatchTarget("Manual",best,extras)
         end
-        transport.LastTransport="no_target_observed"
+        transport.LastTransport="no_target_observed";transport.Target=nil;transport.Health=nil;transport.Distance=nil
+        transport.DamageStatus="nenhum alvo atual observado"
     end
     function api:CanAttack()
         local c=LocalPlayer.Character
@@ -40948,6 +40950,11 @@ local function initFastAttack()
     function api:GetState()
         local result=table.clone(transport)
         result.PreviousTarget=nil
+        result.Age=result.LastCycleAt and os.clock()-result.LastCycleAt or nil
+        if not self.Running then
+            result.Target=nil;result.Health=nil;result.Distance=nil;result.Tool=nil
+            result.DamageStatus="ataque parado; registros anteriores não indicam atividade atual"
+        end
         result.Running=self.Running;result.ManualEnabled=self.ManualEnabled
         return result
     end
@@ -43490,7 +43497,7 @@ local bring=initMissionBring()
         end
         return extras
     end
-    fastAttackApi.GetMethod=function(owner) return owner=="Manual" and "Matsune Click" or attackState.Method end
+    fastAttackApi.GetMethod=function(owner) return attackState.Method end
     do
         local toolLease
         local function releaseTool()
@@ -43938,10 +43945,18 @@ local bring=initMissionBring()
             fogOriginal=nil
         end
     end
-    do
+    local waterWalk=(function()
         local platform,waterPart,watchedHumanoid,deathConnection
         local nextWaterLookup=0
+        local status={Phase="desligado",Enabled=false}
+        local lift,attachment,liftStarted,liftTimedOut
+        local function releaseLift()
+            if lift then lift:Destroy();lift=nil end
+            if attachment then attachment:Destroy();attachment=nil end
+            liftStarted=nil
+        end
         local function removePlatform()
+            releaseLift()
             if platform then platform:Destroy();platform=nil end
         end
         local function clear()
@@ -43969,28 +43984,35 @@ local bring=initMissionBring()
             params.FilterDescendantsInstances=platform and {c,platform}or {c}
             params.IgnoreWater=false
             local result=workspace:Raycast(root.Position+Vector3.new(0,8,0),Vector3.new(0,-256,0),params)
-            if result and (result.Material==Enum.Material.Water or waterName(result.Instance))then return result.Position.Y end
+            status.Probe=result and (result.Instance and result.Instance.Name or tostring(result.Material))or "nenhum objeto"
+            if result and (result.Material==Enum.Material.Water or waterName(result.Instance))then status.Source="raycast";return result.Position.Y end
             -- Some maps use a named water plane with CanQuery disabled.
             local water=knownWater()
             if water then
                 local p=water.CFrame:PointToObjectSpace(root.Position)
                 if math.abs(p.X)<=water.Size.X/2 and math.abs(p.Z)<=water.Size.Z/2 then
                     local y=water.Position.Y+water.Size.Y/2
-                    if y<=root.Position.Y+8 and (not result or result.Position.Y<y-0.05)then return y end
+                    if y<=root.Position.Y+8 and (not result or result.Position.Y<y-0.05)then status.Source="plano "..water.Name;return y end
                 end
             end
         end
         controls.WalkWater=addToggle(pagePlayer,"Andar sobre a água",false,function(on)
-            flags.WalkWater=on;nextWaterLookup=0
+            flags.WalkWater=on;nextWaterLookup=0;liftTimedOut=nil
+            status.Enabled=on;status.Phase=on and "aguardando água"or "desligado"
             if not on then clear()end
         end)
-        bind(RunService.Stepped,function()
+        local function step()
             if not active or destroyed or not flags.WalkWater then return end
             local c,h,root=character()
-            if not root or h.Sit or motionState then removePlatform();return end
+            if not root then status.Phase="aguardando personagem";removePlatform();return end
+            if h.Sit or motionState or root.Anchored then
+                status.Phase=h.Sit and "sentado"or motionState and "suspenso pelo movimento automático"or "personagem ancorado pelo jogo"
+                removePlatform();return
+            end
             if watchedHumanoid~=h then
                 clear();watchedHumanoid=h;deathConnection=h.Died:Connect(removePlatform)
             end
+            status.Source=nil;status.WaterY=nil;status.FeetY=nil
             local waterY=surface(root,c)
             local height=math.max(0,h.HipHeight or 0)+root.Size.Y/2
             if h.RigType==Enum.HumanoidRigType.R6 then
@@ -43998,7 +44020,12 @@ local bring=initMissionBring()
                 height=height+(leg and leg.Size.Y or 2)
             end
             local feet=root.Position.Y-height
-            if not waterY or feet<waterY-1.5 or feet>waterY+12 then removePlatform();return end
+            status.WaterY=waterY;status.FeetY=feet;status.RootY=root.Position.Y
+            if not waterY then status.Phase="água não detectada";removePlatform();return end
+            if root.Position.Y<waterY-4 or feet>waterY+12 then
+                status.Phase="fora da faixa próxima à superfície";removePlatform();return
+            end
+            if liftTimedOut then status.Phase="subida sem progresso; desligue e ligue para tentar novamente";removePlatform();return end
             if not platform then
                 platform=Instance.new("Part")
                 platform.Name="_XerecaWaterWalk"
@@ -44009,10 +44036,41 @@ local bring=initMissionBring()
             end
             -- Fixed at the detected water level: jumping cannot raise the platform.
             platform.CFrame=CFrame.new(root.Position.X,waterY-0.25,root.Position.Z)
+            status.Phase="apoio na superfície"
+            if feet<waterY-0.5 or lift then
+                if feet>=waterY+0.1 then releaseLift()
+                else
+                    if not lift then
+                        attachment=Instance.new("Attachment");attachment.Name="_XerecaWaterLiftAttachment";attachment.Parent=root
+                        lift=Instance.new("AlignPosition");lift.Name="_XerecaWaterLiftPosition"
+                        lift.Mode=Enum.PositionAlignmentMode.OneAttachment;lift.Attachment0=attachment
+                        lift.ApplyAtCenterOfMass=true;lift.RigidityEnabled=false
+                        lift.ForceLimitMode=Enum.ForceLimitMode.PerAxis;lift.ForceRelativeTo=Enum.ActuatorRelativeTo.World
+                        lift.MaxAxesForce=Vector3.new(0,50000,0);lift.MaxVelocity=6;lift.Responsiveness=25
+                        lift.Position=Vector3.new(root.Position.X,waterY+height+0.25,root.Position.Z);lift.Parent=root
+                        liftStarted=os.clock();h:ChangeState(Enum.HumanoidStateType.Jumping)
+                    end
+                    lift.Position=Vector3.new(root.Position.X,waterY+height+0.25,root.Position.Z)
+                    status.Phase="subindo até a superfície"
+                    if os.clock()-liftStarted>5 then liftTimedOut=true;removePlatform();status.Phase="subida sem progresso"end
+                end
+            end
+        end
+        bind(RunService.Stepped,function()
+            local ok,err=pcall(step)
+            if not ok then
+                removePlatform();status.Phase="erro";status.Error=tostring(err):sub(1,180)
+                if status.Error~=status.LastLoggedError then debugLog("ERROR","walk_water",status.Error);status.LastLoggedError=status.Error end
+            end
         end,"player.walk_water")
         bind(LocalPlayer.CharacterRemoving,clear,"player.walk_water.respawn")
         table.insert(cleanupFns,clear)
-    end
+        return {GetState=function()
+            local copy=table.clone(status);copy.LastLoggedError=nil
+            copy.Enabled=flags.WalkWater==true;copy.Platform=platform~=nil and platform.Parent~=nil
+            copy.Lifting=lift~=nil;return copy
+        end}
+    end)()
 
     -- Scoped adaptations of Kaitun GetSaber/UnlockSecondSea and Matsune map stages.
     local firstSeaState={Phase="off",Goal="Saber"}
@@ -44450,7 +44508,7 @@ local bring=initMissionBring()
     report("startup",supported and "target game detected" or "UI available; target game unavailable")
     return {GetCompatibility=compatibility.Get,CheckCompatibility=compatibility.Read,GetStopSummary=stopLedger.Get,IsLightMode=function()return options.LightMode end,SetLightMode=function(v)options.LightMode=v==true end,StopAll=stopAll,ResetProgress=progressTracker.Reset,GetState=function()
         local running={};for name in pairs(jobs) do running[#running+1]=name end;table.sort(running)
-        return {Stops=stopLedger.Get(),Compatibility=compatibility.Get(),Extra=table.clone(extraState),Webhook=hubWebhook.GetState(),Sea=seaIndex(),Active=active,SupportedGame=supported,Mode=options.Mode,AutoEquip=options.AutoEquip,Progress=progressTracker.GetState(),Attack=table.clone(attackState),TweenSpeed=options.Speed,Bring=bring.GetState(),Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),FastAttack=fastAttackApi:GetState(),FirstSea=table.clone(firstSeaState),LevelFarm=table.clone(levelState),QuestRuntime=questRuntime.GetState(),Preload=preload.GetState(),Movement={Distance=moveRoot and moveTarget and (moveRoot.Position-moveTarget.Position).Magnitude or 0,ActualSpeed=actualSpeed,Backend="physics_path",Phase=movementPhase,Rebases=movementRebases,Owner=moveOwner,Suspended=motionState~=nil,Holding=motionState and motionState.Holding==true or false,Anchored=moveRoot and moveRoot.Anchored or false,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
+        return {WaterWalk=waterWalk.GetState(),Stops=stopLedger.Get(),Compatibility=compatibility.Get(),Extra=table.clone(extraState),Webhook=hubWebhook.GetState(),Sea=seaIndex(),Active=active,SupportedGame=supported,Mode=options.Mode,AutoEquip=options.AutoEquip,Progress=progressTracker.GetState(),Attack=table.clone(attackState),TweenSpeed=options.Speed,Bring=bring.GetState(),Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),FastAttack=fastAttackApi:GetState(),FirstSea=table.clone(firstSeaState),LevelFarm=table.clone(levelState),QuestRuntime=questRuntime.GetState(),Preload=preload.GetState(),Movement={Distance=moveRoot and moveTarget and (moveRoot.Position-moveTarget.Position).Magnitude or 0,ActualSpeed=actualSpeed,Backend="physics_path",Phase=movementPhase,Rebases=movementRebases,Owner=moveOwner,Suspended=motionState~=nil,Holding=motionState and motionState.Holding==true or false,Anchored=moveRoot and moveRoot.Anchored or false,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
     end}
 end
 
@@ -44630,16 +44688,19 @@ local function debugReportText()
     local attack=snapshot.Attack or {}
     local movement=snapshot.Movement or {}
     local sharedAttack=snapshot.FastAttack or {}
+    local water=snapshot.WaterWalk or {}
     local rows={eventMonitor.Text():gsub("<[^>]*>",""),"", "XERECA HUB | diagnóstico local",
         "Farm: "..tostring(farm.Phase).." | alvo: "..tostring(farm.Target or farm.ExpectedMob),
         "Ataque: "..tostring(attack.Phase).." | método: "..tostring(attack.Method).." | transporte: "..tostring(attack.Transport).." | clique: "..tostring(attack.Input),
         "FastAttack compartilhado: "..tostring(sharedAttack.Running).." | manual: "..tostring(sharedAttack.ManualEnabled).." | controle: "..tostring(sharedAttack.Owner).." | envios: "..tostring(sharedAttack.Dispatches),
         "Ciclo M1: "..tostring(sharedAttack.Method).." | entrada: "..tostring(sharedAttack.Input).." | remote: "..tostring(sharedAttack.Remote),
         "Observação M1: "..tostring(sharedAttack.DamageStatus),
-        "Arma: "..tostring(attack.Tool).." | distância: "..tostring(attack.Distance).." | tentativas: "..tostring(attack.Attempts),
-        "Vida do alvo: "..tostring(attack.Health).." / "..tostring(attack.MaxHealth).." | última queda de vida: "..(attack.LastDamageAt and string.format("há %.1fs",os.clock()-attack.LastDamageAt) or "não observada"),
+        "Arma: "..tostring(sharedAttack.Tool).." | distância atual M1: "..tostring(sharedAttack.Distance).." | tentativas: "..tostring(attack.Attempts),
+        "Vida atual M1: "..tostring(sharedAttack.Health).." | alvo M1: "..tostring(sharedAttack.Target).." | última vida registrada pelo farm: "..tostring(attack.Health).." / "..tostring(attack.MaxHealth).." | última queda de vida: "..(attack.LastDamageAt and string.format("há %.1fs",os.clock()-attack.LastDamageAt) or "não observada"),
         "Soltar clique: "..tostring(attack.InputRelease).." | alternativa: "..tostring(attack.InputFallback),
         "Movimento: "..tostring(movement.Owner).." | fase: "..tostring(movement.Phase).." | recálculos: "..tostring(movement.Rebases).." | fixo: "..tostring(movement.Holding).." | ancorado: "..tostring(movement.Anchored),
+        "Água: "..tostring(water.Enabled).." | "..tostring(water.Phase).." | apoio: "..tostring(water.Platform).." | subida: "..tostring(water.Lifting),
+        "Detecção água: "..tostring(water.Source).." | raio: "..tostring(water.Probe).." | superfície Y: "..tostring(water.WaterY).." | pés Y: "..tostring(water.FeetY).." | erro: "..tostring(water.Error),
         "BRING: "..tostring(snapshot.Bring and snapshot.Bring.Phase).." | grupo: "..tostring(snapshot.Bring and snapshot.Bring.Grouped),
         "Preload: "..tostring(snapshot.Preload and snapshot.Preload.Rows).." registros | mar: "..tostring(snapshot.Preload and snapshot.Preload.Sea),
         "Missão: "..tostring(farm.QuestSource).." | spawn: "..tostring(farm.SpawnSource),
