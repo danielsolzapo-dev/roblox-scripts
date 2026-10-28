@@ -14,10 +14,11 @@ local debugControl, debugPanelControl, debugVisibility
 local debugHistory = {}
 local DEBUG_LIMIT = 100
 local function debugLog(level, event, detail)
-    if not debugEnabled then return end
+    if not debugEnabled and level~="WARN" and level~="ERROR" then return end
     local entry = {Time=os.clock(), Level=level, Event=event, Detail=tostring(detail or "")}
     if #debugHistory >= DEBUG_LIMIT then table.remove(debugHistory, 1) end
     debugHistory[#debugHistory + 1] = entry
+    if not debugEnabled then return end
     local message = "[UILib DEBUG][" .. level .. "][" .. event .. "] " .. entry.Detail
     if level == "ERROR" or level == "WARN" then warn(message) else print(message) end
 end
@@ -1000,6 +1001,8 @@ local function initImportedFeatures()
         return active and not destroyed and token.Session==requestSession
             and (not token.Owner or generations[token.Owner.Name]==token.Owner.Generation)
     end
+    local rejectedTargets=setmetatable({},{__mode="k"})
+    local manualUntil=0
     local moveRoot, moveTarget, moveOwner
     local stopMove
     local movementPauseUntil=0
@@ -1011,7 +1014,7 @@ local function initImportedFeatures()
         for object,value in pairs(collisionState) do if object.Parent then object.CanCollide=value end end
         table.clear(collisionState)
     end
-    local options = {Weapon="Melee", Mastery="Off", MasteryHealth=30, Speed=100, Offset=20, FixedFarm=true, AutoEquip=true,
+    local options = {Horizontal=4, PauseManual=false, LightMode=false, Recover=false, StallSeconds=30, Weapon="Melee", Mastery="Off", MasteryHealth=30, Speed=100, Offset=20, FixedFarm=true, AutoEquip=true,
         Boss="The Gorilla King", Mode="Off", Chip="Flame", Player="", SkillZ=true, SkillX=true, SkillC=true, SkillV=false, SkillF=false}
     local placeSeas={[2753915549]=1,[85211729168715]=1,[4442272183]=2,[79091703265657]=2,[7449423635]=3,[100117331123089]=3}
     local function seaIndex() return placeSeas[game.PlaceId] end
@@ -1100,6 +1103,8 @@ local function initImportedFeatures()
         return command(key, spacing, path(RS,"Modules","Net",name) or path(RS,"Packages","Net",name), ...)
     end
     -- One physics controller for travel and holding. No HRP Tween/CFrame animation.
+    local actualSpeed=0
+    local samplePosition,sampleRoot
     local movementPhase="idle"
     local movementRebases=0
     local function releaseMotion()
@@ -1244,8 +1249,10 @@ local function initImportedFeatures()
     end,"features.movement.physics")
     bind(RunService.Heartbeat,function(deltaTime)
         local lease=motionState
-        if not lease then return end
+        if not lease then actualSpeed=0;samplePosition=nil;sampleRoot=nil;return end
         local _,h,root=character()
+        if root and sampleRoot==root and samplePosition and tonumber(deltaTime) and deltaTime>0 then actualSpeed=(root.Position-samplePosition).Magnitude/deltaTime end
+        sampleRoot=root;samplePosition=root and root.Position
         if not active or destroyed or root~=lease.Root or h~=lease.Humanoid or not moveTarget then stopMove();return end
         if not syncActualPosition(lease,root) or lease.Holding then return end
         local dt=tonumber(deltaTime)
@@ -1298,7 +1305,7 @@ local function initImportedFeatures()
                     end
                 else errors=0 end
                 if not active or destroyed or generations[name]~=generation then break end
-                task.wait(interval)
+                task.wait(name=="ESP" and options.LightMode and math.max(interval,3) or interval)
             end
             if generations[name]==generation then jobs[name]=nil; stopMove(name) end
         end)
@@ -1375,7 +1382,7 @@ local function initImportedFeatures()
         local best,metric=nil,math.huge
         if folder then for _,object in ipairs(folder:GetDescendants()) do
             local hp=health(object)
-            if part(object) and hp>0 and (not predicate or predicate(object)) then
+            if (not rejectedTargets[object] or os.clock()>=rejectedTargets[object]) and part(object) and hp>0 and (not predicate or predicate(object)) then
                 local d=distance(object)
                 if d<metric then best,metric=object,d end
             end
@@ -1395,7 +1402,7 @@ local function initImportedFeatures()
     end
     local function retainedFarmTarget(folder,names)
         local target=fixedCombatTarget
-        if not options.FixedFarm or not target or not folder or not target:IsDescendantOf(folder) or health(target)<=0 or not part(target) then return nil end
+        if (target and rejectedTargets[target] and os.clock()<rejectedTargets[target]) or not options.FixedFarm or not target or not folder or not target:IsDescendantOf(folder) or health(target)<=0 or not part(target) then return nil end
         if names then
             for _,name in ipairs(names) do if cleanName(target.Name)==cleanName(name) then return target end end
             return nil
@@ -1546,12 +1553,12 @@ progressTracker=initProgressTracker()
         local root=part(target)
         local hp,maxHP=health(target)
         if not root or hp<=0 then fastAttackApi:ReleaseCombat(owner);return end
-        local destination=root.CFrame*CFrame.new(0,options.Offset,4)
+        local destination=root.CFrame*CFrame.new(0,options.Offset,options.Horizontal)
         if owner=="Farm" and options.FixedFarm then
-            if fixedCombatTarget~=target or fixedCombatOffset~=options.Offset then
+            if fixedCombatTarget~=target or fixedCombatOffset~=options.Offset..":"..options.Horizontal then
                 fixedCombatTarget=target
                 fixedCombatPoint=destination
-                fixedCombatOffset=options.Offset
+                fixedCombatOffset=options.Offset..":"..options.Horizontal
             end
             destination=fixedCombatPoint
         end
@@ -2690,7 +2697,7 @@ local questRuntime=initQuestRuntime()
 
 -- Optional mission-only clustering; no hidden-property or network-ownership changes.
 local function initMissionBring()
-    local state={Phase="off",Moved=0,Grouped=0,Eligible=0,Radius=150,Limit=20}
+    local state={Phase="off",Moved=0,Grouped=0,Eligible=0,Radius=150,Limit=20,Spacing=3}
     local center,centerTarget,centerQuest
     local label
     local bosses={}
@@ -2721,7 +2728,7 @@ local function initMissionBring()
         if centerTarget~=target or centerQuest~=key then
             centerTarget=target;centerQuest=key
             center=options.FixedFarm and fixedCombatTarget==target and fixedCombatPoint
-                and fixedCombatPoint*CFrame.new(0,-options.Offset,-4) or targetRoot.CFrame
+                and fixedCombatPoint*CFrame.new(0,-options.Offset,-options.Horizontal) or targetRoot.CFrame
         end
         if (root.Position-center.Position).Magnitude>state.Radius then state.Phase="ponto fora do alcance";paint();return end
         local candidates={}
@@ -2745,8 +2752,8 @@ local function initMissionBring()
             local point=candidates[index].Root
             if progressTracker then progressTracker.Track(candidates[index].Model) end
             -- Leave the chosen attack target untouched; distribute extras around it.
-            local x=((index-1)%5-2)*3
-            local z=(math.floor((index-1)/5)-2)*3
+            local x=((index-1)%5-2)*state.Spacing
+            local z=(math.floor((index-1)/5)-2)*state.Spacing
             local destination=center*CFrame.new(x,0,z)
             if (point.Position-destination.Position).Magnitude>1 then
                 point.CFrame=destination
@@ -2758,6 +2765,8 @@ local function initMissionBring()
         state.Phase="ativo";paint()
     end
     return {Update=update,BeginStep=beginStep,Reset=reset,
+        SetLimit=function(v)state.Limit=math.clamp(math.floor(v),1,20)end,
+        SetSpacing=function(v)state.Spacing=math.clamp(v,2,12)end,
         SetRadius=function(value) state.Radius=math.clamp(value,25,400);paint() end,
         BindLabel=function(value) label=value;paint() end,
         GetState=function()local copy=table.clone(state);copy.Enabled=flags.Bring==true;return copy end}
@@ -2852,7 +2861,34 @@ local bring=initMissionBring()
         end
         return q
     end
+    local watchdog={At=0,Retries=0}
+    bind(UserInputService.InputBegan,function(input,processed)
+        if processed or UserInputService:GetFocusedTextBox() or not options.PauseManual then return end
+        if input.UserInputType==Enum.UserInputType.Keyboard and (input.KeyCode==Enum.KeyCode.W or input.KeyCode==Enum.KeyCode.A or input.KeyCode==Enum.KeyCode.S or input.KeyCode==Enum.KeyCode.D) then
+            manualUntil=os.clock()+3;stopMove();fastAttackApi:ReleaseCombat("Farm");releaseInput()
+        end
+    end,"farm.manual.pause")
+    bind(UserInputService.InputEnded,function(input)
+        if options.PauseManual and input.UserInputType==Enum.UserInputType.Keyboard and (input.KeyCode==Enum.KeyCode.W or input.KeyCode==Enum.KeyCode.A or input.KeyCode==Enum.KeyCode.S or input.KeyCode==Enum.KeyCode.D) then manualUntil=os.clock()+3 end
+    end,"farm.manual.resume")
     local function farmStep()
+        local p=progressTracker.GetState()
+        local _,_,r=character()
+        local h=attackState.Health
+        if options.PauseManual then
+            local ok,held=pcall(function()return UserInputService:IsKeyDown(Enum.KeyCode.W) or UserInputService:IsKeyDown(Enum.KeyCode.A) or UserInputService:IsKeyDown(Enum.KeyCode.S) or UserInputService:IsKeyDown(Enum.KeyCode.D)end)
+            if ok and held then manualUntil=os.clock()+3 end
+        end
+        if os.clock()<manualUntil then watchdog.At=os.clock();farmProgress("manual_pause");return end
+        if not options.Recover or not r or not watchdog.Position or (r.Position-watchdog.Position).Magnitude>3 or h~=watchdog.Health or p.ObservedDefeats~=watchdog.Defeats then
+            watchdog.At=os.clock();watchdog.Position=r and r.Position;watchdog.Health=h;watchdog.Defeats=p.ObservedDefeats;watchdog.Retries=0
+        elseif os.clock()-watchdog.At>=options.StallSeconds then
+            watchdog.At=os.clock();watchdog.Retries=watchdog.Retries+1
+            debugLog("WARN","farm.stalled","No observed progress; recovery "..watchdog.Retries.."/3")
+            if watchdog.Retries>=3 then controls.Farm.Set(false);notify({Title="Farm",Text="Farm parado após três tentativas sem progresso."});return end
+            if fixedCombatTarget then rejectedTargets[fixedCombatTarget]=os.clock()+options.StallSeconds end
+            fixedCombatTarget=nil;fixedCombatPoint=nil;farmQuest=nil;stopMove("Farm");fastAttackApi:ReleaseCombat("Farm")
+        end
         bring.BeginStep()
         local mode=options.Mode
         local _,_,root=character()
@@ -3020,6 +3056,10 @@ local bring=initMissionBring()
     addSection(Farm,"Farm integrado")
     addLabel(Farm,"Um modo de farm por vez. Coordenadas/missões vêm das fontes; progresso e dano dependem do servidor. Missões consultadas no jogo; catálogo alternativo Hoho até nível 2700 (cobertura parcial).")
     local farmControl
+    addToggle(Farm,"Recuperar farm travado",false,function(v) options.Recover=v;watchdog.At=os.clock();watchdog.Retries=0 end)
+    addSlider(Farm,{Name="Tempo sem progresso",Min=15,Max=120,Default=30,Step=5,Callback=function(v)options.StallSeconds=v end})
+    addToggle(Farm,"Pausar farm ao usar WASD",false,function(v)options.PauseManual=v;manualUntil=0 end)
+    addSlider(Farm,{Name="Distância horizontal do alvo",Min=0,Max=40,Default=4,Step=1,Callback=function(v)options.Horizontal=v end})
     speedSlider(Farm)
     addToggle(Farm,"Manter posição fixa no farm",true,function(on)
         options.FixedFarm=on
@@ -3044,6 +3084,8 @@ local bring=initMissionBring()
     farmControl=toggleJob(Farm,"Ativar farm selecionado","Farm",0.3,farmStep)
     controls.Bring=addToggle(Farm,"BRING: agrupar NPCs da missão",false,function(on) flags.Bring=on;bring.Reset() end)
     addSlider(Farm,{Name="Alcance do BRING",Min=25,Max=400,Default=150,Step=25,Suffix=" studs",Callback=bring.SetRadius})
+    addSlider(Farm,{Name="Máximo de NPCs no BRING",Min=1,Max=20,Default=20,Step=1,Callback=bring.SetLimit})
+    addSlider(Farm,{Name="Espaçamento do BRING",Min=2,Max=12,Default=3,Step=1,Callback=bring.SetSpacing})
     bring.BindLabel(addLabel(Farm,""))
     addLabel(Farm,"BRING funciona no modo Level, com missão ativa e perto do alvo. Agrupa até 20 inimigos próximos por etapa; jogadores e bosses ficam de fora.")
     controls.SkillSpam=addToggle(Farm,"Usar skills Z/X/C/V/F",false,function(on) flags.SkillSpam=on end)
@@ -3400,9 +3442,9 @@ local bring=initMissionBring()
     button(Settings,"Parar funções importadas",stopAll)
     addLabel(Settings,"Portes Cokka/Matsune: funções ativadas somente pelos controles. Contratos do jogo e coordenadas precisam de validação no cliente.")
     report("startup",supported and "target game detected" or "UI available; target game unavailable")
-    return {StopAll=stopAll,ResetProgress=progressTracker.Reset,GetState=function()
+    return {IsLightMode=function()return options.LightMode end,SetLightMode=function(v)options.LightMode=v==true end,StopAll=stopAll,ResetProgress=progressTracker.Reset,GetState=function()
         local running={};for name in pairs(jobs) do running[#running+1]=name end;table.sort(running)
-        return {Active=active,SupportedGame=supported,Mode=options.Mode,AutoEquip=options.AutoEquip,Progress=progressTracker.GetState(),Attack=table.clone(attackState),TweenSpeed=options.Speed,Bring=bring.GetState(),Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),FastAttack=fastAttackApi:GetState(),QuestRuntime=questRuntime.GetState(),Preload=preload.GetState(),Movement={Backend="physics_path",Phase=movementPhase,Rebases=movementRebases,Owner=moveOwner,Suspended=motionState~=nil,Holding=motionState and motionState.Holding==true or false,Anchored=moveRoot and moveRoot.Anchored or false,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
+        return {Active=active,SupportedGame=supported,Mode=options.Mode,AutoEquip=options.AutoEquip,Progress=progressTracker.GetState(),Attack=table.clone(attackState),TweenSpeed=options.Speed,Bring=bring.GetState(),Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),FastAttack=fastAttackApi:GetState(),QuestRuntime=questRuntime.GetState(),Preload=preload.GetState(),Movement={Distance=moveRoot and moveTarget and (moveRoot.Position-moveTarget.Position).Magnitude or 0,ActualSpeed=actualSpeed,Backend="physics_path",Phase=movementPhase,Rebases=movementRebases,Owner=moveOwner,Suspended=motionState~=nil,Holding=motionState and motionState.Holding==true or false,Anchored=moveRoot and moveRoot.Anchored or false,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
     end}
 end
 
@@ -3524,7 +3566,7 @@ debugVisibility=function(on)
 end
 local lastDebugPaint=0
 bind(game:GetService("RunService").Heartbeat,function()
-    if debugEnabled and debugWindow.Visible and not panelPaused and os.clock()-lastDebugPaint>=1 then
+    if debugEnabled and debugWindow.Visible and not panelPaused and os.clock()-lastDebugPaint>=(importedFeatures.IsLightMode() and 3 or 1) then
         lastDebugPaint=os.clock();fitDebugWindow();refreshDebugPanel()
     end
 end,"debug.panel")
@@ -3565,6 +3607,8 @@ local function initProductivity(api)
     uiRegistry.Recording=false
     local HttpService=game:GetService("HttpService")
     local favorites={}
+    local profiles={}
+    local lightMode=false
     local saving=false
     local applying=false
     local autosave=true
@@ -3610,7 +3654,7 @@ local function initProductivity(api)
         local fav={};for id in pairs(favorites)do if uiRegistry.ById[id] then fav[#fav+1]=id end end;table.sort(fav)
         local vp=viewport()
         local p=normalGeometry.Position
-        return {Version=1,Controls=values,Favorites=fav,Theme=activeTheme,AutoSave=autosave,
+        return {Version=1,Profiles=profiles,Controls=values,Favorites=fav,Theme=activeTheme,AutoSave=autosave,
             Window={X=(p.X.Scale*vp.X+p.X.Offset)/math.max(1,vp.X),Y=(p.Y.Scale*vp.Y+p.Y.Offset)/math.max(1,vp.Y),W=normalGeometry.Size.X.Offset,H=normalGeometry.Size.Y.Offset},
             Float=normalizedPosition(Float),Stop=stopButton and normalizedPosition(stopButton) or nil}
     end
@@ -3653,6 +3697,7 @@ local function initProductivity(api)
             end
         end
         if type(data)~="table" or data.Version~=1 then status("Sem preferências salvas para carregar.");return false end
+        if type(data.Profiles)=="table" then profiles=data.Profiles end
         applying=true;stopEverything()
         if type(data.AutoSave)=="boolean" then autosave=data.AutoSave;if autoSaveControl then autoSaveControl.Set(autosave)end end
         for id,value in pairs(type(data.Controls)=="table" and data.Controls or {})do
@@ -3819,6 +3864,64 @@ local function initProductivity(api)
         if type(diskWrite)=="function" then local ok,err=pcall(diskWrite,"XerecaHub.debug.txt",report);if ok then notify({Title="DEBUG",Text="Relatório salvo em XerecaHub.debug.txt."});return end;debugLog("WARN","debug.export",err)end
         showReport(report)
     end)
+    addSection(progressPage,"Monitor e metas")
+    local monitor=new("TextLabel",{Name="XerecaFarmMonitor",Text="Farm parado",Visible=false,Position=UDim2.fromOffset(20,140),Size=UDim2.fromOffset(330,100),TextWrapped=true,Font=Enum.Font.Gotham,TextSize=12,TextXAlignment=Enum.TextXAlignment.Left,Theme={BackgroundColor3="ComponentBg",TextColor3="Text"}},uiGui)
+    new("UICorner",{CornerRadius=UDim.new(0,8)},monitor)
+    addToggle(progressPage,"Mostrar estado flutuante do farm",false,function(v)monitor.Visible=v end)
+    addToggle(Settings,"Modo leve",false,function(v)lightMode=v;importedFeatures.SetLightMode(v)end)
+    local goal={Enabled=false,Level=0,Beli=0,Minutes=0}
+    addLabel(progressPage,"Metas: zero ignora o critério. Beli é o ganho observado desde o reset; tempo considera apenas o farm ativo. A primeira meta atingida para todas as automações.")
+    addSlider(progressPage,{Name="Meta de nível (0 ignora)",Min=0,Max=3000,Default=0,Step=1,Callback=function(v)goal.Level=v end})
+    addSlider(progressPage,{Name="Meta de ganho Beli (0 ignora)",Min=0,Max=10000000,Default=0,Step=1000,Callback=function(v)goal.Beli=v end})
+    addSlider(progressPage,{Name="Meta de minutos (0 ignora)",Min=0,Max=720,Default=0,Step=1,Callback=function(v)goal.Minutes=v end})
+    local goalControl=addToggle(progressPage,"Ativar metas de sessão",false,function(v)goal.Enabled=v end)
+    local phaseNames={idle="Parado",waiting_character="Esperando personagem",manual_pause="Pausa manual",combat="Atacando",fighting="Atacando",quest="Pegando missão",waiting_spawn="Esperando spawn",quest_giver="Indo ao NPC da missão",moving_to_target="Indo ao inimigo",waiting_quest_data="Esperando dados da missão",requesting_entrance="Acessando região",waiting_quest_position="Esperando posição da missão",waiting_raid="Esperando raid"}
+    local lastMonitor=0
+    bind(game:GetService("RunService").Heartbeat,function()
+        if destroyed or os.clock()-lastMonitor<(lightMode and 3 or 0.5) then return end
+        lastMonitor=os.clock()
+        local state=importedFeatures.GetState();local m=state.Movement or {};local f=state.Farm or {};local p=state.Progress or {}
+        if monitor.Visible then
+            local phase=not p.Running and "Parado" or phaseNames[f.Phase] or tostring(f.Phase)
+            monitor.Text="Farm: "..phase.." | "..tostring(f.ExpectedMob or state.Mode)..
+                "\nDestino: "..string.format("%.1f",m.Distance or 0).." studs | velocidade real: "..string.format("%.1f",m.ActualSpeed or 0).." studs/s"..
+                "\nMovimento: "..tostring(m.Phase).." | correções: "..tostring(m.Rebases or 0)
+        end
+        if goal.Enabled and p.Running and ((goal.Level>0 and p.Level and p.Level>=goal.Level) or (goal.Beli>0 and (p.BeliDelta or 0)>=goal.Beli) or (goal.Minutes>0 and (p.Elapsed or 0)>=goal.Minutes*60)) then
+            goalControl.Set(false);stopEverything();notify({Title="Meta atingida",Text="Todas as automações foram interrompidas."});debugLog("WARN","session.goal","Session goal reached; automations stopped")
+        end
+    end,"productivity.monitor")
+    addSection(Settings,"Perfis de configuração")
+    local selectedProfile="Farm de level"
+    fluentDropdown(Settings,"Perfil",{"Farm de level","Mastery","Boss"},selectedProfile,function(v)selectedProfile=v end)
+    local profileStatus=addLabel(Settings,"Os perfis guardam ajustes, tema e favoritos. Salve cada perfil antes de carregar; automações ficam desligadas.")
+    addBtn(Settings,"Salvar perfil selecionado",function()
+        local data=capture();data.Profiles=nil;data.Window=nil;data.Float=nil;data.Stop=nil
+        profiles[selectedProfile]=data;requestSave();profileStatus.Text="Perfil salvo: "..selectedProfile
+    end)
+    addBtn(Settings,"Carregar perfil selecionado",function()
+        local data=profiles[selectedProfile]
+        if type(data)~="table" or data.Version~=1 then profileStatus.Text="Este perfil ainda não foi salvo.";return end
+        stopEverything();goalControl.Set(false);applying=true
+        for id,value in pairs(type(data.Controls)=="table" and data.Controls or {})do
+            local r=uiRegistry.ById[id]
+            if r and r.Persist and r.API and r.API.Set and ((r.Kind=="Toggle" and type(value)=="boolean") or (r.Kind=="Slider" and finite(value)) or (r.Kind=="Dropdown" and type(value)=="string" and #value<=200)) then
+                local ok,err=pcall(r.API.Set,value);if not ok then debugLog("WARN","profile.control",err)end
+            end
+        end
+        if type(data.Theme)=="string" and THEMES[data.Theme] then api:SetTheme(data.Theme)end
+        favorites={};for _,id in ipairs(type(data.Favorites)=="table" and data.Favorites or {})do if uiRegistry.ById[id]then favorites[id]=true end end
+        applying=false;refreshFavorites();requestSave();profileStatus.Text="Perfil carregado: "..selectedProfile..". Automações desligadas."
+    end)
+    addSection(Settings,"Histórico de falhas")
+    local errorLabel=addLabel(Settings,"Sem falhas registradas.")
+    local function errorsText()
+        local rows={"XERECA | últimas falhas locais (tempo desde início do processo)"}
+        for _,entry in ipairs(api:GetDebugLog())do if entry.Level=="ERROR" or entry.Level=="WARN" then rows[#rows+1]=string.format("[%.2fs] %s: %s",entry.Time,entry.Event,entry.Detail)end end
+        return table.concat(rows,"\n")
+    end
+    addBtn(Settings,"Atualizar histórico de falhas",function()errorLabel.Text=errorsText()end)
+    addBtn(Settings,"Copiar histórico de falhas",function()local text=errorsText();if type(clipboard)=="function" and pcall(clipboard,text)then notify({Title="DEBUG",Text="Histórico copiado."})else showReport(text)end end)
     uiRegistry.Recording=false
     api.GetDebugExport=debugExport
     api.SavePreferences=savePreferences
@@ -3830,7 +3933,7 @@ local function initProductivity(api)
     bind(game:GetService("RunService").Heartbeat,function()
         if destroyed then return end
         fitStop()
-        if Main.Visible and os.clock()-lastPaint>=1 then lastPaint=os.clock();updateProgress()end
+        if Main.Visible and os.clock()-lastPaint>=(lightMode and 3 or 1) then lastPaint=os.clock();updateProgress()end
     end,"productivity.refresh")
     loadPreferences();filter(input.Value or "");refreshFavorites();updateProgress()
     table.insert(cleanupFns,function()if autosave then savePreferences()end;uiRegistry.OnPreferencesChanged=nil end)
