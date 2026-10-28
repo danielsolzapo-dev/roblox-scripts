@@ -41812,12 +41812,25 @@ progressTracker=initProgressTracker()
         local root=part(target)
         local hp,maxHP=health(target)
         if not root or hp<=0 then fastAttackApi:ReleaseCombat(owner);return end
-        local destination=root.CFrame*CFrame.new(0,options.Offset,options.Horizontal)
+        local sharedState=fastAttackApi:GetState()
+        if attackState.CloseTarget~=target then attackState.CloseTarget=nil end
+        -- Normal M1 cannot use the remote attack's broad acquisition radius.
+        -- Latch the close stance for this target, so health updates do not oscillate the hold.
+        if owner=="Farm" and options.Mode=="Level" and distance(target)<=40
+            and (not fastAttackApi:CanAttack() or (sharedState.Target==target.Name
+                and (sharedState.NoDamageFor or 0)>=2)) then
+            attackState.CloseTarget=target
+        end
+        local close=attackState.CloseTarget==target
+        local vertical=close and math.min(options.Offset,3) or options.Offset
+        local horizontal=close and math.min(options.Horizontal,4) or options.Horizontal
+        attackState.Stance=close and "normal_click_close_range" or "configured_offset"
+        local destination=root.CFrame*CFrame.new(0,vertical,horizontal)
         if owner=="Farm" and options.FixedFarm then
-            if fixedCombatTarget~=target or fixedCombatOffset~=options.Offset..":"..options.Horizontal then
+            if fixedCombatTarget~=target or fixedCombatOffset~=vertical..":"..horizontal then
                 fixedCombatTarget=target
                 fixedCombatPoint=destination
-                fixedCombatOffset=options.Offset..":"..options.Horizontal
+                fixedCombatOffset=vertical..":"..horizontal
             end
             destination=fixedCombatPoint
         end
@@ -41837,11 +41850,11 @@ progressTracker=initProgressTracker()
         attackState.LastDamageAt=lastDamageAt
         stopLedger.Wait(owner,not tool and "Arma selecionada ausente; automação continua aguardando"or nil)
         if not tool then
-            fastAttackApi:ReleaseCombat(owner);attackState.Phase="missing_weapon"
+            fastAttackApi:SetCombatTarget(owner,nil);attackState.Phase="missing_weapon"
         elseif attackState.Distance>100 then
-            fastAttackApi:ReleaseCombat(owner);attackState.Phase="approaching"
+            fastAttackApi:SetCombatTarget(owner,nil);attackState.Phase="approaching"
         elseif levelAuto then
-            releaseInput();fastAttackApi:SetCombatTarget(owner,target)
+            fastAttackApi:SetCombatTarget(owner,target)
             attackState.Input="shared_fast_attack";attackState.Phase="shared_fast_attack"
             attackState.Transport=fastAttackApi:GetState().LastTransport or "worker_started"
             attackState.Attempts=attackState.Attempts+1
@@ -41850,7 +41863,6 @@ progressTracker=initProgressTracker()
             fastAttackApi:SetCombatTarget(owner,nil)
             skillAttack();attackState.Phase="skills_sent"
         elseif fastAttackApi.ManualEnabled or (attackState.Method=="Auto" and fastAttackApi:CanAttack()) then
-            releaseInput()
             fastAttackApi:SetCombatTarget(owner,target)
             attackState.Input="shared_fast_attack"
             attackState.Phase="shared_fast_attack"
@@ -42993,8 +43005,8 @@ local function initMissionBring()
         local key=q.Name..":"..tostring(q.Tier)..":"..cleanName(q.Mob)
         if centerTarget~=target or centerQuest~=key then
             centerTarget=target;centerQuest=key
-            center=options.FixedFarm and fixedCombatTarget==target and fixedCombatPoint
-                and fixedCombatPoint*CFrame.new(0,-options.Offset,-options.Horizontal) or targetRoot.CFrame
+            -- Capture the NPC's world point independently of the player's combat stance.
+            center=targetRoot.CFrame
         end
         if (root.Position-center.Position).Magnitude>state.Radius then state.Phase="ponto fora do alcance";paint();return end
         local candidates={}
@@ -43150,8 +43162,6 @@ local bring=initMissionBring()
         if controls.Buso and not controls.Buso.Get()then
             controls.Buso.Set(true);levelOwnsHaki=true
         end
-        -- Keep one attack worker leased to this farm; nil means no arbitrary nearby target.
-        fastAttackApi:SetCombatTarget("Farm",levelState.Target)
     end
     local function levelFarmStep()
         ensureLevelSupport()
@@ -43447,6 +43457,7 @@ local bring=initMissionBring()
         if reason~="remotes_unavailable" and reason~="remote_failed" and reason~="no_damage_observed"then return false end
         local c=LocalPlayer.Character;local tool=c and c:FindFirstChildOfClass("Tool")
         if not tool or distance(target)>fastAttackApi.Distance then return false end
+        if owner~="Manual" and distance(target)>10 then return false,"approaching_normal_click_range" end
         local activated=pcall(function()tool:Activate()end)
         local clicked=inputClick("Matsune Click")
         return activated or clicked,"normal_click_sent"
