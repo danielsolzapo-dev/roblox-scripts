@@ -43721,7 +43721,7 @@ local bring=initMissionBring()
             if not validRequest(token)then entry.Busy=false;entry.Next=0;return end
             local ok,result=pcall(function()return remote:InvokeServer(table.unpack(args,1,args.n))end)
             entry.Busy=false
-            if validRequest(token)and ok then entry.Value=result elseif not ok then debugLog("WARN","firstsea.query",result)end
+            if validRequest(token)and ok then entry.Value=result;entry.Updated=os.clock();entry.Error=nil elseif not ok then entry.Error=tostring(result);debugLog("WARN","firstsea.query",result)end
         end)
         return entry.Value
     end
@@ -43790,14 +43790,63 @@ local bring=initMissionBring()
         end
         if firstLabel then firstLabel.Text=firstSeaState.Phase end
     end
+    local requirementLabel
+    local function paintRequirements()
+        if not requirementLabel then return end
+        local value=path(LocalPlayer,"Data","Level");local level=value and tonumber(value.Value)
+        local saber=firstSeaState.Goal=="Saber"
+        local needed=saber and 200 or 700
+        local rows={"Requisitos • "..firstSeaState.Goal}
+        local nextStep,unknown
+        local function row(title,state)
+            rows[#rows+1]=(state==true and "✔ "or state==false and "✖ "or "? ")..title
+            if state==nil then unknown=true end
+            if state==false and not nextStep then nextStep=title end
+        end
+        local levelReady;if level then levelReady=level>=needed end
+        row("Nível "..needed.." | atual: "..tostring(level or "indisponível")..(level and level<needed and (" | faltam "..needed-level)or ""),levelReady)
+        -- Preserve false distinctly from nil: nil means the game has not supplied this field.
+        if level and level<needed then nextStep="Atingir nível "..needed end
+        local entry=firstQueries[saber and "saber"or "sea2"]
+        local data=entry and type(entry.Value)=="table"and entry.Value or nil
+        local function flag(key)if data and type(data[key])=="boolean"then return data[key]end end
+        if saber then
+            local door=path(workspace,"Map","Jungle","QuestPlates","Door")
+            local opened;if door and type(door.Transparency)=="number"then opened=door.Transparency>=1 end
+            row("Puzzle da Jungle concluído",opened)
+            row("Torch utilizada",flag("UsedTorch"));row("Sick Man ajudado",flag("UsedCup"))
+            row("Conversa com Rich Son",flag("TalkedSon"));row("Mob Leader derrotado",flag("KilledMob"))
+            row("Relic colocada",flag("UsedRelic"))
+            rows[#rows+1]=hasTool("Saber")and "✔ Saber observado na mochila/personagem"or "? Saber não observado na mochila/personagem"
+        else
+            row("Conversa com Military Detective",flag("TalkedDetective"));row("Chave utilizada",flag("UsedKey"));row("Ice Admiral derrotado",flag("KilledIceBoss"))
+        end
+        if entry and entry.Busy then rows[#rows+1]="Consultando progresso..."
+        elseif entry and entry.Error then rows[#rows+1]="Consulta falhou; tente Atualizar requisitos."
+        elseif not data then rows[#rows+1]="Progresso ainda não consultado. Use Atualizar requisitos."
+        else rows[#rows+1]="Consulta observada há "..math.floor(os.clock()-(entry.Updated or os.clock())).."s"end
+        rows[#rows+1]="Próxima etapa: "..(nextStep or (not data and "Consultar progresso"or unknown and "Confirmar etapas não informadas"or "Verificar recompensa/acesso no jogo"))
+        firstSeaState.Requirements=table.concat(rows,"\n");requirementLabel.Text=firstSeaState.Requirements
+    end
     if seaIndex()==1 then
         local firstPage=addTab("First Sea")
         dropdown(firstPage,"Objetivo First Sea",{"Saber","Segundo Sea"},"Saber",function(v)
             if controls.FirstSea then controls.FirstSea.Set(false)end
-            firstSeaState.Goal=v;firstQueries={};plateIndex=1
+            firstSeaState.Goal=v;firstQueries={};plateIndex=1;paintRequirements()
         end)
         toggleJob(firstPage,"Auto objetivo First Sea","FirstSea",0.5,function()firstStep();if firstLabel then firstLabel.Text=firstSeaState.Phase end end)
         firstLabel=addLabel(firstPage,"Selecione Saber ou Segundo Sea.")
+        requirementLabel=addLabel(firstPage,"");paintRequirements()
+        addBtn(firstPage,"Atualizar requisitos",function()
+            local key=firstSeaState.Goal=="Saber"and "saber"or "sea2"
+            local entry=firstQueries[key];if entry and not entry.Busy then entry.Next=0 end
+            firstQuery(key,firstSeaState.Goal=="Saber"and "ProQuestProgress"or "DressrosaQuestProgress")
+            paintRequirements()
+        end)
+        local lastRequirements=0
+        bind(RunService.Heartbeat,function()
+            if active and not destroyed and Main.Visible and os.clock()-lastRequirements>=1 then lastRequirements=os.clock();paintRequirements()end
+        end,"firstsea.requirements")
         button(firstPage,"Ver progresso do objetivo",function()
             local action=firstSeaState.Goal=="Saber" and "ProQuestProgress" or "DressrosaQuestProgress"
             comm("first.progress",3,action)
