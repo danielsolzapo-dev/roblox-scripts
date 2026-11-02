@@ -40556,7 +40556,7 @@ local function registerControl(parent,title,kind,api,native,before,run)
     end
     local id=tab.Name.."/"..kind.."/"..title
     if uiRegistry.ById[id] then id=id.."/"..tostring(#uiRegistry.Records+1) end
-    local safeToggle=title=="Manter posição fixa no farm" or title=="WindUI: transparência" or title=="Auto equipar arma selecionada" or title:match("^Skill [ZXCVF]$")~=nil
+    local safeToggle=title=="Manter posição fixa no farm" or title=="WindUI: transparência" or title=="Auto equipar arma selecionada" or title=="Kaitun: obter Saber no First Sea" or title=="Kaitun: desbloquear Segundo Sea" or title:match("^Skill [ZXCVF]$")~=nil
     local persist=kind=="Slider" or (kind=="Dropdown" and title~="Jogador" and title~="NPC deste servidor") or (kind=="Toggle" and safeToggle)
     local record={Id=id,Title=title,Page=parent,Tab=tab,Kind=kind,API=api,Frame=frame,Run=run,Persist=persist,Path=tab.Name.." / "..title}
     uiRegistry.Records[#uiRegistry.Records+1]=record;uiRegistry.ById[id]=record
@@ -41288,6 +41288,7 @@ local function initImportedFeatures()
     local buttonBusy = {}
     local onJobStop = {}
     local onFarmChange
+    local cancelKaitun
     local modeControl
     local progressTracker
     local gates = shared._XerecaCommandGates
@@ -41481,6 +41482,7 @@ local function initImportedFeatures()
         if not active or destroyed or typeof(target)~="CFrame" then return end
         if os.clock()<movementPauseUntil then return end
         if owner=="Manual" then
+            if cancelKaitun then cancelKaitun("Movimento manual selecionado") end
             for name in pairs(movementJobs) do if flags[name] and controls[name] then controls[name].Set(false) end end
         end
         local _,h,root=character()
@@ -41591,6 +41593,7 @@ local function initImportedFeatures()
         stopLedger.Context=priorContext
     end
     local function startJob(name, interval, fn)
+        if movementJobs[name] and cancelKaitun then cancelKaitun("Movimento assumido por "..(stopLedger.Names[name]or name)) end
         stopJob(name,"Reiniciado")
         if movementJobs[name] then
             for other in pairs(movementJobs) do if other~=name and flags[other] and controls[other] then stopLedger.Pending[other]="Movimento assumido por "..(stopLedger.Names[name]or name);controls[other].Set(false) end end
@@ -41621,6 +41624,9 @@ local function initImportedFeatures()
     local function toggleJob(page, label, key, interval, fn)
         stopLedger.Names[key]=label
         local control=addToggle(page,label,false,function(on)
+            if not on and flags[key] and (key=="Farm"or key=="FirstSea") and coroutine.running()~=jobs[key] and cancelKaitun then
+                cancelKaitun("Etapa interrompida pelo controle")
+            end
             if key=="Farm" and on and options.Mode=="Off"then
                 options.Mode="Level";if modeControl then modeControl.Set("Level",true)end
             end
@@ -43450,9 +43456,10 @@ local bring=initMissionBring()
     dropdown(Farm,"Ataque do farm",{"Matsune Click","Auto","Tool"},"Matsune Click",function(v)
         fastAttackApi.ReleaseInput();attackState.Method=v
     end)
-    addToggle(Farm,"Auto equipar arma selecionada",true,function(on) options.AutoEquip=on end)
+    local autoEquipControl=addToggle(Farm,"Auto equipar arma selecionada",true,function(on) options.AutoEquip=on end)
     dropdown(Farm,"Arma",{"Melee","Sword","Gun","Blox Fruit"},options.Weapon,function(v) options.Weapon=v end)
     modeControl=dropdown(Farm,"Modo",modes,"Off",function(v)
+        if cancelKaitun then cancelKaitun("Modo de farm alterado") end
         options.Mode=v;farmQuest=nil;farmQuestKey=nil;fixedCombatTarget=nil;fixedCombatPoint=nil;stopMove("Farm")
         if v=="Off" and farmControl then farmControl.Set(false) end
         if onFarmChange then onFarmChange(flags.Farm==true)end
@@ -44219,6 +44226,159 @@ local bring=initMissionBring()
         onJobStop.FirstSea=function()releaseInput();firstSeaState.Phase="Parado";if firstLabel then firstLabel.Text="Parado"end end
     end
 
+    -- Original coordinator: reuses this hub's workers, never downloads another hub.
+    local function initKaitun()
+        -- BEGIN GENERATED KAITUN POLICY
+        local choose = (function()
+            -- Pure policy; embedded in Standalone by scripts/sync_kaitun.py. No game calls.
+            return function(snapshot, config)
+                if not snapshot.Supported then return "stop", "Jogo ou Sea não reconhecido" end
+                if type(snapshot.Level) ~= "number" or snapshot.Level ~= snapshot.Level then
+                    return "wait", "Aguardando nível replicado"
+                end
+                if not snapshot.Alive then return "wait", "Aguardando personagem vivo" end
+                local target = math.max(1, math.floor(config.Target))
+                if config.Saber then target = math.max(target, 200) end
+                if config.SecondSea then target = math.max(target, 700) end
+                if snapshot.Sea == 1 and config.Saber and snapshot.Level >= 200 then
+                    if snapshot.Saber == nil then return "wait", "Consultando posse do Saber" end
+                    if not snapshot.Saber and snapshot.Level >= 200 then return "saber", "Obter Saber" end
+                end
+                if snapshot.Sea == 1 and config.SecondSea and snapshot.Level >= 700 then
+                    return "sea2", "Desbloquear Segundo Sea"
+                end
+                if snapshot.Level >= target then return "done", "Meta de nível e objetivos disponíveis concluídos" end
+                return "level", "Level Farm até " .. tostring(target)
+            end
+        end)()
+        -- END GENERATED KAITUN POLICY
+        local config={Target=700,Saber=false,SecondSea=false,Timeout=180}
+        local state={Running=false,Phase="off",Reason="Desligado",Owned=nil,StartedAt=0}
+        local applying=false
+        local previous,signature,changedAt
+        local control
+        local page=addTab("Kaitun")
+        addLabel(page,"Coordena Level Farm e objetivos do First Sea. Inicie manualmente; Parar encerra a fila. Não desbloqueia o Terceiro Sea nem compra frutas/estilos automaticamente.")
+        local label=addLabel(page,"Kaitun desligado.")
+        local function paint()
+            local target=math.max(config.Target,config.Saber and 200 or 1,config.SecondSea and 700 or 1)
+            local detail=state.Owned=="FirstSea"and firstSeaState.Phase or state.Owned=="Farm"and farmStatus.Phase
+            label.Text="Kaitun • "..state.Phase.."\n"..state.Reason.."\nNível alvo efetivo: "..target
+                .." | etapa: "..tostring(state.Owned or "nenhuma")
+                ..(detail and ("\n"..detail)or "")
+        end
+        local function releaseWorker()
+            local owner=state.Owned;state.Owned=nil
+            if owner and controls[owner] then controls[owner].Set(false) end
+        end
+        local function finish(reason,phase)
+            state.Phase=phase or "paused";state.Reason=reason
+            stopLedger.Pending.Kaitun=reason
+            if control then control.Set(false) end
+            paint()
+        end
+        cancelKaitun=function(reason)
+            if not applying and flags.Kaitun then finish(reason) end
+        end
+        local function configure()
+            if cancelKaitun then cancelKaitun("Configuração Kaitun alterada; inicie novamente") end
+            paint()
+        end
+        addSlider(page,{Name="Nível alvo do Kaitun",Min=1,Max=10000,Step=1,Default=700,Callback=function(v)
+            if type(v)=="number"and v==v and math.abs(v)<math.huge then config.Target=math.clamp(math.floor(v),1,10000);configure()end
+        end})
+        addToggle(page,"Kaitun: obter Saber no First Sea",false,function(v)config.Saber=v;configure()end)
+        addToggle(page,"Kaitun: desbloquear Segundo Sea",false,function(v)config.SecondSea=v;configure()end)
+        addLabel(page,"Saber eleva a meta mínima para 200; Segundo Sea para 700. Em outro Sea, objetivos exclusivos do First Sea são ignorados. Após teleporte, execute o hub e inicie novamente.")
+        addSlider(page,{Name="Pausar Kaitun sem progresso (segundos)",Min=30,Max=600,Step=15,Default=180,Callback=function(v)
+            if type(v)=="number"and v==v and math.abs(v)<math.huge then config.Timeout=math.clamp(v,30,600);configure()end
+        end})
+        onJobStop.Kaitun=function()
+            if not state.Running then return end
+            state.Running=false
+            applying=true
+            releaseWorker()
+            if previous then
+                -- Only restore passive settings. Previously active farms stay stopped.
+                firstSeaState.Goal=previous.Goal;autoEquipControl.Set(previous.AutoEquip)
+                modeControl.Set(previous.Mode)
+                previous=nil
+            end
+            applying=false
+            if state.Phase~="done"then state.Phase="paused";state.Reason=stopLedger.Context or state.Reason end
+            paint()
+        end
+        local function saberOwned()
+            if hasTool("Saber")then return true end
+            local data=firstQuery("kaitun.inventory","getInventory")
+            local query=firstQueries["kaitun.inventory"]
+            if not query or query.Error or not query.Updated or os.clock()-query.Updated>10 or type(data)~="table"then return nil end
+            local recognized=next(data)==nil
+            for _,item in pairs(data)do
+                if type(item)=="table"and type(item.Name)=="string"then
+                    recognized=true
+                    if cleanName(item.Name)=="saber"then return true end
+                end
+            end
+            if recognized then return false end
+            return nil
+        end
+        local function begin()
+            previous={Mode=options.Mode,Goal=firstSeaState.Goal,AutoEquip=options.AutoEquip}
+            state.Running=true;state.StartedAt=os.clock();signature=nil;changedAt=os.clock()
+            -- Stop competing movement/mastery before acquiring a worker.
+            applying=true
+            if controls.MasteryGoal then controls.MasteryGoal.Set(false)end
+            for name in pairs(movementJobs)do if flags[name]and controls[name]then controls[name].Set(false)end end
+            autoEquipControl.Set(true)
+            applying=false
+        end
+        local function step()
+            if not state.Running then begin()end
+            local _,humanoid=character()
+            local value=path(LocalPlayer,"Data","Level")
+            local level=value and tonumber(value.Value)
+            local owned
+            if supported and seaIndex()==1 and config.Saber and level and level>=200 then owned=saberOwned()end
+            local phase,reason=choose({Supported=supported,Sea=seaIndex(),Alive=humanoid~=nil,Level=level,Saber=owned},config)
+            local query=firstQueries[phase=="sea2"and "sea2"or "saber"]
+            local progress={}
+            if query and type(query.Value)=="table"then
+                for key,v in pairs(query.Value)do if type(v)=="boolean"or type(v)=="number"then progress[#progress+1]=tostring(key).."="..tostring(v)end end
+                table.sort(progress)
+            end
+            local mark=phase..":"..tostring(level)..":"..tostring(owned)..":"..table.concat(progress,",")
+            if mark~=signature then signature=mark;changedAt=os.clock()end
+            if phase=="stop"or phase=="done"then finish(reason,phase=="done"and "done"or "paused");return end
+            if os.clock()-changedAt>=config.Timeout then finish("Sem progresso observado por "..config.Timeout.."s. Confira missão, arma e requisitos.");return end
+            state.Phase=phase;state.Reason=reason
+            local desired=phase=="level"and "Farm"or (phase=="saber"or phase=="sea2")and "FirstSea"or nil
+            if state.Owned and state.Owned==desired and not flags[state.Owned]then
+                finish("A etapa foi encerrada; confira o resumo de paradas antes de reiniciar");return
+            end
+            if state.Owned~=desired then
+                applying=true
+                releaseWorker()
+                if desired=="Farm"then
+                    modeControl.Set("Level");state.Owned=desired;farmControl.Set(true)
+                elseif desired=="FirstSea"then
+                    firstSeaState.Goal=phase=="saber"and "Saber"or "Segundo Sea"
+                    plateIndex=1;state.Owned=desired;controls.FirstSea.Set(true)
+                end
+                applying=false
+            end
+            paint()
+        end
+        control=toggleJob(page,"Iniciar Kaitun","Kaitun",0.5,step)
+        addBtn(page,"Pausar Kaitun",function()finish("Pausado pelo usuário")end)
+        return {Stop=function(reason)if flags.Kaitun then finish(reason or "Parada geral")end end,GetState=function()
+            local copy=table.clone(state);copy.Config=table.clone(config)
+            copy.SecondsWithoutProgress=state.Running and math.max(0,os.clock()-(changedAt or os.clock()))or 0
+            return copy
+        end}
+    end
+    local kaitun=initKaitun()
+
     local function initExtraFeatures()
     -- Inventory data adapter: named game modules from supplied Kaitun, with legacy query fallback.
     local goalInventory={Known=false,Counts={},Owned={},Mastery={},Next=0,Busy=false}
@@ -44483,6 +44643,7 @@ local bring=initMissionBring()
 
     local function stopAll(reason)
         local previousReason=stopLedger.Context;stopLedger.Context=reason or "Parada geral"
+        kaitun.Stop(reason or "Parada geral")
         hubWebhook.Stop()
         fastToggle.Set(false)
         fastAttackApi:StopAll()
@@ -44508,7 +44669,7 @@ local bring=initMissionBring()
     report("startup",supported and "target game detected" or "UI available; target game unavailable")
     return {GetCompatibility=compatibility.Get,CheckCompatibility=compatibility.Read,GetStopSummary=stopLedger.Get,IsLightMode=function()return options.LightMode end,SetLightMode=function(v)options.LightMode=v==true end,StopAll=stopAll,ResetProgress=progressTracker.Reset,GetState=function()
         local running={};for name in pairs(jobs) do running[#running+1]=name end;table.sort(running)
-        return {WaterWalk=waterWalk.GetState(),Stops=stopLedger.Get(),Compatibility=compatibility.Get(),Extra=table.clone(extraState),Webhook=hubWebhook.GetState(),Sea=seaIndex(),Active=active,SupportedGame=supported,Mode=options.Mode,AutoEquip=options.AutoEquip,Progress=progressTracker.GetState(),Attack=table.clone(attackState),TweenSpeed=options.Speed,Bring=bring.GetState(),Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),FastAttack=fastAttackApi:GetState(),FirstSea=table.clone(firstSeaState),LevelFarm=table.clone(levelState),QuestRuntime=questRuntime.GetState(),Preload=preload.GetState(),Movement={Distance=moveRoot and moveTarget and (moveRoot.Position-moveTarget.Position).Magnitude or 0,ActualSpeed=actualSpeed,Backend="physics_path",Phase=movementPhase,Rebases=movementRebases,Owner=moveOwner,Suspended=motionState~=nil,Holding=motionState and motionState.Holding==true or false,Anchored=moveRoot and moveRoot.Anchored or false,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
+        return {Kaitun=kaitun.GetState(),WaterWalk=waterWalk.GetState(),Stops=stopLedger.Get(),Compatibility=compatibility.Get(),Extra=table.clone(extraState),Webhook=hubWebhook.GetState(),Sea=seaIndex(),Active=active,SupportedGame=supported,Mode=options.Mode,AutoEquip=options.AutoEquip,Progress=progressTracker.GetState(),Attack=table.clone(attackState),TweenSpeed=options.Speed,Bring=bring.GetState(),Jobs=running,Flags=table.clone(flags),Farm=table.clone(farmStatus),FastAttack=fastAttackApi:GetState(),FirstSea=table.clone(firstSeaState),LevelFarm=table.clone(levelState),QuestRuntime=questRuntime.GetState(),Preload=preload.GetState(),Movement={Distance=moveRoot and moveTarget and (moveRoot.Position-moveTarget.Position).Magnitude or 0,ActualSpeed=actualSpeed,Backend="physics_path",Phase=movementPhase,Rebases=movementRebases,Owner=moveOwner,Suspended=motionState~=nil,Holding=motionState and motionState.Holding==true or false,Anchored=moveRoot and moveRoot.Anchored or false,Destination=moveTarget and moveTarget.Position or nil,FixedFarm=options.FixedFarm}}
     end}
 end
 
