@@ -32,3 +32,11 @@ embutida. A edição deve ser feita em `KaitunPlanner.luau`, seguida de
 
 Os testes locais não validam coordenadas, contratos remotos, dano ou recompensas
 no Blox Fruits; esses pontos precisam de teste dentro do jogo.
+
+### Correção de compilação
+
+O estado interno do coordenador usa uma única tabela para não ultrapassar o
+limite de 200 registradores locais de alguns executores. O runner também compila
+o Standalone inteiro em `-O0` e `-O1`; somente a compilação otimizada não detectava
+a regressão. Sem testar dentro do Roblox, isto confirma a correção do erro de
+compilação reportado, não a compatibilidade de todos os recursos com o jogo.

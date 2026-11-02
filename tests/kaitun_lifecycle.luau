@@ -10,7 +10,7 @@ local options={Mode="Boss",AutoEquip=false}
 local farmStatus={Phase="idle"}
 local firstSeaState={Goal="Saber"}
 local plateIndex=1
-local cancelKaitun
+local kaitunRuntime={}
 local stopLedger={Pending={}}
 local inventory={{Name="Katana"}}
 local tools={}
@@ -33,7 +33,7 @@ local function addSlider(_,opts)widgets[opts.Name]=opts.Callback end
 local function addToggle(_,name,_,callback)widgets[name]=callback end
 local function worker(name)
     return {Set=function(on)
-        if on and cancelKaitun then cancelKaitun("Movimento externo")end
+        if on and kaitunRuntime.Cancel then kaitunRuntime.Cancel("Movimento externo")end
         flags[name]=on
     end}
 end
@@ -41,10 +41,10 @@ controls.Farm=worker("Farm");controls.FirstSea=worker("FirstSea");controls.Boat=
 controls.MasteryGoal=worker("MasteryGoal")
 local farmControl=controls.Farm
 local modeControl={Set=function(mode)
-    if cancelKaitun then cancelKaitun("Modo alterado")end
+    if kaitunRuntime.Cancel then kaitunRuntime.Cancel("Modo alterado")end
     options.Mode=mode
 end}
-local autoEquipControl={Set=function(on)options.AutoEquip=on end}
+kaitunRuntime.AutoEquipControl={Set=function(on)options.AutoEquip=on end}
 local function toggleJob(_,_,name,_,fn)
     step=fn
     local c={Set=function(on)
@@ -59,7 +59,7 @@ local function toggleJob(_,_,name,_,fn)
     return c
 end
 -- INSERT ACTUAL COORDINATOR
-local kaitun=initKaitun()
+local kaitun=kaitunRuntime.Init()
 assert(not flags.Kaitun and not options.AutoEquip, "startup must not enable automation")
 widgets["Kaitun: obter Saber no First Sea"](true)
 widgets["Kaitun: desbloquear Segundo Sea"](true)
@@ -78,7 +78,7 @@ assert(kaitun.GetState().Phase=="done" and options.Mode=="Boss" and not options.
 
 sea=1;level=100
 controls.Kaitun.Set(true);step()
-cancelKaitun("Movimento manual selecionado")
+kaitunRuntime.Cancel("Movimento manual selecionado")
 assert(not flags.Kaitun and not flags.Farm, "manual takeover cancels queue")
 controls.Kaitun.Set(true);step()
 kaitun.Stop("Parada geral")
