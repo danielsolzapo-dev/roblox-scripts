@@ -1,5 +1,5 @@
 -- XERECA entry point: visible download/compile/startup diagnostics.
-local build = "0121e9c7eb1198916a640ee0e1781d0845728779"
+local build = "6909ccf724b018c8fdf52b8862d9cc9d166cf718"
 local sourceUrl = "https://raw.githubusercontent.com/danielsolzapo-dev/roblox-scripts/" .. build .. "/RobloxUILibrary/Standalone.client.luau"
 local Players = game:GetService("Players")
 local player = Players.LocalPlayer
